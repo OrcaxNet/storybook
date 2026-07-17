@@ -1,0 +1,15 @@
+{
+  "id": "test-003",
+  "title": "Docker compose volume mount issue",
+  "messages": [
+    {
+      "role": "user",
+      "content": "docker compose的volume挂载不生效，容器内看不到文件。"
+    },
+    {
+      "role": "assistant",
+      "content": "检查docker-compose.yml中的volumes配置，确保路径正确。宿主机路径用绝对路径或相对路径。常见问题是路径映射写反了，格式应为 宿主机路径:容器路径。另外检查Docker Desktop的File Sharing设置是否包含了该目录。"
+    }
+  ],
+  "timestamp": "2025-01-17T09:15:00"
+}

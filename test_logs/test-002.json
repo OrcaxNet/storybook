@@ -1,0 +1,15 @@
+{
+  "id": "test-002",
+  "title": "Git rebase conflict resolution",
+  "messages": [
+    {
+      "role": "user",
+      "content": "git rebase时遇到冲突，不知道怎么解决。"
+    },
+    {
+      "role": "assistant",
+      "content": "冲突解决步骤：1. git status查看冲突文件 2. 手动编辑冲突文件，删除<<< === >>>标记 3. git add已解决的文件 4. git rebase --continue继续rebase。如果实在搞不定可以git rebase --abort放弃。"
+    }
+  ],
+  "timestamp": "2025-01-16T14:00:00"
+}

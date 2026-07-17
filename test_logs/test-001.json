@@ -1,0 +1,15 @@
+{
+  "id": "test-001",
+  "title": "Python FastAPI CORS error",
+  "messages": [
+    {
+      "role": "user",
+      "content": "我在用FastAPI时遇到了CORS错误，前端fetch请求被拒绝。"
+    },
+    {
+      "role": "assistant",
+      "content": "这个问题通过添加CORSMiddleware中间件解决。在main.py中from fastapi.middleware.cors import CORSMiddleware，然后app.add_middleware(CORSMiddleware, allow_origins=[\"*\"], allow_methods=[\"*\"], allow_headers=[\"*\"])。"
+    }
+  ],
+  "timestamp": "2025-01-15T10:30:00"
+}

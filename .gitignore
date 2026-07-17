@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual env
+.venv/
+venv/
+
+# Local env
+.env
+.env.local
+
+# Runtime data (contains personal session memory — do not commit)
+data/
+logs/
+
+# Claude Code local working state
+.claude/
+
+# OS
+.DS_Store

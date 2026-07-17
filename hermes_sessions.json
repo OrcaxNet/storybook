@@ -1,0 +1,58 @@
+[
+  {
+    "source": "hermes_session",
+    "raw_content": "用户需求：实现离线Coding记忆系统MVP。\n问题：pyproject.toml 的 build-backend 配置为 setuptools.backends._legacy:_Backend，这不是有效的 setuptools 构建后端路径，导致 pip install -e . 失败。\n诊断步骤：\n1. 运行 python -m coding_memory --help 发现 No module named coding_memory\n2. 检查 pyproject.toml 发现 build-backend 配置错误\n3. 确认 setuptools.build_meta 是正确的构建后端\n解决方案：将 [build-system] 的 build-backend 从 setuptools.backends._legacy:_Backend 改为 setuptools.build_meta\n结果：修改后 uv pip install -e . 成功，cm --help 正常工作\n结论：setuptools 的 build-backend 必须使用 setuptools.build_meta 而非不存在的内部路径",
+    "problem_desc": "pyproject.toml build-backend 配置错误导致 pip install -e . 失败",
+    "code_snippets": "[\"build-backend = 'setuptools.build_meta'\"]",
+    "conclusion": "将 build-backend 改为 setuptools.build_meta 后安装成功"
+  },
+  {
+    "source": "hermes_session",
+    "raw_content": "问题：Hermes Discord bot 连接成功但没有 home channel，hermes send --to discord 命令失败。\n诊断步骤：\n1. hermes gateway status 确认 bot 在线\n2. hermes send --list 发现 channel directory 为空\n3. 通过 Discord API 查询 bot 所在的 guilds，发现返回 200 但 guilds 列表为空\n4. 检查发现 bot 缺少 Privileged Intents（Server Members Intent 和 Message Content Intent）\n5. 用户在 Discord Developer Portal 启用 privileged intents 后 bot 才能看到 guilds\n6. bot 加入 server 后仍遇到 Missing Access 错误，需要在 server settings 中给 bot 角色添加 View Channels、Send Messages、Read Message History 权限\n解决方案：\n1. 在 Discord Developer Portal 启用 Privileged Gateway Intents\n2. 在 server 设置中给 bot 角色分配正确的权限\n3. 设置 DISCORD_HOME_CHANNEL 环境变量\n结论：Discord bot 需要同时启用 Developer Portal 的 privileged intents 和 server 级别的频道权限",
+    "problem_desc": "Hermes Discord bot 连接后无法发送消息，Missing Access 错误",
+    "code_snippets": "[\"hermes send --to discord:channel_id 'message'\"]",
+    "conclusion": "启用 privileged intents + 配置 server 权限 + 设置 home channel 后 Discord 通信正常"
+  },
+  {
+    "source": "hermes_session",
+    "raw_content": "问题：Hermes Photon (iMessage) 平台的 tapback 表情回应功能无法从 agent 沙箱触发。\n诊断步骤：\n1. 研究 Hermes Photon sidecar 代码，发现 /react 端点存在\n2. send_message_tool 有 react action 可以调用 sidecar 的 /react\n3. 适配器内部通过 _last_inbound_by_chat 记录每条聊天最近的入站消息 ID\n4. 但触发反应需要知道目标消息的 iMessage GUID\n5. 这个 ID 存在 gateway 进程的内存中，但沙箱里 _gateway_runner_ref() 返回 None，无法跨进程访问\n6. 直接查询 iMessage 的 chat.db 也被 macOS 沙箱拒绝了（权限不足）\n解决方案方向：\n1. 在 sidecar 添加 /last-message 端点暴露最近消息 ID\n2. 让 send_message_tool 在 gateway 进程内执行\n3. 让 gateway 在传递消息时把 messageId 写入环境变量或 DB\n结论：跨进程通信限制导致 agent 沙箱无法直接访问 gateway 内存中的消息 ID，需要架构层面的改动",
+    "problem_desc": "Hermes Photon iMessage tapback 功能因跨进程限制无法从 agent 沙箱触发",
+    "code_snippets": "[\"_gateway_runner_ref() returns None in sandbox\"]",
+    "conclusion": "需要架构层面改动：sidecar 新增端点或 gateway 传递 messageId"
+  },
+  {
+    "source": "hermes_session",
+    "raw_content": "问题：为 pocket-vibe 项目编写 README，需要从实际代码中提取信息而非编造。\n项目结构：TypeScript monorepo，包含 protocol/relay/cli/web 四个包。\n技术栈：Bun runtime、Cloudflare Workers、React 19 + Vite、WebSocket。\n核心架构：\n1. protocol 包定义 Zod schema 作为 CLI 和 Relay 共享的 wire format\n2. relay 是 Cloudflare Worker，使用 Durable Objects (UserHub) 管理每用户的 WebSocket 连接\n3. cli 是 pv 命令行工具，通过 Claude Code hook 机制捕获会话事件\n4. web 是手机端 PWA，通过 WebSocket 实时接收事件\n关键设计：\n- GitHub OAuth Device Flow 认证\n- JWT 通过 WebSocket subprotocol 传递（浏览器无法自定义 WS header）\n- check-pending 长轮询机制（最长 25s）\n- Fail-open/fail-closed 策略\n解决方案：读取 CLAUDE.md、package.json、源码文件，提取实际架构信息，编写完整的 README\n结论：README 应基于实际代码整理，包含项目简介、功能列表、monorepo 结构、快速开始、开发指南、架构要点",
+    "problem_desc": "为 pocket-vibe TypeScript monorepo 项目编写基于实际代码的 README",
+    "code_snippets": "[\"bun install\", \"bunx wrangler deploy\", \"pv login && pv init\"]",
+    "conclusion": "基于 CLAUDE.md、package.json、源码编写了完整的 README"
+  },
+  {
+    "source": "hermes_session",
+    "raw_content": "问题：Python 列表推导式内存占用过高，处理大数据集时 OOM。\n代码：result = [expensive_func(x) for x in huge_list]\n诊断步骤：\n1. 用内存分析器定位列表推导式占用 2GB\n2. 发现列表推导式会一次性生成所有结果到内存\n3. 改为生成器表达式：sum(expensive_func(x) for x in huge_list)\n4. 对大数据集使用 itertools.islice 分批处理\n结果：改用生成器后内存从 2GB 降到 50MB\n结论：大数据集应使用生成器表达式而非列表推导式，必要时用 itertools.islice 分批处理",
+    "problem_desc": "Python 列表推导式处理大数据集时内存占用过高导致 OOM",
+    "code_snippets": "[\"result = [expensive_func(x) for x in huge_list]\", \"sum(expensive_func(x) for x in huge_list)\"]",
+    "conclusion": "改用生成器后内存从 2GB 降到 50MB"
+  },
+  {
+    "source": "hermes_session",
+    "raw_content": "问题：React useEffect 触发无限渲染循环。\n代码：useEffect(() => { setData(transform(data)); }, [data, setData]);\n诊断步骤：\n1. 检查 useEffect 依赖数组发现 setData 是 useState 的 setter，每次渲染都不同\n2. 用 useCallback 包裹 setData 回调\n3. 将不依赖 props 的逻辑移出 useEffect 到 useMemo\n结果：将 setData 用 useCallback 包裹后渲染次数从无限降为 2 次\n结论：useEffect 依赖数组中的 setState 函数需要用 useCallback 稳定引用",
+    "problem_desc": "React useEffect 依赖数组包含 setState 导致无限渲染循环",
+    "code_snippets": "[\"useEffect(() => { setData(transform(data)); }, [data, setData])\", \"useCallback(setData, [])\"]",
+    "conclusion": "将 setData 用 useCallback 包裹后渲染次数从无限降为 2 次"
+  },
+  {
+    "source": "hermes_session",
+    "raw_content": "问题：Docker 容器内 DNS 解析失败，curl 报 could not resolve host。\n代码：docker run --network=bridge myapp\n诊断步骤：\n1. 检查容器 DNS 配置 cat /etc/resolv.conf 发现为空\n2. docker run 添加 --dns 8.8.8.8 参数临时修复\n3. 在 daemon.json 配置 dns 字段永久修复\n结果：配置 daemon.json 的 dns 后容器内 DNS 解析正常\n结论：Docker bridge 网络默认不配置 DNS，需要在 daemon.json 中添加 dns 服务器地址",
+    "problem_desc": "Docker 容器内 DNS 解析失败，curl could not resolve host",
+    "code_snippets": "[\"docker run --dns 8.8.8.8 myapp\", \"{\\\"dns\\\": [\\\"8.8.8.8\\\"]} in /etc/docker/daemon.json\"]",
+    "conclusion": "配置 daemon.json 的 dns 后容器内 DNS 解析正常"
+  },
+  {
+    "source": "hermes_session",
+    "raw_content": "问题：Git rebase 后分支丢失提交记录。\n代码：git rebase main && git push --force\n诊断步骤：\n1. 用 git reflog 找到丢失的 commit hash\n2. git reset --hard <hash> 恢复\n3. 重新 rebase 时使用 --preserve-merges 避免丢失\n结果：通过 reflog 成功恢复丢失的 3 个 commit\n结论：git reflog 是恢复 rebase 丢失提交的最后手段，force push 前应先备份分支",
+    "problem_desc": "Git rebase 后 force push 导致分支丢失提交记录",
+    "code_snippets": "[\"git reflog\", \"git reset --hard <hash>\", \"git rebase --preserve-merges main\"]",
+    "conclusion": "通过 reflog 成功恢复丢失的 3 个 commit"
+  }
+]
