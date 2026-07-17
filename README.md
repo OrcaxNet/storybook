@@ -87,6 +87,33 @@ storybook stats
 PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 ```
 
+## 🧪 测试
+
+测试套件覆盖 `store` / `processor` / `search` 三个核心模块的关键路径与边界，
+**完全不依赖 Ollama**——所有 LLM / embedding 调用均被 mock 桩替换，本地一键可重复运行。
+
+```bash
+# 1. 安装测试依赖（与运行时依赖一并）
+VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
+
+# 2. 一键运行全部测试
+.venv/bin/pytest
+
+# 带覆盖率报告（聚焦 store/processor/search）
+.venv/bin/pytest --cov=storybook --cov-report=term-missing
+```
+
+测试不启动 Ollama、不联网：把 `OLLAMA_HOST` 指向任意地址都不影响结果。
+用例要点：
+
+- **store**：Session/Story CRUD、`_edge_pair` 无向边归一、`search_by_vector` 的 `1 - dist²/2`
+  相似度换算（与 numpy 暴力余弦交叉验证）、双写一致性（`add_story`/`update_story` 后
+  `stories.embedding` 与 `story_vectors` 同步；分裂后父 story 向量从索引移除）。
+- **processor**：create / merge / update 三分支 + split 路径，mock `llm`/`embeddings` 返回固定值，
+  验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
+- **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
+- **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
+
 ## 🚀 使用
 
 ```bash
@@ -156,6 +183,7 @@ storybook/
 ├── data/               # 运行时数据库 memory.db（不纳入版本管理）
 ├── logs/               # 运行时日志（不纳入版本管理）
 ├── docs/TECH_DESIGN.md # 原始设计文档
+├── tests/              # pytest 测试套件（store/processor/search + 集成，全 mock Ollama）
 ├── test_logs/          # 示例 JSON 数据
 ├── hermes_sessions.json
 ├── .env.example
@@ -165,7 +193,7 @@ storybook/
 ## 📝 说明
 
 - **完全离线**：所有 LLM / embedding 走本地 Ollama，不发送任何数据到云端。
-- **无测试套件**：`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
+- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
 - `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`，不存在 `tests/` 或 `scripts/` 目录，也未配置 launchd plist）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 
