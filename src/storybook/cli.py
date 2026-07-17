@@ -3,6 +3,7 @@ CLI 入口 — storybook 命令
 
 用法:
   storybook init                    初始化数据库
+  storybook doctor [--fix]          环境与健康自检（--fix 修复向量双写不一致）
   storybook import <path>           导入会话日志(JSON)
   storybook import                  从 Claude Code 采集（默认数据源）
   storybook import --claude         从 Claude Code 采集（同上，显式写法）
@@ -26,6 +27,7 @@ from . import store
 from . import collector
 from . import processor
 from . import search as search_module
+from . import health
 
 
 def setup_logging(verbose: bool = False):
@@ -49,6 +51,18 @@ def init():
     """初始化数据库"""
     store.init_db()
     click.echo(f"✅ 数据库已初始化: {config.DB_PATH}")
+
+
+@cli.command()
+@click.option("--fix", is_flag=True, help="自动修复向量双写不一致（重建缺失行 / 清除孤立行）")
+def doctor(fix):
+    """🩺 环境与健康自检
+
+    检查 Ollama 可达性、LLM/Embedding 模型、向量维度、sqlite-vec 扩展与
+    story_vectors 虚表、向量双写一致性，逐项给出 ✅/❌ 与修复建议。
+    加 --fix 自动修复向量双写不一致。
+    """
+    health.run_doctor(fix=fix)
 
 
 @cli.command()

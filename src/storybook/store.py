@@ -96,6 +96,130 @@ def init_db():
 
 
 # ═══════════════════════════════════════════════
+#  健康检查辅助（供 doctor 使用）
+# ═══════════════════════════════════════════════
+
+def check_vec_extension() -> bool:
+    """检测 sqlite-vec 扩展能否加载。
+
+    用内存库探测，不触碰数据文件、无副作用。
+    """
+    try:
+        probe = sqlite3.connect(":memory:")
+        probe.enable_load_extension(True)
+        sqlite_vec.load(probe)
+        probe.close()
+        return True
+    except Exception:
+        return False
+
+
+def stories_table_exists() -> bool:
+    """stories 表是否存在（判断 schema 是否已初始化）。"""
+    if not config.DB_PATH.exists():
+        return False
+    db = sqlite3.connect(str(config.DB_PATH))
+    try:
+        row = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='stories'"
+        ).fetchone()
+        return row is not None
+    finally:
+        db.close()
+
+
+def story_vectors_table_exists() -> bool:
+    """story_vectors vec0 虚表是否存在。"""
+    if not config.DB_PATH.exists():
+        return False
+    db = sqlite3.connect(str(config.DB_PATH))
+    try:
+        row = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='story_vectors'"
+        ).fetchone()
+        return row is not None
+    finally:
+        db.close()
+
+
+def vector_consistency() -> dict:
+    """检查 stories.embedding 与 story_vectors 的双写一致性。
+
+    embedding 双写约束：stories.embedding（BLOB）与 story_vectors（vec0 行）
+    必须同有同无。返回::
+
+        {
+          "blob_count": int,     # stories.embedding 非空行数
+          "vec_count": int,      # story_vectors 行数
+          "missing_vec": [ids],  # 有 BLOB 但缺 vec0 行（需重建）
+          "orphan_vec": [ids],   # 有 vec0 行但 BLOB 缺失/Story 不存在（需清除）
+        }
+    """
+    db = get_db()
+    try:
+        blob_count = db.execute(
+            "SELECT COUNT(*) FROM stories WHERE embedding IS NOT NULL"
+        ).fetchone()[0]
+        vec_count = db.execute("SELECT COUNT(*) FROM story_vectors").fetchone()[0]
+        missing_vec = [r[0] for r in db.execute(
+            """SELECT s.id FROM stories s
+               WHERE s.embedding IS NOT NULL
+                 AND s.id NOT IN (SELECT story_id FROM story_vectors)"""
+        ).fetchall()]
+        orphan_vec = [r[0] for r in db.execute(
+            """SELECT v.story_id FROM story_vectors v
+               LEFT JOIN stories s ON s.id = v.story_id
+               WHERE s.id IS NULL OR s.embedding IS NULL"""
+        ).fetchall()]
+        return {
+            "blob_count": blob_count,
+            "vec_count": vec_count,
+            "missing_vec": missing_vec,
+            "orphan_vec": orphan_vec,
+        }
+    finally:
+        db.close()
+
+
+def repair_vector_consistency() -> dict:
+    """修复向量双写不一致，返回 ``{"rebuilt", "cleared", "failed"}``。
+
+    - missing_vec（有 BLOB 无 vec0 行）：用现有 BLOB 重建 story_vectors 行；
+    - orphan_vec（有 vec0 行但 BLOB 缺失/Story 不存在）：删除孤立的 vec0 行。
+    """
+    report = vector_consistency()
+    rebuilt = 0
+    cleared = 0
+    failed = []
+    db = get_db()
+    try:
+        for sid in report["missing_vec"]:
+            row = db.execute(
+                "SELECT embedding FROM stories WHERE id = ?", (sid,)
+            ).fetchone()
+            if row is None or row["embedding"] is None:
+                continue
+            try:
+                db.execute(
+                    "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",
+                    (sid, row["embedding"]),
+                )
+                rebuilt += 1
+            except Exception as e:
+                failed.append((sid, f"rebuild: {e}"))
+        for sid in report["orphan_vec"]:
+            try:
+                db.execute("DELETE FROM story_vectors WHERE story_id = ?", (sid,))
+                cleared += 1
+            except Exception as e:
+                failed.append((sid, f"clear: {e}"))
+        db.commit()
+    finally:
+        db.close()
+    return {"rebuilt": rebuilt, "cleared": cleared, "failed": failed}
+
+
+# ═══════════════════════════════════════════════
 #  Session CRUD
 # ═══════════════════════════════════════════════
 

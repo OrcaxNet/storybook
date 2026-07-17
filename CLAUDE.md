@@ -14,12 +14,14 @@ Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
 - **Ollama must be running** at `http://localhost:11434` (override with `OLLAMA_HOST`) with two models pulled:
   - LLM: `qwythos-hermes:latest` (override `STORYBOOK_LLM_MODEL`)
   - Embedding: `qwen3-embedding:0.6b`, **1024-dim** (override `STORYBOOK_EMBED_MODEL`). `EMBED_DIM` in config must match.
+- `config.py` auto-loads a project-root `.env` at import (no error if absent; copy `.env.example`). Pre-existing env vars / command-line `VAR=val` take priority over `.env` (`.env` never overwrites them).
 - The venv has no `pip` (created with `uv`). Install editable to get the `storybook` command: `VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .` (re-run if the project dir moves and the `storybook` shebang goes stale). Without installing, run via `PYTHONPATH=src .venv/bin/python -m storybook.cli <command>`.
 
 ## Commands
 
 ```
 storybook init                          # create SQLite schema + vec0 virtual table (also auto-run by other commands)
+storybook doctor [--fix]                # env health check (Ollama/models/dim/sqlite-vec/vector double-write); --fix repairs double-write inconsistency
 storybook import-data                   # default: collect Claude Code sessions from ~/.claude/projects (incremental, dedup by sessionId)
 storybook import-data --claude          # same as above (explicit)
 storybook import-data --sample [--n 100]   # generate & import simulated Claude Code sessions (no real sessions needed)
@@ -36,7 +38,7 @@ There is **no test suite**. `test_logs/*.json` and `hermes_sessions.json` are sa
 
 ## Architecture
 
-Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds.
+Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `storybook doctor` (env + vector double-write consistency self-check, reads via `store`).
 
 ### Storage layer (`store.py`) — SQLite + sqlite-vec
 Single file at `data/memory.db`. Three tables (`sessions`, `stories`, `edges`) plus the **`story_vectors` vec0 virtual table**. Each `get_db()` call opens a fresh connection (WAL mode, foreign keys on) and loads the sqlite-vec extension.
