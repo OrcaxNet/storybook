@@ -182,6 +182,35 @@ class TestGetStatsOverview:
 
 
 # ═══════════════════════════════════════════════
+#  prime_context_memories（晨间简报，转调 prime.prime_context）
+# ═══════════════════════════════════════════════
+
+class TestPrimeContextMemories:
+    def test_injects_on_match(self, fake_embedder):
+        a = _seed("A", basis(0))
+        fake_embedder.register("q", basis(0))
+        out = mcp_server.prime_context_memories(cwd="/x/proj", first_prompt="q")
+        assert out["injected"] is True
+        assert out["count"] == 1
+        assert out["matches"][0]["story_id"] == a
+        assert out["briefing"] != ""
+
+    def test_silent_on_no_match(self, fake_embedder):
+        fake_embedder.register("q", basis(0))
+        out = mcp_server.prime_context_memories(cwd="/x/proj", first_prompt="q")
+        assert out["injected"] is False
+        assert out["briefing"] == ""
+        assert out["count"] == 0
+
+    def test_silent_on_embedding_failure(self, fake_embedder):
+        fake_embedder.register("q", None)
+        out = mcp_server.prime_context_memories(cwd="/x/proj", first_prompt="q")
+        assert out["injected"] is False
+        assert out["note"] is not None
+        assert "storybook doctor" in out["note"]
+
+
+# ═══════════════════════════════════════════════
 #  FastMCP 装配（需 mcp SDK）
 # ═══════════════════════════════════════════════
 
@@ -207,7 +236,7 @@ class TestServerWiring:
         mcp = self._server()
         tools = asyncio.run(mcp.list_tools())
         names = {t.name for t in tools}
-        assert names == {"recall", "get_story", "stats"}
+        assert names == {"recall", "get_story", "stats", "prime_context"}
 
     def test_recall_input_schema_has_query(self):
         mcp = self._server()
@@ -217,6 +246,16 @@ class TestServerWiring:
         assert "top_k" in props
         # query 必填
         assert "query" in tools["recall"].inputSchema.get("required", [])
+
+    def test_prime_context_schema_has_cwd_and_first_prompt(self):
+        mcp = self._server()
+        tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+        props = tools["prime_context"].inputSchema["properties"]
+        assert "cwd" in props
+        assert "first_prompt" in props
+        assert "top_k" in props
+        # 均可选（无必填）
+        assert tools["prime_context"].inputSchema.get("required", []) == []
 
     def test_recall_end_to_end_via_call_tool(self, fake_embedder):
         a = _seed("A", basis(0))
@@ -240,3 +279,24 @@ class TestServerWiring:
         res = asyncio.run(mcp.call_tool("stats", {}))
         data = self._extract_json(res)
         assert "stories" in data
+
+    def test_prime_context_end_to_end_via_call_tool(self, fake_embedder):
+        a = _seed("A", basis(0))
+        fake_embedder.register("q", basis(0))
+        mcp = self._server()
+        res = asyncio.run(mcp.call_tool(
+            "prime_context", {"cwd": "/x/proj", "first_prompt": "q"}))
+        data = self._extract_json(res)
+        assert data["injected"] is True
+        assert data["count"] == 1
+        assert data["matches"][0]["story_id"] == a
+        assert data["briefing"] != ""
+
+    def test_prime_context_silent_when_no_match(self, fake_embedder):
+        fake_embedder.register("q", basis(0))
+        mcp = self._server()
+        res = asyncio.run(mcp.call_tool(
+            "prime_context", {"cwd": "/x/proj", "first_prompt": "q"}))
+        data = self._extract_json(res)
+        assert data["injected"] is False
+        assert data["briefing"] == ""

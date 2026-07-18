@@ -15,10 +15,12 @@ CLI 入口 — storybook 命令
   storybook stats                   查看统计
   storybook list                    列出所有story
   storybook show <story_id>         查看story详情
+  storybook prime [--cwd PATH]      会话启动主动注入（晨间简报），供 SessionStart hook 调用
   storybook mcp                     启动 MCP server（stdio，供 Claude Code 等 agent 召回）
 """
 import json
 import logging
+import os
 import sys
 
 import click
@@ -81,6 +83,85 @@ def mcp():
 
 
 @cli.command()
+@click.option("--cwd", default=None,
+              help="当前项目目录（默认取进程 cwd；hook 中传 $CLAUDE_PROJECT_DIR）")
+@click.option("--prompt", "first_prompt", default="",
+              help="可选的首条提问（agent 路径或手动传入；无则仅用 cwd 派生查询）")
+@click.option("--top", "-t", "top_k", type=int, default=None, help="最多召回候选数")
+@click.option("--budget", "token_budget", type=int, default=None,
+              help="简报 token 预算上限（默认 2000）")
+@click.option("--format", "output_format",
+              type=click.Choice(["text", "json", "hook"]),
+              default="text",
+              help="text=纯文本简报到 stdout（供 hook 注入）；json=完整结构化结果；"
+                   "hook=SessionStart hookSpecificOutput JSON")
+def prime(cwd, first_prompt, top_k, token_budget, output_format):
+    """🌅 会话启动主动注入（晨间简报）。
+
+    基于 cwd + 可选首条提问，召回 top-N 相关记忆，生成精简摘要。
+    相关度不足或无匹配时静默不输出（供 SessionStart hook 注入：无输出即不污染上下文）。
+
+    \b
+    Hook 用法（默认 text 输出到 stdout，被 Claude Code 作为额外上下文注入）:
+      storybook prime --cwd "$CLAUDE_PROJECT_DIR"
+
+    \b
+    结构化注入（支持 hookSpecificOutput 的 Claude Code 版本）:
+      storybook prime --cwd "$CLAUDE_PROJECT_DIR" --format hook
+
+    详见 README「🌅 会话启动注入」一节。
+    """
+    from . import prime as prime_module
+
+    # CLI 默认用进程 cwd（hook 中应显式传 $CLAUDE_PROJECT_DIR）；prime_context 本身不回退，
+    # 以便 cwd/first_prompt 均空时静默不注入的语义可被单测。
+    cwd = cwd or os.getcwd()
+
+    # hook 路径须非侵入：DB 未初始化等任何异常都不应报错或向上下文注入错误。
+    # 全程兜底 try/except：失败时退化为静默不注入（exit 0、stdout 空）。
+    try:
+        try:
+            store.init_db()
+        except Exception as e:  # noqa: BLE001  -- best-effort，工具调用时再按需报错
+            logging.getLogger(__name__).warning("prime: init_db 失败（继续）: %s", e)
+        result = prime_module.prime_context(
+            cwd=cwd, first_prompt=first_prompt,
+            top_k=top_k, token_budget=token_budget,
+        )
+    except Exception as e:  # noqa: BLE001  -- 绝不向 hook 上下文抛错
+        result = {
+            "cwd": cwd, "query": "", "count": 0, "injected": False,
+            "briefing": "", "matches": [], "truncated": False,
+            "note": f"prime 异常：{e}",
+        }
+
+    briefing = result.get("briefing") or ""
+
+    if output_format == "json":
+        # 完整结构化结果（调试 / 程序化用）
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if output_format == "hook":
+        # SessionStart hook 结构化注入：仅 additionalContext 被注入，其余 stdout 被忽略
+        payload = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": briefing,
+            }
+        }
+        click.echo(json.dumps(payload, ensure_ascii=False))
+        return
+
+    # text（默认 / hook 兼容）：只把简报写到 stdout（注入上下文）
+    if briefing:
+        click.echo(briefing)
+    # note（环境问题等）只进 stderr，不进上下文，避免污染
+    if result.get("note"):
+        click.echo(f"[storybook prime] {result['note']}", err=True)
+
+
+@cli.command()
 @click.argument("path", required=False)
 @click.option("--claude", is_flag=True, help="从 Claude Code 采集")
 @click.option("--cursor", is_flag=True, help="从 Cursor 自动采集")
@@ -115,15 +196,14 @@ def import_data(path, claude, cursor, sample, n):
         click.echo(f"✅ 导入 {count} 条 Claude Code 会话")
 
     elif path:
-        import os as _os
         click.echo(f"📥 从路径导入: {path}")
         sessions = []
-        if _os.path.isdir(path):
+        if os.path.isdir(path):
             # 目录：扫描所有 .json 文件
-            for fname in sorted(_os.listdir(path)):
+            for fname in sorted(os.listdir(path)):
                 if not fname.endswith(".json"):
                     continue
-                fpath = _os.path.join(path, fname)
+                fpath = os.path.join(path, fname)
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         data = json.load(f)

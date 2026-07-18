@@ -69,6 +69,14 @@ WEIGHT_INCREMENT = 0.1         # 共同调用每次提升
 WEIGHT_MAX = 1.0               # 权重上限
 WEIGHT_PARENT_CHILD = 1.0      # 父子story默认权重
 
+# ── 会话启动主动注入（晨间简报 / 上下文预热）──
+# 见 src/storybook/prime.py。相比普通检索，主动注入用更高相关度门槛，
+# 避免把弱相关记忆塞进每次会话开头的上下文造成噪声。
+PRIME_MIN_SIMILARITY = 0.60    # 主动注入最低相似度（高于 SIM_THRESHOLD_SEARCH=0.50）
+PRIME_TOP_K = 5                # 主动注入最多考虑的候选数（再按 token 预算裁剪）
+PRIME_TOKEN_BUDGET = 2000      # 注入简报的 token 预算上限（≤2k，避免污染上下文）
+PRIME_CONTENT_EXCERPT_CHARS = 140  # 简报中每条 story 摘要的最大字符数
+
 # ── Claude Code 会话路径（主数据源）──
 # 每个 .jsonl 文件 = 一个会话；目录名是 cwd 编码（/ -> -）
 CLAUDE_PROJECTS_PATH = Path.home() / ".claude" / "projects"

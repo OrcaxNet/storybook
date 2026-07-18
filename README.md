@@ -21,6 +21,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
 - 🏠 **完全离线**：只需本地 Ollama，零云端依赖
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
+- 🌅 **晨间简报**：会话启动时基于 cwd / 首条提问**主动召回**相关记忆并注入上下文（`SessionStart` hook 或 `prime_context` MCP 工具），实现"下意识回忆"--更贴近初衷；token 预算内、相关度不足时**静默不注入**
 
 ## 🏗 架构
 
@@ -113,8 +114,9 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **processor**：create / merge / update 三分支 + split 路径，mock `llm`/`embeddings` 返回固定值，
   验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
+- **prime**：query 构造（cwd / first_prompt）、主动注入门槛（高于检索）、token 预算裁剪、静默不注入（空库 / 低于门槛 / embedding 失败 / schema 缺失均不抛错）。
 - **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
-- **MCP server**：`tests/test_mcp_server.py` 覆盖三个工具的核心逻辑与 FastMCP 装配/端到端调用。需 `.[mcp,test]`（即多装 `[mcp]` extra）；未装时该文件自动 skip，不影响基础 `pytest` 全绿。
+- **MCP server**：`tests/test_mcp_server.py` 覆盖四个工具（`recall`/`get_story`/`stats`/`prime_context`）的核心逻辑与 FastMCP 装配/端到端调用。需 `.[mcp,test]`（即多装 `[mcp]` extra）；未装时该文件自动 skip，不影响基础 `pytest` 全绿。
 
 ## 🚀 使用
 
@@ -131,6 +133,7 @@ storybook search "<query>" [--top 3] # 向量检索 + 关联 Story 激活
 storybook stats                      # 系统统计
 storybook list [--limit 20]          # 列出所有 Story
 storybook show <story_id>            # 查看 Story 详情（含关联记忆）
+storybook prime [--cwd PATH]         # 会话启动主动注入（晨间简报），供 SessionStart hook 调用
 storybook mcp                        # 启动 MCP server（stdio，供 Claude Code 等 agent 运行时召回）
 ```
 
@@ -196,15 +199,95 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 | `recall` | `query`（必填）, `top_k?`（默认 3） | 向量检索 + 关联激活，返回 `{query, count, matches:[{story_id,title,content,keywords,similarity,related}]}`。`count=0` 表示无匹配（记忆库为空或无相关记忆），此时 `matches` 为空，不返回噪声 |
 | `get_story` | `story_id`（必填） | 查看单条记忆详情（含关联记忆），剥离 1024 维 embedding |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
+| `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / Ollama 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
 
 ### 说明
 
 - server 与 CLI 共享同一份配置（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
 - `recall` 复用 CLI `search` 的全部语义，**包括副作用**：命中记忆的 `access_count` 自增、共同召回的关联边权重提权（"反复回忆加深记忆路径"）。
 - `recall` 需要本地 Ollama 生成查询向量；Ollama 不可用时返回可操作错误（提示 `storybook doctor`）。`get_story` / `stats` 不依赖 Ollama。
-- server 启动时自动 `init_db`：全新环境下 `recall` 返回空、`stats` 返回 0、`get_story` 报不存在。
+- `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**--Ollama 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
+- server 启动时自动 `init_db`：全新环境下 `recall` 返回空、`stats` 返回 0、`get_story` 报不存在、`prime_context` 返回 `injected=false`。
 
-## ⚙️ 配置
+## 🌅 会话启动注入（晨间简报 / 上下文预热）
+
+> 仅暴露 `recall` 等 MCP 工具仍需 agent **主动**调用。更进一步：新会话开始时，基于 cwd / 首条提问**主动 surface** 最相关 story 注入上下文，实现"下意识回忆"--更贴近项目初衷（人脑处理事项时自动想起相关经历）。
+
+`prime_context` 与 `storybook prime` 共享 `src/storybook/prime.py` 的召回 + 预算控制逻辑，**复用 `search.search`**，不重复实现检索。两条触发路径：
+
+| 路径 | 触发时机 | 查询信号 | 接入方式 |
+|------|----------|----------|----------|
+| **SessionStart hook** | 会话启动（尚无首条提问） | 仅 cwd（项目目录派生项目名） | `storybook prime` CLI，stdout 被注入为额外上下文 |
+| **MCP `prime_context`** | agent 读到首条提问后主动调用 | cwd + 首条提问（提问为主信号） | agent 调用工具，拿回 `briefing` 自行呈现 |
+
+### 行为保证（验收标准）
+
+1. **有匹配时自动注入**：召回 ≥ `PRIME_MIN_SIMILARITY`（默认 0.60，高于检索 0.50）的记忆，渲染为精简简报。
+2. **无相关记忆时静默不注入、不报错**：召回为空 / 全低于门槛 / Ollama 不可用 / DB 未初始化 -> `injected=false`、`briefing=""`、hook 输出空 stdout（什么都不注入）。
+3. **token 预算内、有针对性**：简报 ≤ `PRIME_TOKEN_BUDGET`（默认 2000）token，超额时按相似度从低到高丢弃候选并对单条摘要裁剪（`truncated=true`）；每条摘要 ≤ `PRIME_CONTENT_EXCERPT_CHARS`（默认 140）字符。
+4. **hook / 接入说明**：见下文。
+
+### 方式一：Claude Code `SessionStart` hook（推荐，纯自动）
+
+`storybook prime` 默认把简报纯文本写到 stdout（被 Claude Code 作为额外上下文注入）；无匹配时 stdout 为空（不注入）。hook 始终 exit 0、非阻塞，任何环境异常都静默退化（不向上下文注入错误）。
+
+在项目级 `.claude/settings.json` 或用户级 `~/.claude/settings.json` 配置：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/绝对路径/storybook/.venv/bin/storybook prime --cwd \"$CLAUDE_PROJECT_DIR\""
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+> ⚠️ 用**绝对路径**指向 venv 里的 `storybook`（Claude Code 启动 hook 进程时不一定继承 shell 的 PATH）。`$CLAUDE_PROJECT_DIR` 由 Claude Code 注入，即当前项目目录。未做 editable 安装时可用 `python -m storybook.prime` 形式（`command` 指向 `.venv/bin/python`，`args` 为 `["-m", "storybook.prime", "--cwd", "$CLAUDE_PROJECT_DIR"]`）。
+>
+> 若你的 Claude Code 版本支持 `hookSpecificOutput` 结构化注入，可改用 `--format hook`，仅 `additionalContext` 字段被注入、其余 stdout 被忽略：
+
+```json
+"command": "/绝对路径/storybook/.venv/bin/storybook prime --cwd \"$CLAUDE_PROJECT_DIR\" --format hook"
+```
+
+调试时可用 `--format json` 查看完整结构化结果（`query` / `count` / `matches` / `truncated` / `note`）：
+
+```bash
+storybook prime --cwd "$PWD" --prompt "你的首条提问" --format json
+```
+
+### 方式二：MCP `prime_context` 工具（agent 主动调用）
+
+已启用 MCP server（见上文「🔌 MCP 接入」）后，agent 可在读到用户首条提问后调用 `prime_context`，传入自身 cwd 与首条提问，拿回 `briefing` 呈现给用户。适合"提问已到、但想强化主动回忆"的场景，或非 Claude Code 的 MCP-aware agent。
+
+```python
+prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_k=5)
+# -> {"injected": true, "briefing": "📖 Storybook 晨间简报：...", "count": 2, ...}
+```
+
+### 简报样例
+
+```
+📖 Storybook 晨间简报：以下过往记忆可能与当前任务相关（按相似度排序）
+
+• [82%] 排查用户下单失败
+  问题：下单接口超时 步骤：1.查日志定位回调超时 2.复现 结果：调整超时配置并加重试
+• [75%] 订单链路需求开发
+  问题：支付回调链路改造 步骤：... 结果：...
+
+（来自本地 Storybook 记忆库；调用 recall / get_story 可查看详情。不相关可忽略。）
+```
+
+
 
 所有路径、模型名、阈值都集中在 `src/storybook/config.py`。环境变量样例见 `.env.example`（注意：`config.py` 不会自动加载 `.env`，需自行 `export` 或用 direnv 等工具）。
 
@@ -226,6 +309,10 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 | `TOP_K_RETRIEVAL` / `TOP_K_SEARCH` | 5 / 3 | 做梦召回 / 用户搜索返回数 |
 | `STORY_MAX_CHARS` | 400 | Story 最大字数 |
 | `WEIGHT_INCREMENT` / `WEIGHT_MAX` | 0.1 / 1.0 | 共同召回提权 / 权重上限 |
+| `PRIME_MIN_SIMILARITY` | 0.60 | 晨间简报主动注入最低相似度（高于检索 0.50，避免噪声） |
+| `PRIME_TOP_K` | 5 | 晨间简报最多考虑的候选数（再按 token 预算裁剪） |
+| `PRIME_TOKEN_BUDGET` | 2000 | 晨间简报 token 预算上限（≤2k，避免污染上下文） |
+| `PRIME_CONTENT_EXCERPT_CHARS` | 140 | 晨间简报中每条 Story 摘要最大字符数 |
 
 LLM 调用参数（temp 0.3、`num_ctx` 8192、120s 超时）硬编码在 `llm._chat` / `_generate` 中。
 
@@ -242,7 +329,8 @@ storybook/
 │   ├── llm.py          # Ollama LLM 调用
 │   ├── embeddings.py   # Ollama embedding 调用
 │   ├── search.py       # 向量检索 + 关联激活
-│   └── mcp_server.py   # MCP server（recall / get_story / stats）
+│   ├── prime.py        # 会话启动主动注入（晨间简报，复用 search）
+│   └── mcp_server.py   # MCP server（recall / get_story / stats / prime_context）
 ├── data/               # 运行时数据库 memory.db（不纳入版本管理）
 ├── logs/               # 运行时日志（不纳入版本管理）
 ├── docs/TECH_DESIGN.md # 原始设计文档
@@ -256,8 +344,9 @@ storybook/
 ## 📝 说明
 
 - **完全离线**：所有 LLM / embedding 走本地 Ollama，不发送任何数据到云端。
-- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
-- **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`（需 `[mcp]` extra；接入见上文「🔌 MCP 接入」）。
+- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
+- **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（需 `[mcp]` extra；接入见上文「🔌 MCP 接入」）。
+- **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / Ollama 不可用时静默不注入（见上文「🌅 会话启动注入」）。
 - `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`，不存在 `tests/` 或 `scripts/` 目录，也未配置 launchd plist）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 
