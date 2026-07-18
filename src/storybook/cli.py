@@ -15,6 +15,7 @@ CLI 入口 — storybook 命令
   storybook stats                   查看统计
   storybook list                    列出所有story
   storybook show <story_id>         查看story详情
+  storybook mcp                     启动 MCP server（stdio，供 Claude Code 等 agent 召回）
 """
 import json
 import logging
@@ -63,6 +64,20 @@ def doctor(fix):
     加 --fix 自动修复向量双写不一致。
     """
     health.run_doctor(fix=fix)
+
+
+@cli.command()
+def mcp():
+    """🔌 启动 MCP server（stdio），把记忆检索暴露给 MCP-aware agent（如 Claude Code）。
+
+    agent 可在运行时调用 recall / get_story / stats 召回过往记忆，
+    实现"跨 session 经验复用"。server 为独立进程，不依赖 CLI 运行态。
+
+    需先安装 MCP 依赖：uv pip install -e ".[mcp]"。
+    Claude Code 接入配置见 README「MCP 接入」一节。
+    """
+    from . import mcp_server
+    mcp_server.main()
 
 
 @cli.command()
