@@ -83,3 +83,10 @@ CLAUDE_PROJECTS_PATH = Path.home() / ".claude" / "projects"
 
 # ── Cursor 日志路径（备用数据源，未用 Cursor 可忽略）──
 CURSOR_STORAGE_PATH = Path.home() / "Library" / "Application Support" / "Cursor" / "User" / "workspaceStorage"
+
+# ── 做梦周期自动化 ──
+# 定时触发间隔（秒）：launchd / `storybook dream` 守护进程每轮做梦的间隔，默认 4 小时。
+# launchd 无 shell 环境，故可通过环境变量在 plist 中覆盖。
+DREAM_INTERVAL = int(os.getenv("STORYBOOK_DREAM_INTERVAL", "14400"))
+# `storybook process --watch` 轮询 ~/.claude/projects 的间隔（秒），默认 60。
+WATCH_POLL_INTERVAL = int(os.getenv("STORYBOOK_WATCH_POLL_INTERVAL", "60"))

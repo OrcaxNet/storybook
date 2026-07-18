@@ -11,6 +11,9 @@ CLI 入口 — storybook 命令
   storybook import --sample [N]     生成N条模拟数据(默认100)
   storybook process                 处理所有pending会话(做梦)
   storybook process --session ID    处理指定会话
+  storybook process --watch         监听 ~/.claude/projects，有新会话自动加工（长驻）
+  storybook dream --once            跑一次完整做梦周期（采集+加工）后退出；launchd 入口
+  storybook dream                   定时守护进程（非 macOS 兜底，每 DREAM_INTERVAL 秒一轮）
   storybook search <query>          搜索记忆
   storybook stats                   查看统计
   storybook list                    列出所有story
@@ -22,6 +25,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 import click
@@ -32,6 +36,7 @@ from . import collector
 from . import processor
 from . import search as search_module
 from . import health
+from . import dreamd
 from . import eval as eval_module
 
 
@@ -263,21 +268,80 @@ def import_data(path, claude, cursor, sample, n):
 
 @cli.command(name="process")
 @click.option("--session", "-s", type=int, help="处理指定会话ID")
-def process_cmd(session):
-    """🌙 处理会话(做梦)"""
+@click.option("--watch", is_flag=True,
+              help="监听模式：轮询 ~/.claude/projects，有新会话自动加工（长驻，Ctrl-C 退出）")
+@click.option("--interval", default=None, type=int,
+              help="--watch 轮询间隔（秒），默认读 config.WATCH_POLL_INTERVAL（60）")
+def process_cmd(session, watch, interval):
+    """🌙 处理会话(做梦)
+
+    不带 flag：加工所有 pending 会话（受并发锁保护，与 --watch / launchd 互不重叠）。
+    --watch：长驻监听，发现新 Claude 会话即自动采集 + 加工。
+    """
     store.init_db()
 
+    if watch:
+        dreamd.setup_dream_logging()
+        stop = threading.Event()
+        dreamd.install_signal_handlers(stop)
+        poll = interval if interval is not None else config.WATCH_POLL_INTERVAL
+        click.echo(f"🌙 监听模式启动：每 {poll}s 轮询 {config.CLAUDE_PROJECTS_PATH}（Ctrl-C 退出）")
+        dreamd.watch_loop(poll_interval=poll, stop_event=stop, verbose=True)
+        return
+
     if session:
-        click.echo(f"🔄 处理会话 #{session}...")
-        result = processor.process_session(session)
-        if result:
-            click.echo(f"✅ 完成 → story #{result}")
+        # 单会话加工同样受锁保护，避免与正在跑的全量周期撞车
+        try:
+            with dreamd.acquire_dream_lock(blocking=False):
+                click.echo(f"🔄 处理会话 #{session}...")
+                result = processor.process_session(session)
+                if result:
+                    click.echo(f"✅ 完成 -> story #{result}")
+                else:
+                    click.echo("❌ 处理失败")
+        except dreamd.DreamLockBusy:
+            click.echo("⏳ 另一个做梦周期正在运行，已跳过")
+        return
+
+    # 全量加工（不采集，仅处理 pending），走锁保护的统一路径
+    result = dreamd.run_dream_cycle_once(import_new=False, verbose=True)
+    if result["status"] == "skipped":
+        click.echo("⏳ 另一个做梦周期正在运行，已跳过")
+    elif result["total"] == 0:
+        click.echo("✅ 没有待处理的会话")
+
+
+@cli.command()
+@click.option("--once", is_flag=True,
+              help="只跑一次完整做梦周期（采集+加工）后退出；launchd 定时任务用此入口")
+@click.option("--interval", default=None, type=int,
+              help="守护进程循环间隔（秒），默认读 config.DREAM_INTERVAL（14400 = 4 小时）")
+def dream(once, interval):
+    """🌙 做梦周期自动化：定时触发或文件监听，让记忆在后台自动整理。
+
+    --once：单次完整周期（采集 Claude 会话 + 加工 pending）后退出。launchd / cron 调用此入口。
+    不带 --once：定时守护进程（非 macOS 兜底），每 interval 秒一轮，Ctrl-C / SIGTERM 退出。
+    """
+    store.init_db()
+    dreamd.setup_dream_logging()
+
+    if once:
+        result = dreamd.run_dream_cycle_once(import_new=True, verbose=True)
+        if result["status"] == "skipped":
+            click.echo("⏳ 另一个做梦周期正在运行，已跳过")
         else:
-            click.echo("❌ 处理失败")
-    else:
-        summary = processor.process_all_pending(verbose=True)
-        if summary["total"] == 0:
-            click.echo("✅ 没有待处理的会话")
+            click.echo(
+                f"🌙 做梦周期完成：采集 {result['imported']} 条，"
+                f"加工 {result['total']} 条（成功 {result['success']} / 失败 {result['failed']}），"
+                f"用时 {result['duration_s']}s"
+            )
+        return
+
+    stop = threading.Event()
+    dreamd.install_signal_handlers(stop)
+    iv = interval if interval is not None else config.DREAM_INTERVAL
+    click.echo(f"🌙 做梦守护进程启动：每 {iv}s 触发一次（Ctrl-C 退出）")
+    dreamd.dream_daemon(interval=iv, stop_event=stop, verbose=False)
 
 
 @cli.command()

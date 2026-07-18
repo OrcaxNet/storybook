@@ -116,6 +116,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
 - **prime**：query 构造（cwd / first_prompt）、主动注入门槛（高于检索）、token 预算裁剪、静默不注入（空库 / 低于门槛 / embedding 失败 / schema 缺失均不抛错）。
 - **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
+- **dreamd（做梦周期自动化）**：`fcntl.flock` 并发锁互斥与释放、`run_dream_cycle_once` 采集+加工/跳过/空、监听循环首帧追补与变化触发、定时守护、信号退出、`logs/dream.log` 幂等写入。全 mock，不依赖 Ollama。
 - **MCP server**：`tests/test_mcp_server.py` 覆盖四个工具（`recall`/`get_story`/`stats`/`prime_context`）的核心逻辑与 FastMCP 装配/端到端调用。需 `.[mcp,test]`（即多装 `[mcp]` extra）；未装时该文件自动 skip，不影响基础 `pytest` 全绿。
 
 ## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
@@ -154,6 +155,9 @@ storybook import-data --cursor       # 扫描 Cursor 的 workspaceStorage（备�
 storybook import-data <file|dir>     # 导入 JSON（list / {sessions:[...]} / {messages:[...]} 聊天日志）
 
 storybook process [--session ID]     # 做梦周期：处理所有 pending 会话（或指定一条）
+storybook process --watch [--interval N]  # 监听模式：轮询 ~/.claude/projects，有新会话自动采集+加工（长驻）
+storybook dream --once                # 单次完整做梦周期（采集+加工）后退出；launchd/cron 入口
+storybook dream [--interval N]        # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
 storybook search "<query>" [--top 3] # 向量检索 + 关联 Story 激活
 storybook stats                      # 系统统计
 storybook list [--limit 20]          # 列出所有 Story
@@ -172,6 +176,57 @@ storybook process                       # 跑做梦周期
 storybook search "如何调试数据库连接"     # 搜一下
 storybook stats                         # 看看沉淀了多少 Story
 ```
+
+## 🌙 做梦周期自动化
+
+「做梦」无需手动触发。三种自动化入口（均复用同一把文件锁，互不重叠；运行日志落 `logs/dream.log`）：
+
+| 入口 | 用途 | 平台 |
+|------|------|------|
+| `storybook process --watch` | 反应式监听：轮询 `~/.claude/projects`，有新会话自动采集 + 加工（长驻，Ctrl-C 退出） | 全平台 |
+| `storybook dream --once` | 单次完整周期（采集 + 加工）后退出——**定时调度器的入口** | 全平台 |
+| `storybook dream` | 定时守护进程，每 `DREAM_INTERVAL` 秒一轮（Ctrl-C / SIGTERM 退出） | 非 macOS 兜底 |
+
+### macOS：launchd 定时任务
+
+`scripts/` 下提供 plist 模板与一键安装脚本。安装脚本会把模板里的占位符替换为当前 venv / 仓库 / 日志的真实路径，写入 `~/Library/LaunchAgents/com.storybook.dream.plist` 并加载。
+
+```bash
+# 安装：每 4 小时（默认）自动跑一次 dream --once
+./scripts/install_launchd.sh
+# 每 1 小时
+./scripts/install_launchd.sh --interval 3600
+# 卸载
+./scripts/install_launchd.sh --uninstall
+
+# 常用调试命令
+launchctl start com.storybook.dream            # 立即触发一次
+launchctl print gui/$(id -u)/com.storybook.dream  # 查看状态
+tail -f logs/dream.log                            # 看运行日志
+```
+
+plist 触发的是 `<venv>/bin/python -m storybook.cli dream --once`，`StartInterval` 可配置（默认 14400s = 4h），`RunAtLoad=true`（登录时先追补一次离线期间的新会话）。launchd 无 shell 环境，故 `storybook` 必须装在 venv 里、`.env` 由 `config.py` 自动加载——无需手动 `export`。
+
+### Linux / 其它平台：守护进程
+
+非 macOS 用 `storybook dream` 守护进程替代 launchd，由 systemd / nohup 托管：
+
+```bash
+# 直接前台 / nohup 后台跑
+nohup .venv/bin/python -m storybook.cli dream >> logs/dream-daemon.log 2>&1 &
+
+# 或用 systemd user 服务（模板：scripts/com.storybook.dream.service）
+sed -e "s|__PYTHON_BIN__|$PWD/.venv/bin/python|" \
+    -e "s|__STORYBOOK_DIR__|$PWD|" \
+    scripts/com.storybook.dream.service > ~/.config/systemd/user/storybook-dream.service
+systemctl --user daemon-reload
+systemctl --user enable --now storybook-dream.service
+journalctl --user -u storybook-dream.service -f
+```
+
+### 并发保护
+
+所有做梦周期入口（手动 `process` / `--watch` / `dream --once` / `dream` 守护）共用 `data/dream.lock` 文件锁（`fcntl.flock` 非阻塞）。**已有周期在跑时，新触发立即跳过、不重复执行**，避免两个 process 同时写库。进程崩溃时 OS 自动释放锁，无 stale-pid 问题。
 
 ## 🔌 MCP 接入（供 agent 运行时召回）
 
@@ -313,8 +368,9 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 ```
 
 
+## ⚙️ 配置
 
-所有路径、模型名、阈值都集中在 `src/storybook/config.py`。环境变量样例见 `.env.example`（注意：`config.py` 不会自动加载 `.env`，需自行 `export` 或用 direnv 等工具）。
+所有路径、模型名、阈值都集中在 `src/storybook/config.py`。环境变量样例见 `.env.example`。`config.py` 启动时自动加载项目根 `.env`（无则跳过）；命令行 / 已存在的环境变量优先级高于 `.env`，故 launchd 等无 shell 的场景也无需手动 `export`。
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
@@ -322,6 +378,8 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `STORYBOOK_LLM_MODEL` | `qwythos-hermes:latest` | 做梦加工用的 LLM |
 | `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
 | `STORYBOOK_LLM_THINK` | `0` | Qwen3 思考模式：`0`=关（提取类任务约 9× 加速），`1`=开（检索准确率不足时再开） |
+| `STORYBOOK_DREAM_INTERVAL` | `14400` | `dream` 守护进程 / launchd 定时间隔（秒），默认 4 小时 |
+| `STORYBOOK_WATCH_POLL_INTERVAL` | `60` | `process --watch` 轮询 `~/.claude/projects` 的间隔（秒） |
 
 关键阈值（`config.py`）：
 
@@ -354,12 +412,14 @@ storybook/
 │   ├── llm.py          # Ollama LLM 调用
 │   ├── embeddings.py   # Ollama embedding 调用
 │   ├── search.py       # 向量检索 + 关联激活
+│   ├── dreamd.py       # 做梦周期自动化（锁 / 监听 / 定时守护 / 日志）
 │   ├── prime.py        # 会话启动主动注入（晨间简报，复用 search）
 │   └── mcp_server.py   # MCP server（recall / get_story / stats / prime_context）
 ├── data/               # 运行时数据库 memory.db（不纳入版本管理）
 ├── logs/               # 运行时日志（不纳入版本管理）
+├── scripts/            # launchd plist 模板 + install_launchd.sh + systemd 单元模板
 ├── docs/TECH_DESIGN.md # 原始设计文档
-├── tests/              # pytest 测试套件（store/processor/search + 集成，全 mock Ollama）
+├── tests/              # pytest 测试套件（store/processor/search/dreamd + 集成，全 mock Ollama）
 ├── test_logs/          # 示例 JSON 数据
 ├── hermes_sessions.json
 ├── .env.example
@@ -369,10 +429,10 @@ storybook/
 ## 📝 说明
 
 - **完全离线**：所有 LLM / embedding 走本地 Ollama，不发送任何数据到云端。
-- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
+- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
 - **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（需 `[mcp]` extra；接入见上文「🔌 MCP 接入」）。
 - **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / Ollama 不可用时静默不注入（见上文「🌅 会话启动注入」）。
-- `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`，不存在 `tests/` 或 `scripts/` 目录，也未配置 launchd plist）。
+- `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「🧪 测试」与「🌙 做梦周期自动化」）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 
 ## License
