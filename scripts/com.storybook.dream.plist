@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Storybook 做梦周期 - macOS launchd 定时任务模板
+
+  这是「模板」，含占位符，请用 scripts/install_launchd.sh 生成真实 plist 并加载：
+      ./scripts/install_launchd.sh --interval 14400     # 每 4 小时（默认）
+      ./scripts/install_launchd.sh --interval 3600      # 每 1 小时
+      ./scripts/install_launchd.sh --uninstall          # 卸载
+
+  install 脚本会把下列占位符替换为当前环境的真实路径后写入
+  ~/Library/LaunchAgents/com.storybook.dream.plist：
+      __PYTHON_BIN__       venv 的 python（.venv/bin/python）
+      __STORYBOOK_DIR__    storybook 仓库根目录（WorkingDirectory）
+      __LOG_DIR__          日志目录（<repo>/logs）
+      __START_INTERVAL__   触发间隔（秒），由 --interval 决定
+
+  手动加载/卸载（脚本内部即用此命令）：
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.storybook.dream.plist
+      launchctl bootout    gui/$(id -u)/com.storybook.dream
+      launchctl start      com.storybook.dream   # 立即触发一次（调试用）
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/propertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.storybook.dream</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>-m</string>
+        <string>storybook.cli</string>
+        <string>dream</string>
+        <string>--once</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__STORYBOOK_DIR__</string>
+
+    <!-- 每 N 秒触发一次（默认 14400 = 4 小时）-->
+    <key>StartInterval</key>
+    <integer>__START_INTERVAL__</integer>
+
+    <!-- 加载时（登录）先跑一次，追补离线期间的新会话；受文件锁保护，安全 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 后台运行、低 IO 优先级：做梦周期会调本地 Ollama，让出前台资源 -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- 日志（launchd 无 shell，stdout/stderr 落盘到此处；dreamd 另写 logs/dream.log）-->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dream-launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dream-launchd.err.log</string>
+</dict>
+</plist>
