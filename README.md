@@ -114,6 +114,31 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
 - **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
 
+## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
+
+PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段。`storybook eval` 建立可重复的检索质量基线，
+作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染 `data/memory.db`。
+
+```bash
+storybook eval all                              # 跑全部三轮评测（默认）
+storybook eval retrieval                        # 仅检索评测
+storybook eval all --report data/eval_reports/baseline.json   # 落盘 JSON 报告，便于阈值调整前后对比
+python scripts/eval.py retrieval                # 等价独立脚本（未做 editable 安装时用）
+```
+
+三轮评测：
+
+1. **retrieval** — 用 `data/retrieval_benchmark.json`（24 topic × 3 查询变体 = 72 对，含精确术语 / 同义改写 / 跨语言 EN↔ZH + 负例），
+   真实 embedding 索引人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、负例特异性，并判定是否达 recall@3≥70%。
+   同时输出 `SIM_THRESHOLD_SEARCH` 阈值敏感性曲线。
+2. **processing** — 真实 embedding + 确定性 LLM 桩（人工关键词/摘要），度量 merge/update 分支是否选对
+   （duplicate 应并入、distinct 应新建），输出 `SIM_THRESHOLD_HIGH` 阈值敏感性曲线。隔离度量 0.85/0.92 阈值，排除 LLM 关键词质量波动。
+3. **split** — 真实 embedding + 确定性 LLM 桩，度量分裂路径结构正确性（父向量移除、父子边 1.0、子向量入索引、子 story 可检索）。
+
+当前基线（2026-07-19，`data/eval_reports/baseline-2026-07-19.json`）：recall@3 = 100% ✅ 达标；
+合并正确率 85.7%（`dup-docker-dns` sim 0.83 落在 0.85 阈值下方被误判为 create，阈值敏感性显示 0.82 可达 100%）；
+分裂结构正确率 100%。`tests/test_eval.py` 用确定性 mock 覆盖评测逻辑本身，无需 Ollama。
+
 ## 🚀 使用
 
 ```bash

@@ -22,7 +22,9 @@ venv/
 .env.local
 
 # Runtime data (contains personal session memory — do not commit)
-data/
+data/*.db
+data/*.db-wal
+data/*.db-shm
 logs/
 
 # Claude Code local working state

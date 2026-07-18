@@ -19,6 +19,7 @@ CLI 入口 — storybook 命令
 import json
 import logging
 import sys
+from pathlib import Path
 
 import click
 
@@ -28,6 +29,7 @@ from . import collector
 from . import processor
 from . import search as search_module
 from . import health
+from . import eval as eval_module
 
 
 def setup_logging(verbose: bool = False):
@@ -262,6 +264,47 @@ def show(story_id):
 
 def main():
     cli()
+
+
+@cli.command()
+@click.argument("part", required=False, default="all",
+                type=click.Choice(["all", "retrieval", "processing", "split"]))
+@click.option("--report", "-r", type=click.Path(dir_okay=False, writable=True),
+              help="把完整 JSON 报告写入该路径")
+@click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
+              help="自定义 benchmark 数据集 JSON（默认 data/retrieval_benchmark.json）")
+def eval(part, report, benchmark_path):
+    """📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
+
+    PART 取值：retrieval / processing / split / all（默认 all）。
+
+    retrieval 用真实 embedding + 人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、
+    阈值敏感性曲线，并判定是否达 PRD「重复 bug 检索准确率≥70%」(recall@3)。
+    processing 用真实 embedding + 确定性 LLM 桩，度量 merge/update 分支是否选对。
+    split 度量分裂路径结构正确性。
+
+    需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染 data/memory.db。
+    用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
+    """
+    parts = ("retrieval", "processing", "split") if part == "all" else (part,)
+    click.echo(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
+
+    bp = benchmark_path
+    try:
+        rep = eval_module.run_all(parts=parts, benchmark_path=bp)
+    except Exception as ex:
+        click.echo(f"❌ 评测失败: {ex}")
+        raise
+
+    rep.meta["embed_mode"] = "ollama"
+    rep.meta["part"] = part
+    click.echo(eval_module.format_report(rep))
+
+    if report:
+        out = Path(report)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        click.echo(f"\n📝 JSON 报告已写入: {out}")
 
 
 if __name__ == "__main__":
