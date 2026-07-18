@@ -11,6 +11,43 @@ DB_PATH = DATA_DIR / "memory.db"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _load_env_file(path: Path) -> None:
+    """从 .env 文件加载环境变量。
+
+    优先级：命令行/已存在的环境变量 > .env 文件 > 代码默认值。
+    因此只在变量尚未由环境/命令行预设时写入（不覆盖），文件不存在时静默跳过。
+    支持空行、``#`` 注释、可选的 ``export`` 前缀、成对的单/双引号包裹。
+    """
+    if not path.is_file():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        # 不覆盖已存在的环境变量，保证命令行/环境变量优先级高于 .env
+        if key not in os.environ:
+            os.environ[key] = value
+
+
+# 启动时自动加载项目根 .env（无则跳过、不报错）；须在读 os.getenv 之前执行
+_load_env_file(BASE_DIR / ".env")
+
 # ── Ollama ──
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("STORYBOOK_LLM_MODEL", "qwythos-hermes:latest")
