@@ -1,0 +1,464 @@
+{
+  "version": 1,
+  "created": "2026-07-19",
+  "description": "Storybook 检索质量评测基准（ground truth）。每个 topic 对应一条 story（按 processor create 分支建索引：embedding = embed(keywords + problem_desc)）。queries 给出三种表述变体（exact 精确术语 / synonym 同义改写 / cross_lang 跨语言），ground truth 为本 topic 的 story。merge_pairs/split_cases 用于评测加工分支正确率与分裂质量。所有标注为人工 ground truth，可复现。",
+  "embed_index_text": "由 eval runner 复刻 processor.process_session 的索引文本：' '.join(keywords) + ' ' + problem_desc",
+  "topics": [
+    {
+      "id": "react-useeffect-loop",
+      "domain": "frontend-react",
+      "title": "React useEffect 无限渲染循环",
+      "problem_desc": "React useEffect 依赖数组包含 setState 导致无限渲染循环",
+      "keywords": ["React", "useEffect", "无限循环", "useCallback", "依赖数组", "setState"],
+      "content": "问题：useEffect 触发无限渲染循环。步骤：1.检查依赖数组发现 setData 是 useState 的 setter，每次渲染引用都不同；2.用 useCallback 包裹 setData 回调稳定引用；3.将不依赖 props 的逻辑移出 useEffect 到 useMemo。结果：setData 用 useCallback 包裹后渲染次数从无限降为 2 次。",
+      "queries": {
+        "exact": "useEffect 依赖数组 setState 无限循环",
+        "synonym": "React 组件一直重复渲染停不下来怎么办",
+        "cross_lang": "useEffect infinite render loop setState dependency"
+      }
+    },
+    {
+      "id": "react-state-not-update",
+      "domain": "frontend-react",
+      "title": "React 状态更新不反映到 UI",
+      "problem_desc": "直接修改 state 引用未变导致 React 不重新渲染",
+      "keywords": ["React", "状态管理", "不可变数据", "setState", "immer", "UI不更新"],
+      "content": "问题：React 状态更新后 UI 不刷新。步骤：1.发现直接 state.items.push 后 setState(state) 引用未变，React 跳过渲染；2.改为 setState({...state, items: [...state.items, newItem]}) 创建新引用；3.用 immer 简化不可变更新。结果：用展开运算符创建新引用后 UI 正确更新。",
+      "queries": {
+        "exact": "React setState 直接修改 state UI 不更新",
+        "synonym": "React 改了数据界面没刷新",
+        "cross_lang": "React state mutation no re-render"
+      }
+    },
+    {
+      "id": "python-listcomp-oom",
+      "domain": "python",
+      "title": "Python 列表推导式内存占用过高",
+      "problem_desc": "Python 列表推导式处理大数据集一次性载入内存导致 OOM",
+      "keywords": ["Python", "生成器", "内存优化", "列表推导式", "itertools", "OOM"],
+      "content": "问题：列表推导式处理大数据集 OOM。步骤：1.内存分析器定位列表推导式占 2GB；2.改为生成器表达式 sum(expensive_func(x) for x in huge_list) 惰性求值；3.对大数据集用 itertools.islice 分批处理。结果：改用生成器后内存从 2GB 降到 50MB。",
+      "queries": {
+        "exact": "Python 列表推导式 内存 OOM 生成器",
+        "synonym": "Python 处理大列表内存爆了怎么优化",
+        "cross_lang": "Python list comprehension out of memory generator"
+      }
+    },
+    {
+      "id": "python-async-block-loop",
+      "domain": "python",
+      "title": "Python 异步函数阻塞事件循环",
+      "problem_desc": "async 函数中用同步 requests 阻塞 asyncio 事件循环",
+      "keywords": ["Python", "asyncio", "aiohttp", "事件循环", "异步编程", "阻塞"],
+      "content": "问题：async 函数阻塞事件循环。步骤：1.发现 async fetch 内用同步 requests.get 卡住整个循环；2.替换为 aiohttp 的 async/await 接口；3.对必须同步的代码用 loop.run_in_executor 放线程池。结果：换 aiohttp 后事件循环不再阻塞，并发从 1 提升到 50。",
+      "queries": {
+        "exact": "Python asyncio 同步 requests 阻塞事件循环",
+        "synonym": "Python 异步函数把事件循环卡死了",
+        "cross_lang": "Python asyncio blocking event loop requests"
+      }
+    },
+    {
+      "id": "python-multiprocessing-sharedmem",
+      "domain": "python",
+      "title": "Python 多进程共享内存数据同步",
+      "problem_desc": "多进程写共享 Value 数据不一致",
+      "keywords": ["Python", "multiprocessing", "共享内存", "锁", "Manager", "Value"],
+      "content": "问题：多进程写共享 Value 数据不一致。步骤：1.发现多进程并发写 Value('i') 丢更新；2.用 v.get_lock() 加锁保护临界区；3.复杂共享状态改用 multiprocessing.Manager 的 dict/list。结果：用 Manager + 锁后多进程数据同步正确。",
+      "queries": {
+        "exact": "Python multiprocessing Value 共享内存 数据不一致",
+        "synonym": "Python 多进程共享变量数据对不上",
+        "cross_lang": "Python multiprocessing shared Value race condition"
+      }
+    },
+    {
+      "id": "git-rebase-lost-commits",
+      "domain": "git",
+      "title": "Git rebase 后 force push 丢失提交",
+      "problem_desc": "git rebase 后 force push 导致分支丢失提交记录",
+      "keywords": ["Git", "rebase", "reflog", "force-push", "分支恢复", "commit丢失"],
+      "content": "问题：rebase 后 force push 丢了提交。步骤：1.用 git reflog 找到丢失的 commit hash；2.git reset --hard <hash> 恢复；3.重新 rebase 用 --preserve-merges 避免丢失。结果：通过 reflog 成功恢复丢失的 3 个 commit。",
+      "queries": {
+        "exact": "git rebase force push commit 丢失 reflog",
+        "synonym": "git rebase 之后提交不见了怎么找回",
+        "cross_lang": "git rebase force push lost commits reflog"
+      }
+    },
+    {
+      "id": "git-rebase-conflict",
+      "domain": "git",
+      "title": "Git rebase 冲突解决",
+      "problem_desc": "git rebase 时遇到冲突不知道怎么解决",
+      "keywords": ["Git", "rebase", "冲突", "merge conflict", "git status", "abort"],
+      "content": "问题：git rebase 遇到冲突。步骤：1.git status 查看冲突文件；2.手动编辑冲突文件删除 <<<< === >>>> 标记；3.git add 已解决文件；4.git rebase --continue 继续；搞不定可 git rebase --abort 放弃。结果：按步骤解决冲突完成 rebase。",
+      "queries": {
+        "exact": "git rebase 冲突 conflict 解决",
+        "synonym": "git rebase 报冲突了怎么处理",
+        "cross_lang": "git rebase merge conflict resolution"
+      }
+    },
+    {
+      "id": "docker-dns-resolve",
+      "domain": "docker",
+      "title": "Docker 容器内 DNS 解析失败",
+      "problem_desc": "Docker 容器内 curl could not resolve host DNS 解析失败",
+      "keywords": ["Docker", "DNS", "网络配置", "daemon.json", "容器网络", "resolv.conf"],
+      "content": "问题：容器内 DNS 解析失败。步骤：1.cat /etc/resolv.conf 发现为空；2.docker run 加 --dns 8.8.8.8 临时修复；3.在 /etc/docker/daemon.json 配 dns 字段永久修复。结果：配 daemon.json 的 dns 后容器内 DNS 解析正常。",
+      "queries": {
+        "exact": "Docker 容器 DNS could not resolve host daemon.json",
+        "synonym": "Docker 容器里域名解析不了",
+        "cross_lang": "Docker container DNS resolution failed daemon.json"
+      }
+    },
+    {
+      "id": "docker-volume-mount",
+      "domain": "docker",
+      "title": "Docker compose volume 挂载不生效",
+      "problem_desc": "docker compose volume 挂载不生效容器内看不到文件",
+      "keywords": ["Docker", "compose", "volume", "挂载", "File Sharing", "路径映射"],
+      "content": "问题：compose volume 挂载不生效。步骤：1.检查 docker-compose.yml 的 volumes 路径；2.确认格式为 宿主机路径:容器路径，常见是写反了；3.检查 Docker Desktop File Sharing 是否包含该目录。结果：修正路径映射后容器内可见文件。",
+      "queries": {
+        "exact": "docker compose volume 挂载 不生效",
+        "synonym": "Docker compose 挂载的目录容器里看不到文件",
+        "cross_lang": "docker compose volume mount not working"
+      }
+    },
+    {
+      "id": "fastapi-cors",
+      "domain": "backend-python",
+      "title": "FastAPI CORS 错误",
+      "problem_desc": "FastAPI 前端 fetch 请求被 CORS 拒绝",
+      "keywords": ["FastAPI", "CORS", "CORSMiddleware", "中间件", "跨域", "fetch"],
+      "content": "问题：FastAPI CORS 拦截前端 fetch。步骤：1.from fastapi.middleware.cors import CORSMiddleware；2.app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])。结果：加 CORSMiddleware 后前端跨域请求成功。",
+      "queries": {
+        "exact": "FastAPI CORS CORSMiddleware 跨域 fetch",
+        "synonym": "FastAPI 前端请求被跨域策略挡了",
+        "cross_lang": "FastAPI CORS error CORSMiddleware fetch blocked"
+      }
+    },
+    {
+      "id": "pyproject-build-backend",
+      "domain": "python-tooling",
+      "title": "pyproject.toml build-backend 配置错误",
+      "problem_desc": "pyproject.toml build-backend 配置为无效路径导致 pip install -e . 失败",
+      "keywords": ["pyproject.toml", "build-backend", "setuptools", "build_meta", "pip install", "editable"],
+      "content": "问题：pip install -e . 失败。步骤：1.python -m coding_memory --help 报 No module named；2.检查 pyproject.toml 发现 build-backend 写成 setuptools.backends._legacy:_Backend（不存在）；3.改为 setuptools.build_meta。结果：改 build-backend 后 uv pip install -e . 成功。",
+      "queries": {
+        "exact": "pyproject.toml build-backend setuptools pip install 失败",
+        "synonym": "pip install -e . 装不上 build-backend 报错",
+        "cross_lang": "pyproject.toml build-backend invalid pip install editable fail"
+      }
+    },
+    {
+      "id": "discord-bot-missing-access",
+      "domain": "integrations",
+      "title": "Discord bot Missing Access 错误",
+      "problem_desc": "Hermes Discord bot 连接后无法发送消息 Missing Access",
+      "keywords": ["Discord", "bot", "Missing Access", "privileged intents", "权限", "guild"],
+      "content": "问题：Discord bot 连上但发消息报 Missing Access。步骤：1.hermes gateway status 确认 bot 在线但 guilds 为空；2.Discord Developer Portal 启用 Privileged Gateway Intents（Server Members / Message Content）；3.server 设置给 bot 角色 View Channels/Send Messages/Read History 权限；4.设 DISCORD_HOME_CHANNEL。结果：启用 intents + 配 server 权限后通信正常。",
+      "queries": {
+        "exact": "Discord bot Missing Access privileged intents 权限",
+        "synonym": "Discord 机器人连上了但发不出消息",
+        "cross_lang": "Discord bot Missing Access privileged intents permission"
+      }
+    },
+    {
+      "id": "photon-imessage-tapback",
+      "domain": "integrations",
+      "title": "iMessage tapback 跨进程限制",
+      "problem_desc": "Hermes Photon iMessage tapback 因跨进程限制无法从 agent 沙箱触发",
+      "keywords": ["iMessage", "Photon", "tapback", "跨进程", "沙箱", "sidecar"],
+      "content": "问题：iMessage tapback 无法从 agent 沙箱触发。步骤：1.触发反应需目标消息 iMessage GUID，存在 gateway 进程内存；2.沙箱里 _gateway_runner_ref() 返回 None 无法跨进程访问；3.查 chat.db 被 macOS 沙箱拒绝。方向：sidecar 加 /last-message 端点暴露消息 ID，或 gateway 传递 messageId。结果：需架构层改动，sidecar 新增端点或 gateway 透传 messageId。",
+      "queries": {
+        "exact": "iMessage tapback 跨进程 沙箱 gateway",
+        "synonym": "iMessage 表情回应在 agent 沙箱里触发不了",
+        "cross_lang": "iMessage tapback cross-process sandbox gateway"
+      }
+    },
+    {
+      "id": "ts-generic-inference",
+      "domain": "typescript",
+      "title": "TypeScript 泛型类型推断失败",
+      "problem_desc": "TypeScript 泛型合并函数类型推断失败",
+      "keywords": ["TypeScript", "泛型", "类型推断", "Record", "类型约束", "extends"],
+      "content": "问题：泛型合并函数类型推断失败。步骤：1.发现 function merge<T>(a:T,b:T) 中 T 未限制为 object；2.加 extends Record<string, unknown> 约束；3.用 T & U 推断合并后类型。结果：加泛型约束后类型推断正确，编译通过。",
+      "queries": {
+        "exact": "TypeScript 泛型 类型推断 Record 约束",
+        "synonym": "TS 泛型函数类型推不出来",
+        "cross_lang": "TypeScript generic type inference fail Record constraint"
+      }
+    },
+    {
+      "id": "pg-n-plus-1",
+      "domain": "database",
+      "title": "PostgreSQL N+1 查询问题",
+      "problem_desc": "PostgreSQL ORM 循环查询产生 N+1 慢查询",
+      "keywords": ["PostgreSQL", "N+1查询", "ORM优化", "prefetch_related", "select_related", "EXPLAIN"],
+      "content": "问题：列表接口 N+1 查询慢。步骤：1.EXPLAIN ANALYZE 发现执行 1001 次查询；2.用 select_related('posts')（外键 join）或 prefetch_related（反向外键）优化；3.外键字段加 db_index。结果：用 prefetch_related 后查询从 1001 次降到 2 次，耗时 3s→50ms。",
+      "queries": {
+        "exact": "PostgreSQL N+1 查询 prefetch_related 慢查询",
+        "synonym": "数据库列表接口查了上千次很慢",
+        "cross_lang": "PostgreSQL N+1 query prefetch_related slow"
+      }
+    },
+    {
+      "id": "mysql-deadlock",
+      "domain": "database",
+      "title": "MySQL 死锁排查",
+      "problem_desc": "MySQL 两个事务反向更新同批行导致死锁",
+      "keywords": ["MySQL", "死锁", "INNODB", "事务隔离", "加锁顺序", "deadlock"],
+      "content": "问题：MySQL 死锁。步骤：1.SHOW ENGINE INNODB STATUS 看死锁日志；2.发现两事务以不同顺序更新同一批行；3.统一所有事务加锁顺序，按 id ASC 排序后更新。结果：统一加锁顺序后死锁消除。",
+      "queries": {
+        "exact": "MySQL 死锁 INNODB 加锁顺序 事务",
+        "synonym": "MySQL 两个事务互相锁死了",
+        "cross_lang": "MySQL deadlock INNODB lock order transaction"
+      }
+    },
+    {
+      "id": "redis-cache-avalanche",
+      "domain": "cache",
+      "title": "Redis 缓存雪崩",
+      "problem_desc": "Redis 缓存相同 TTL 同时失效导致雪崩击穿数据库",
+      "keywords": ["Redis", "缓存雪崩", "TTL", "互斥锁", "缓存穿透", "抖动"],
+      "content": "问题：缓存雪崩压垮 DB。步骤：1.分析发现所有缓存设相同 TTL 同时失效；2.TTL 加随机抖动 timeout=300+random(0,60)；3.互斥锁防缓存重建时大量请求穿透 DB。结果：加 TTL 抖动 + 互斥锁后 DB 负载峰值降 90%。",
+      "queries": {
+        "exact": "Redis 缓存雪崩 TTL 互斥锁 穿透",
+        "synonym": "Redis 缓存同时过期把数据库打挂了",
+        "cross_lang": "Redis cache avalanche TTL jitter mutex"
+      }
+    },
+    {
+      "id": "nodejs-memory-leak",
+      "domain": "nodejs",
+      "title": "Node.js 内存泄漏 OOM",
+      "problem_desc": "Node.js 中间件 cache 对象无限增长导致 OOM",
+      "keywords": ["Node.js", "内存泄漏", "LRU缓存", "heapdump", "OOM", "中间件"],
+      "content": "问题：Node.js OOM。步骤：1.heapdump 抓堆快照对比发现 cache 对象无限增长；2.改用 lru-cache 设 max 上限；3.加 process.on('warning') 监控内存。结果：换 LRU 缓存后内存稳定在 200MB 以内，不再 OOM。",
+      "queries": {
+        "exact": "Node.js 内存泄漏 LRU heapdump OOM",
+        "synonym": "Node 服务内存一直涨最后 OOM 了",
+        "cross_lang": "Node.js memory leak LRU heapdump OOM"
+      }
+    },
+    {
+      "id": "websocket-reconnect",
+      "domain": "networking",
+      "title": "WebSocket 频繁断开重连",
+      "problem_desc": "WebSocket 连接 keepalive 超时频繁断开重连",
+      "keywords": ["WebSocket", "心跳机制", "keepalive", "重连", "连接稳定性", "ping"],
+      "content": "问题：WebSocket 频繁断连。步骤：1.查服务端日志发现 keepalive 超时；2.客户端加心跳 setInterval(() => ws.ping(), 30s)；3.服务端配 ping_timeout=60s。结果：加心跳后 WebSocket 稳定运行 24h 无断连。",
+      "queries": {
+        "exact": "WebSocket 心跳 keepalive 频繁断开 重连",
+        "synonym": "WebSocket 连接老掉线怎么保持稳定",
+        "cross_lang": "WebSocket frequent disconnect reconnect heartbeat keepalive"
+      }
+    },
+    {
+      "id": "k8s-crashloopbackoff",
+      "domain": "kubernetes",
+      "title": "Kubernetes Pod CrashLoopBackOff",
+      "problem_desc": "Kubernetes Pod CrashLoopBackOff 因 ConfigMap 名称拼写错误",
+      "keywords": ["Kubernetes", "CrashLoopBackOff", "ConfigMap", "Pod调试", "env", "Deployment"],
+      "content": "问题：Pod 一直 CrashLoopBackOff。步骤：1.kubectl describe pod 发现 env DB_HOST 未设置；2.检查 Deployment yaml 发现 env 引用的 ConfigMap 名称拼错；3.修正 ConfigMap 名并 kubectl apply。结果：修正 ConfigMap 引用后 Pod 正常运行。",
+      "queries": {
+        "exact": "Kubernetes CrashLoopBackOff ConfigMap env Pod",
+        "synonym": "k8s Pod 一直重启起不来怎么排查",
+        "cross_lang": "kubernetes pod keeps crashing restart loop ConfigMap env"
+      }
+    },
+    {
+      "id": "nginx-real-ip",
+      "domain": "networking",
+      "title": "Nginx 反向代理获取真实客户端 IP",
+      "problem_desc": "Nginx 反向代理后后端 remote_addr 总是 127.0.0.1",
+      "keywords": ["Nginx", "反向代理", "X-Real-IP", "X-Forwarded-For", "proxy", "客户端IP"],
+      "content": "问题：反代后拿不到真实客户端 IP。步骤：1.Nginx 默认不转发客户端 IP，$remote_addr 后端看到 127.0.0.1；2.加 proxy_set_header X-Real-IP $remote_addr；3.后端从 X-Forwarded-For 取第一个 IP。结果：配 X-Real-IP 头后后端正确获取客户端真实 IP。",
+      "queries": {
+        "exact": "Nginx 反向代理 X-Real-IP X-Forwarded-For 客户端IP",
+        "synonym": "Nginx 反代后后端拿到的 IP 都是本机",
+        "cross_lang": "Nginx reverse proxy real client IP X-Forwarded-For"
+      }
+    },
+    {
+      "id": "rust-borrow-checker",
+      "domain": "rust",
+      "title": "Rust 借用检查器 cannot borrow as mutable",
+      "problem_desc": "Rust 不可变借用存在时不能可变借用报错",
+      "keywords": ["Rust", "借用检查器", "所有权", "RefCell", "生命周期", "borrow"],
+      "content": "问题：Rust cannot borrow as mutable。步骤：1.理解所有权规则：不可变借用存在时不能可变借用；2.确保不可变借用用完再修改；3.需运行时检查用 RefCell。结果：调整借用顺序后编译通过。",
+      "queries": {
+        "exact": "Rust 借用检查器 cannot borrow as mutable 所有权",
+        "synonym": "Rust 编译器说不能可变借用怎么改",
+        "cross_lang": "Rust borrow checker cannot borrow as mutable ownership"
+      }
+    },
+    {
+      "id": "go-goroutine-leak",
+      "domain": "go",
+      "title": "Go goroutine 泄漏",
+      "problem_desc": "Go 循环起 goroutine 不等待完成导致 goroutine 泄漏连接数增长",
+      "keywords": ["Go", "goroutine泄漏", "WaitGroup", "context", "并发控制", "NumGoroutine"],
+      "content": "问题：goroutine 泄漏连接数涨。步骤：1.runtime.NumGoroutine() 发现 goroutine 持续增长；2.用 sync.WaitGroup 等待所有 goroutine 完成；3.加 context.WithTimeout 控超时。结果：加 WaitGroup + context 超时后 goroutine 数稳定。",
+      "queries": {
+        "exact": "Go goroutine 泄漏 WaitGroup context 并发",
+        "synonym": "Go 协程越起越多不回收怎么办",
+        "cross_lang": "Go goroutine leak WaitGroup context concurrency"
+      }
+    },
+    {
+      "id": "vue-props-validation",
+      "domain": "frontend-vue",
+      "title": "Vue props 类型校验不生效",
+      "problem_desc": "Vue props 类型校验只在开发模式警告不阻止渲染",
+      "keywords": ["Vue", "props", "类型校验", "validator", "TypeScript", "校验"],
+      "content": "问题：Vue props 类型校验不生效。步骤：1.Vue 2 props 类型校验只在开发模式警告不阻止渲染；2.升级为 validator 函数显式校验；3.用 TypeScript + vue-class-component 强化类型检查。结果：加 validator 函数后开发环境正确警告类型不匹配。",
+      "queries": {
+        "exact": "Vue props 类型校验 validator 不生效",
+        "synonym": "Vue 组件传错类型 props 不报错",
+        "cross_lang": "Vue props type validation validator not working"
+      }
+    }
+  ],
+  "negatives": [
+    "今天午饭吃什么",
+    "推荐一部周末看的电影",
+    "如何学习吉他弹唱"
+  ],
+  "merge_pairs": [
+    {
+      "id": "dup-react-loop",
+      "relation": "duplicate",
+      "expected_branch": "merge_or_update",
+      "expected_same_story": true,
+      "note": "同一 React useEffect 无限循环 bug，不同表述，应合并/更新到同一 story 而非新建",
+      "a": {
+        "problem_desc": "React useEffect 依赖数组包含 setState 导致无限渲染循环",
+        "keywords": ["React", "useEffect", "无限循环", "useCallback", "依赖数组"],
+        "summary": {"title": "React useEffect 无限循环", "content": "问题：useEffect 无限渲染。步骤：1.依赖数组含 setState；2.useCallback 包裹；3.逻辑移出。结果：渲染从无限降为 2 次。"}
+      },
+      "b": {
+        "problem_desc": "useEffect 里 setState 引起死循环渲染停不下来",
+        "keywords": ["React", "useEffect", "render loop", "useCallback", "setter"],
+        "summary": {"title": "useEffect 渲染死循环", "content": "问题：useEffect 死循环。步骤：1.setter 每次新引用；2.useCallback 稳定；3.移出副作用。结果：渲染稳定。"}
+      }
+    },
+    {
+      "id": "dup-docker-dns",
+      "relation": "duplicate",
+      "expected_branch": "merge_or_update",
+      "expected_same_story": true,
+      "note": "同一 Docker DNS 解析失败 bug，中英表述，应合并/更新",
+      "a": {
+        "problem_desc": "Docker 容器内 curl could not resolve host DNS 解析失败",
+        "keywords": ["Docker", "DNS", "daemon.json", "resolv.conf", "网络配置"],
+        "summary": {"title": "Docker DNS 解析失败", "content": "问题：容器 DNS 失败。步骤：1.resolv.conf 空；2.--dns 8.8.8.8；3.daemon.json 配 dns。结果：DNS 正常。"}
+      },
+      "b": {
+        "problem_desc": "Docker container cannot resolve hostname inside bridge network",
+        "keywords": ["Docker", "DNS", "daemon.json", "bridge network", "resolve host"],
+        "summary": {"title": "Docker container DNS fail", "content": "问题：容器内域名解析失败。步骤：1.resolv.conf 空；2.--dns 临时；3.daemon.json 永久。结果：解析正常。"}
+      }
+    },
+    {
+      "id": "dup-fastapi-cors",
+      "relation": "duplicate",
+      "expected_branch": "merge_or_update",
+      "expected_same_story": true,
+      "note": "同一 FastAPI CORS bug，不同表述，应合并/更新",
+      "a": {
+        "problem_desc": "FastAPI 前端 fetch 请求被 CORS 拒绝",
+        "keywords": ["FastAPI", "CORS", "CORSMiddleware", "跨域", "fetch"],
+        "summary": {"title": "FastAPI CORS 错误", "content": "问题：CORS 拦截 fetch。步骤：1.引 CORSMiddleware；2.add_middleware allow_origins *。结果：跨域成功。"}
+      },
+      "b": {
+        "problem_desc": "FastAPI 接口跨域被浏览器拦截跨域请求失败",
+        "keywords": ["FastAPI", "CORS", "中间件", "跨域", "allow_origins"],
+        "summary": {"title": "FastAPI 跨域拦截", "content": "问题：跨域被拦。步骤：1.CORSMiddleware；2.allow_origins。结果：跨域通。"}
+      }
+    },
+    {
+      "id": "near-identical-pg-n-plus-1",
+      "relation": "near_identical",
+      "expected_branch": "update",
+      "expected_same_story": true,
+      "note": "几乎相同表述的 PostgreSQL N+1 问题，应走 update（sim>=0.92）",
+      "a": {
+        "problem_desc": "PostgreSQL ORM 循环查询产生 N+1 慢查询",
+        "keywords": ["PostgreSQL", "N+1查询", "prefetch_related", "select_related", "EXPLAIN"],
+        "summary": {"title": "PostgreSQL N+1 查询", "content": "问题：N+1 慢查询。步骤：1.EXPLAIN；2.prefetch_related；3.db_index。结果：1001→2 次。"}
+      },
+      "b": {
+        "problem_desc": "PostgreSQL ORM 循环查询产生 N+1 慢查询（prefetch 优化）",
+        "keywords": ["PostgreSQL", "N+1查询", "prefetch_related", "select_related", "EXPLAIN"],
+        "summary": {"title": "PostgreSQL N+1 查询", "content": "问题：N+1 慢查询。步骤：1.EXPLAIN；2.prefetch_related；3.db_index。结果：1001→2 次。"}
+      }
+    },
+    {
+      "id": "distinct-react-loop-vs-state",
+      "relation": "distinct",
+      "expected_branch": "create",
+      "expected_same_story": false,
+      "note": "useEffect 无限循环 vs 状态不更新 UI，都是 React 状态问题但是不同 bug，应各自新建",
+      "a": {
+        "problem_desc": "React useEffect 依赖数组包含 setState 导致无限渲染循环",
+        "keywords": ["React", "useEffect", "无限循环", "useCallback", "依赖数组"],
+        "summary": {"title": "useEffect 无限循环", "content": "问题：useEffect 死循环。步骤：useCallback 稳定 setter。结果：渲染稳定。"}
+      },
+      "b": {
+        "problem_desc": "React 直接修改 state 引用未变导致 UI 不刷新",
+        "keywords": ["React", "状态管理", "不可变数据", "setState", "UI不更新"],
+        "summary": {"title": "React 状态不更新 UI", "content": "问题：改 state UI 不刷。步骤：展开运算符新引用。结果：UI 更新。"}
+      }
+    },
+    {
+      "id": "distinct-docker-dns-vs-volume",
+      "relation": "distinct",
+      "expected_branch": "create",
+      "expected_same_story": false,
+      "note": "Docker DNS 解析 vs volume 挂载，都是 Docker 但不同问题，应各自新建",
+      "a": {
+        "problem_desc": "Docker 容器内 curl could not resolve host DNS 解析失败",
+        "keywords": ["Docker", "DNS", "daemon.json", "resolv.conf", "网络配置"],
+        "summary": {"title": "Docker DNS 解析失败", "content": "问题：容器 DNS 失败。步骤：daemon.json 配 dns。结果：DNS 正常。"}
+      },
+      "b": {
+        "problem_desc": "docker compose volume 挂载不生效容器内看不到文件",
+        "keywords": ["Docker", "compose", "volume", "挂载", "路径映射"],
+        "summary": {"title": "Docker volume 挂载不生效", "content": "问题：volume 不生效。步骤：宿主机:容器路径。结果：文件可见。"}
+      }
+    },
+    {
+      "id": "distinct-git-rebase-lost-vs-conflict",
+      "relation": "distinct",
+      "expected_branch": "create",
+      "expected_same_story": false,
+      "note": "rebase 丢提交 vs rebase 冲突，都是 git rebase 但不同问题，应各自新建",
+      "a": {
+        "problem_desc": "git rebase 后 force push 导致分支丢失提交记录",
+        "keywords": ["Git", "rebase", "reflog", "force-push", "分支恢复"],
+        "summary": {"title": "git rebase 丢提交", "content": "问题：rebase 丢提交。步骤：reflog 找回。结果：恢复 3 commit。"}
+      },
+      "b": {
+        "problem_desc": "git rebase 时遇到冲突不知道怎么解决",
+        "keywords": ["Git", "rebase", "冲突", "merge conflict", "git status"],
+        "summary": {"title": "git rebase 冲突", "content": "问题：rebase 冲突。步骤：删标记 + add + continue。结果：rebase 完成。"}
+      }
+    }
+  ],
+  "split_cases": [
+    {
+      "id": "split-react-loop-twosteps",
+      "relation": "merge_should_split",
+      "expected_split": true,
+      "note": "同一 React useEffect 无限循环 bug 的会话（与 existing 相似度落在 merge 区间 [0.85,0.92)），合并后含 2 个独立子步骤（useCallback 稳定 setter + useReducer 拆分状态），应触发分裂为子 story",
+      "existing": {
+        "problem_desc": "React useEffect 依赖数组包含 setState 导致无限渲染循环",
+        "keywords": ["React", "useEffect", "无限循环", "useCallback", "依赖数组"],
+        "summary": {"title": "React useEffect 无限循环", "content": "问题：useEffect 死循环。步骤：1.依赖含 setState；2.useCallback 包裹 setter。结果：渲染稳定。"}
+      },
+      "incoming": {
+        "problem_desc": "useEffect 里 setState 死循环，且 useReducer 拆分状态后仍重渲染",
+        "keywords": ["React", "useEffect", "无限循环", "useCallback", "useReducer"],
+        "summary": {"title": "useEffect 循环与 useReducer 重渲染", "content": "问题：useEffect 死循环且 useReducer 重渲染。步骤：1.useCallback 稳定 setter 解决循环；2.useReducer 拆分状态避免不相关重渲染。结果：循环消除且渲染收敛。"}
+      }
+    }
+  ]
+}
