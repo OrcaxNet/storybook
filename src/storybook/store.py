@@ -69,6 +69,9 @@ def get_db() -> sqlite3.Connection:
     db = sqlite3.connect(str(config.DB_PATH))
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    # MCP server（agent 运行时 recall，会写 access_count/边权）与做梦周期 process
+    # 可能并发写同一库；设 busy_timeout 让后到的写等待而非立刻报 database is locked。
+    db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
     # 加载 sqlite-vec 扩展
     db.enable_load_extension(True)

@@ -18,11 +18,15 @@ CLI 入口 — storybook 命令
   storybook stats                   查看统计
   storybook list                    列出所有story
   storybook show <story_id>         查看story详情
+  storybook prime [--cwd PATH]      会话启动主动注入（晨间简报），供 SessionStart hook 调用
+  storybook mcp                     启动 MCP server（stdio，供 Claude Code 等 agent 召回）
 """
 import json
 import logging
+import os
 import sys
 import threading
+from pathlib import Path
 
 import click
 
@@ -33,6 +37,7 @@ from . import processor
 from . import search as search_module
 from . import health
 from . import dreamd
+from . import eval as eval_module
 
 
 def setup_logging(verbose: bool = False):
@@ -71,6 +76,99 @@ def doctor(fix):
 
 
 @cli.command()
+def mcp():
+    """🔌 启动 MCP server（stdio），把记忆检索暴露给 MCP-aware agent（如 Claude Code）。
+
+    agent 可在运行时调用 recall / get_story / stats 召回过往记忆，
+    实现"跨 session 经验复用"。server 为独立进程，不依赖 CLI 运行态。
+
+    需先安装 MCP 依赖：uv pip install -e ".[mcp]"。
+    Claude Code 接入配置见 README「MCP 接入」一节。
+    """
+    from . import mcp_server
+    mcp_server.main()
+
+
+@cli.command()
+@click.option("--cwd", default=None,
+              help="当前项目目录（默认取进程 cwd；hook 中传 $CLAUDE_PROJECT_DIR）")
+@click.option("--prompt", "first_prompt", default="",
+              help="可选的首条提问（agent 路径或手动传入；无则仅用 cwd 派生查询）")
+@click.option("--top", "-t", "top_k", type=int, default=None, help="最多召回候选数")
+@click.option("--budget", "token_budget", type=int, default=None,
+              help="简报 token 预算上限（默认 2000）")
+@click.option("--format", "output_format",
+              type=click.Choice(["text", "json", "hook"]),
+              default="text",
+              help="text=纯文本简报到 stdout（供 hook 注入）；json=完整结构化结果；"
+                   "hook=SessionStart hookSpecificOutput JSON")
+def prime(cwd, first_prompt, top_k, token_budget, output_format):
+    """🌅 会话启动主动注入（晨间简报）。
+
+    基于 cwd + 可选首条提问，召回 top-N 相关记忆，生成精简摘要。
+    相关度不足或无匹配时静默不输出（供 SessionStart hook 注入：无输出即不污染上下文）。
+
+    \b
+    Hook 用法（默认 text 输出到 stdout，被 Claude Code 作为额外上下文注入）:
+      storybook prime --cwd "$CLAUDE_PROJECT_DIR"
+
+    \b
+    结构化注入（支持 hookSpecificOutput 的 Claude Code 版本）:
+      storybook prime --cwd "$CLAUDE_PROJECT_DIR" --format hook
+
+    详见 README「🌅 会话启动注入」一节。
+    """
+    from . import prime as prime_module
+
+    # CLI 默认用进程 cwd（hook 中应显式传 $CLAUDE_PROJECT_DIR）；prime_context 本身不回退，
+    # 以便 cwd/first_prompt 均空时静默不注入的语义可被单测。
+    cwd = cwd or os.getcwd()
+
+    # hook 路径须非侵入：DB 未初始化等任何异常都不应报错或向上下文注入错误。
+    # 全程兜底 try/except：失败时退化为静默不注入（exit 0、stdout 空）。
+    try:
+        try:
+            store.init_db()
+        except Exception as e:  # noqa: BLE001  -- best-effort，工具调用时再按需报错
+            logging.getLogger(__name__).warning("prime: init_db 失败（继续）: %s", e)
+        result = prime_module.prime_context(
+            cwd=cwd, first_prompt=first_prompt,
+            top_k=top_k, token_budget=token_budget,
+        )
+    except Exception as e:  # noqa: BLE001  -- 绝不向 hook 上下文抛错
+        result = {
+            "cwd": cwd, "query": "", "count": 0, "injected": False,
+            "briefing": "", "matches": [], "truncated": False,
+            "note": f"prime 异常：{e}",
+        }
+
+    briefing = result.get("briefing") or ""
+
+    if output_format == "json":
+        # 完整结构化结果（调试 / 程序化用）
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if output_format == "hook":
+        # SessionStart hook 结构化注入：仅 additionalContext 被注入，其余 stdout 被忽略
+        payload = {
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": briefing,
+            }
+        }
+        click.echo(json.dumps(payload, ensure_ascii=False))
+        return
+
+    # text（默认 / hook 兼容）：只把简报写到 stdout（注入上下文）
+    if briefing:
+        click.echo(briefing)
+    # note（环境问题等）只进 stderr，不进上下文，避免污染
+    if result.get("note"):
+        click.echo(f"[storybook prime] {result['note']}", err=True)
+
+
+@cli.command()
 @click.argument("path", required=False)
 @click.option("--claude", is_flag=True, help="从 Claude Code 采集")
 @click.option("--cursor", is_flag=True, help="从 Cursor 自动采集")
@@ -105,15 +203,14 @@ def import_data(path, claude, cursor, sample, n):
         click.echo(f"✅ 导入 {count} 条 Claude Code 会话")
 
     elif path:
-        import os as _os
         click.echo(f"📥 从路径导入: {path}")
         sessions = []
-        if _os.path.isdir(path):
+        if os.path.isdir(path):
             # 目录：扫描所有 .json 文件
-            for fname in sorted(_os.listdir(path)):
+            for fname in sorted(os.listdir(path)):
                 if not fname.endswith(".json"):
                     continue
-                fpath = _os.path.join(path, fname)
+                fpath = os.path.join(path, fname)
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -326,6 +423,47 @@ def show(story_id):
 
 def main():
     cli()
+
+
+@cli.command()
+@click.argument("part", required=False, default="all",
+                type=click.Choice(["all", "retrieval", "processing", "split"]))
+@click.option("--report", "-r", type=click.Path(dir_okay=False, writable=True),
+              help="把完整 JSON 报告写入该路径")
+@click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
+              help="自定义 benchmark 数据集 JSON（默认 data/retrieval_benchmark.json）")
+def eval(part, report, benchmark_path):
+    """📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
+
+    PART 取值：retrieval / processing / split / all（默认 all）。
+
+    retrieval 用真实 embedding + 人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、
+    阈值敏感性曲线，并判定是否达 PRD「重复 bug 检索准确率≥70%」(recall@3)。
+    processing 用真实 embedding + 确定性 LLM 桩，度量 merge/update 分支是否选对。
+    split 度量分裂路径结构正确性。
+
+    需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染 data/memory.db。
+    用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
+    """
+    parts = ("retrieval", "processing", "split") if part == "all" else (part,)
+    click.echo(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
+
+    bp = benchmark_path
+    try:
+        rep = eval_module.run_all(parts=parts, benchmark_path=bp)
+    except Exception as ex:
+        click.echo(f"❌ 评测失败: {ex}")
+        raise
+
+    rep.meta["embed_mode"] = "ollama"
+    rep.meta["part"] = part
+    click.echo(eval_module.format_report(rep))
+
+    if report:
+        out = Path(report)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        click.echo(f"\n📝 JSON 报告已写入: {out}")
 
 
 if __name__ == "__main__":
