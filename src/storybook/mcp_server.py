@@ -1,12 +1,15 @@
 """MCP server：把记忆检索暴露给 MCP-aware agent（如 Claude Code）运行时召回。
 
 作为独立 stdio 进程运行，**复用**现有 ``search.search`` / ``store.get_story`` /
-``store.get_stats``，不重复实现检索逻辑。
+``store.get_stats`` / ``prime.prime_context``，不重复实现检索逻辑。
 
 工具：
-  - recall(query, top_k?)  向量检索 + 关联激活（与 CLI ``search`` 同源，含 access_count/边权提权副作用）
-  - get_story(story_id)    查看单条记忆详情（含关联记忆）
-  - stats()                记忆库概况
+  - recall(query, top_k?)        向量检索 + 关联激活（与 CLI ``search`` 同源，含 access_count/边权提权副作用）
+  - get_story(story_id)          查看单条记忆详情（含关联记忆）
+  - stats()                      记忆库概况
+  - prime_context(cwd, first_prompt?, top_k?)
+                                  会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成
+                                  ≤2k token 的精简摘要，相关度不足时静默不注入
 
 启动方式（二选一，均为独立进程，不依赖 CLI 运行态）：
   storybook mcp                   # 经 CLI 入口（需安装 [mcp] extra）
@@ -22,6 +25,7 @@ from typing import Any
 from . import config  # noqa: F401  -- 触发 config 初始化（.env 自动加载、目录创建）
 from . import store
 from . import search as search_module
+from . import prime as prime_module
 
 logger = logging.getLogger(__name__)
 
@@ -163,12 +167,24 @@ def get_stats_overview() -> dict:
         }
 
 
+def prime_context_memories(cwd: str = "", first_prompt: str = "",
+                           top_k: int = 5) -> dict:
+    """会话启动主动注入（晨间简报）。直接转调 ``prime.prime_context``。
+
+    单独包一层仅为与 ``recall_memories`` / ``get_story_detail`` / ``get_stats_overview``
+    保持"模块级核心逻辑 + MCP 装配"的分层一致，便于不依赖 mcp SDK 直接单测。
+    语义见 ``prime.prime_context``：相关度不足 / 召回为空 / Ollama 不可用时
+    ``injected=False``、``briefing=""``，不抛错（晨间简报须非侵入）。
+    """
+    return prime_module.prime_context(cwd=cwd, first_prompt=first_prompt, top_k=top_k)
+
+
 # ═══════════════════════════════════════════════
 #  FastMCP server 装配（延迟导入 mcp）
 # ═══════════════════════════════════════════════
 
 def create_server():
-    """构造并返回 FastMCP server，注册三个工具。
+    """构造并返回 FastMCP server，注册四个工具。
 
     ``mcp`` SDK 在此处延迟导入：未安装 [mcp] extra 时抛 ModuleNotFoundError，
     由 ``main`` 转为可操作提示。
@@ -212,6 +228,22 @@ def create_server():
         （`storybook import-data` + `storybook process`）。
         """
         return get_stats_overview()
+
+    @mcp.tool()
+    def prime_context(cwd: str = "", first_prompt: str = "", top_k: int = 5) -> dict:
+        """会话启动主动注入（晨间简报）：基于当前项目目录 + 首条提问召回相关记忆并生成精简摘要。
+
+        在新会话开始、读到用户首条提问后调用，实现"下意识回忆"过往相似经历。
+        返回 ``injected=True`` 时 ``briefing`` 为可直接呈现给用户的简报（≤2k token）；
+        ``injected=False`` 表示无相关记忆或环境不可用（不报错，静默不注入，``note`` 给出原因）。
+        命中记忆会自增 access_count 并提权关联边（与 recall 同源副作用）。
+
+        Args:
+            cwd: 当前项目目录（agent 的工作目录）。为空且 first_prompt 也为空时静默不注入。
+            first_prompt: 用户的首条提问/任务描述（可选；无则仅用 cwd 派生查询）。
+            top_k: 最多考虑的候选记忆数，默认 5（再按 token 预算裁剪）。
+        """
+        return prime_context_memories(cwd=cwd, first_prompt=first_prompt, top_k=top_k)
 
     return mcp
 
