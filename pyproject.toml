@@ -10,6 +10,13 @@ dependencies = [
     "sqlite-vec>=0.1",
 ]
 
+[project.optional-dependencies]
+# 测试套件依赖：pytest + 覆盖率。`uv pip install -e ".[test]"` 安装。
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
 [project.scripts]
 storybook = "storybook.cli:cli"
 
@@ -19,3 +26,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# 失败用例摘要、禁用警告噪音、显式标注被 skip 的原因
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "error::DeprecationWarning:storybook.*",
+]
