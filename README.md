@@ -20,6 +20,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🔍 **联想检索**：向量召回 + 边图扩散，共同召回会反向增强边权重
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
 - 🏠 **完全离线**：只需本地 Ollama，零云端依赖
+- 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
 
 ## 🏗 架构
 
@@ -113,6 +114,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
   验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
 - **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
+- **MCP server**：`tests/test_mcp_server.py` 覆盖三个工具的核心逻辑与 FastMCP 装配/端到端调用。需 `.[mcp,test]`（即多装 `[mcp]` extra）；未装时该文件自动 skip，不影响基础 `pytest` 全绿。
 
 ## 🚀 使用
 
@@ -129,6 +131,7 @@ storybook search "<query>" [--top 3] # 向量检索 + 关联 Story 激活
 storybook stats                      # 系统统计
 storybook list [--limit 20]          # 列出所有 Story
 storybook show <story_id>            # 查看 Story 详情（含关联记忆）
+storybook mcp                        # 启动 MCP server（stdio，供 Claude Code 等 agent 运行时召回）
 ```
 
 > 命令是 **`import-data`** 而非 `import`（click 把 `import_data` 函数自动连字符化）。无参数/无 flag 时默认走 `--claude`。`--claude` / `--sample` / `--cursor` / `<path>` 四种来源互斥。
@@ -141,6 +144,65 @@ storybook process                       # 跑做梦周期
 storybook search "如何调试数据库连接"     # 搜一下
 storybook stats                         # 看看沉淀了多少 Story
 ```
+
+## 🔌 MCP 接入（供 agent 运行时召回）
+
+> 项目北极星是 **agent 跨 session 经验复用**。仅靠人工 `storybook search` 无法让 agent 在运行时自动召回；MCP server 把检索暴露为工具后，Claude Code 等 MCP-aware agent 可在新任务中主动查询记忆库。
+
+MCP server 是一个独立 stdio 进程，**复用** `search.search` / `store.get_story` / `store.get_stats`，不重复实现检索逻辑。
+
+### 安装
+
+MCP SDK 作为可选依赖，需单独安装：
+
+```bash
+VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[mcp]"
+```
+
+### 启动方式（二选一，均为独立进程，不依赖 CLI 运行态）
+
+```bash
+storybook mcp                   # 经 CLI 入口（推荐）
+python -m storybook.mcp_server  # 直接跑模块（editable 安装后即可）
+```
+
+### 在 Claude Code 中启用
+
+最简方式（命令行注册）：
+
+```bash
+claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
+```
+
+或手动写入配置（用户级 `~/.claude.json`，或项目级 `.mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "storybook": {
+      "command": "/绝对路径/storybook/.venv/bin/storybook",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+> ⚠️ 用 **绝对路径** 指向 venv 里的 `storybook`：Claude Code 启动 MCP 进程时不一定继承 shell 的 PATH，相对命令可能找不到。未做 editable 安装时可用 `python -m storybook.mcp_server`（`command` 指向 `.venv/bin/python`，`args` 为 `["-m", "storybook.mcp_server"]`）。
+
+### 暴露的工具
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `recall` | `query`（必填）, `top_k?`（默认 3） | 向量检索 + 关联激活，返回 `{query, count, matches:[{story_id,title,content,keywords,similarity,related}]}`。`count=0` 表示无匹配（记忆库为空或无相关记忆），此时 `matches` 为空，不返回噪声 |
+| `get_story` | `story_id`（必填） | 查看单条记忆详情（含关联记忆），剥离 1024 维 embedding |
+| `stats` | - | 记忆库概况（会话/Story/关联边数量） |
+
+### 说明
+
+- server 与 CLI 共享同一份配置（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
+- `recall` 复用 CLI `search` 的全部语义，**包括副作用**：命中记忆的 `access_count` 自增、共同召回的关联边权重提权（"反复回忆加深记忆路径"）。
+- `recall` 需要本地 Ollama 生成查询向量；Ollama 不可用时返回可操作错误（提示 `storybook doctor`）。`get_story` / `stats` 不依赖 Ollama。
+- server 启动时自动 `init_db`：全新环境下 `recall` 返回空、`stats` 返回 0、`get_story` 报不存在。
 
 ## ⚙️ 配置
 
@@ -179,7 +241,8 @@ storybook/
 │   ├── processor.py    # 做梦周期（dream cycle）
 │   ├── llm.py          # Ollama LLM 调用
 │   ├── embeddings.py   # Ollama embedding 调用
-│   └── search.py       # 向量检索 + 关联激活
+│   ├── search.py       # 向量检索 + 关联激活
+│   └── mcp_server.py   # MCP server（recall / get_story / stats）
 ├── data/               # 运行时数据库 memory.db（不纳入版本管理）
 ├── logs/               # 运行时日志（不纳入版本管理）
 ├── docs/TECH_DESIGN.md # 原始设计文档
@@ -194,6 +257,7 @@ storybook/
 
 - **完全离线**：所有 LLM / embedding 走本地 Ollama，不发送任何数据到云端。
 - **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
+- **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`（需 `[mcp]` extra；接入见上文「🔌 MCP 接入」）。
 - `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`，不存在 `tests/` 或 `scripts/` 目录，也未配置 launchd plist）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 
