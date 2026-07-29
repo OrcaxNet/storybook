@@ -4,6 +4,8 @@
 import json
 import sqlite3
 import logging
+import os
+import uuid
 from typing import Optional
 
 import sqlite_vec
@@ -17,6 +19,10 @@ _SCHEMA = """
 -- 会话日志表（原始导入数据）
 CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    global_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    sync_state TEXT NOT NULL DEFAULT 'local_only'
+        CHECK(sync_state IN ('local_only', 'synced', 'pending', 'conflict', 'paused', 'error')),
     source TEXT NOT NULL,
     raw_content TEXT NOT NULL,
     problem_desc TEXT,
@@ -30,6 +36,10 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- Story 表（结构化记忆单元）
 CREATE TABLE IF NOT EXISTS stories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    global_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    sync_state TEXT NOT NULL DEFAULT 'local_only'
+        CHECK(sync_state IN ('local_only', 'synced', 'pending', 'conflict', 'paused', 'error')),
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     keywords TEXT NOT NULL DEFAULT '[]',
@@ -46,6 +56,10 @@ CREATE TABLE IF NOT EXISTS stories (
 -- 关联边表（带权重的关联网络）
 CREATE TABLE IF NOT EXISTS edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    global_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    sync_state TEXT NOT NULL DEFAULT 'local_only'
+        CHECK(sync_state IN ('local_only', 'synced', 'pending', 'conflict', 'paused', 'error')),
     source_id INTEGER NOT NULL,
     target_id INTEGER NOT NULL,
     weight REAL DEFAULT 0.0,
@@ -66,7 +80,10 @@ CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
 
 def get_db() -> sqlite3.Connection:
     """获取数据库连接（每次调用创建新连接，用完即关）"""
+    config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(config.DB_PATH))
+    if os.name != "nt":
+        config.DB_PATH.chmod(0o600)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     # MCP server（agent 运行时 recall，会写 access_count/边权）与做梦周期 process
@@ -81,10 +98,11 @@ def get_db() -> sqlite3.Connection:
 
 
 def init_db():
-    """初始化数据库 schema"""
+    """初始化数据库 schema，并补齐 v0.2 Profile/同步预留字段。"""
     db = get_db()
     try:
         db.executescript(_SCHEMA)
+        _ensure_identity_columns(db)
         # 创建 sqlite-vec 虚拟表
         db.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS story_vectors USING vec0(
@@ -96,6 +114,56 @@ def init_db():
         logger.info("数据库初始化完成: %s", config.DB_PATH)
     finally:
         db.close()
+
+
+def _new_global_id() -> str:
+    """生成不依赖路径、hostname 或数据库自增键的全局对象 ID。"""
+
+    return str(uuid.uuid4())
+
+
+def _ensure_identity_columns(db: sqlite3.Connection) -> None:
+    """为已有 v0.1 数据库原地补齐 Profile、global_id 与 sync_state。
+
+    完整的旧库迁移/备份由后续迁移流程负责；这里仅做幂等、无损的兼容列扩展，
+    确保当前代码可以继续打开已有数据库。
+    """
+
+    for table in ("sessions", "stories", "edges"):
+        columns = {
+            row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "global_id" not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN global_id TEXT")
+        if "profile_id" not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN profile_id TEXT")
+        if "sync_state" not in columns:
+            db.execute(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN sync_state TEXT NOT NULL DEFAULT 'local_only'"
+            )
+
+        missing = db.execute(
+            f"SELECT id FROM {table} WHERE global_id IS NULL OR global_id = ''"
+        ).fetchall()
+        for row in missing:
+            db.execute(
+                f"UPDATE {table} SET global_id = ? WHERE id = ?",
+                (_new_global_id(), row["id"]),
+            )
+        db.execute(
+            f"UPDATE {table} SET profile_id = ? "
+            "WHERE profile_id IS NULL OR profile_id = ''",
+            (config.PROFILE_ID,),
+        )
+        db.execute(
+            f"UPDATE {table} SET sync_state = 'local_only' "
+            "WHERE sync_state IS NULL OR sync_state = ''"
+        )
+        db.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_global_id "
+            f"ON {table}(global_id)"
+        )
 
 
 # ═══════════════════════════════════════════════
@@ -232,9 +300,14 @@ def add_session(source: str, raw_content: str, problem_desc: str = "",
     db = get_db()
     try:
         cur = db.execute(
-            """INSERT INTO sessions (source, raw_content, problem_desc, code_snippets, conclusion)
-               VALUES (?, ?, ?, ?, ?)""",
-            (source, raw_content, problem_desc, code_snippets, conclusion)
+            """INSERT INTO sessions (
+                   global_id, profile_id, sync_state,
+                   source, raw_content, problem_desc, code_snippets, conclusion
+               ) VALUES (?, ?, 'local_only', ?, ?, ?, ?, ?)""",
+            (
+                _new_global_id(), config.PROFILE_ID,
+                source, raw_content, problem_desc, code_snippets, conclusion,
+            )
         )
         db.commit()
         return cur.lastrowid
@@ -295,9 +368,12 @@ def add_story(title: str, content: str, keywords: list[str],
     try:
         emb_blob = np.array(embedding, dtype=np.float32).tobytes()
         cur = db.execute(
-            """INSERT INTO stories (title, content, keywords, embedding, parent_id, source_session_ids)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (title, content, json.dumps(keywords, ensure_ascii=False),
+            """INSERT INTO stories (
+                   global_id, profile_id, sync_state,
+                   title, content, keywords, embedding, parent_id, source_session_ids
+               ) VALUES (?, ?, 'local_only', ?, ?, ?, ?, ?, ?)""",
+            (_new_global_id(), config.PROFILE_ID,
+             title, content, json.dumps(keywords, ensure_ascii=False),
              emb_blob, parent_id, json.dumps(source_session_ids or []))
         )
         story_id = cur.lastrowid
@@ -448,9 +524,14 @@ def add_or_update_edge(source_id: int, target_id: int, weight: float,
             )
         else:
             db.execute(
-                """INSERT INTO edges (source_id, target_id, weight, edge_type)
-                   VALUES (?, ?, ?, ?)""",
-                (source_id, target_id, weight, edge_type)
+                """INSERT INTO edges (
+                       global_id, profile_id, sync_state,
+                       source_id, target_id, weight, edge_type
+                   ) VALUES (?, ?, 'local_only', ?, ?, ?, ?)""",
+                (
+                    _new_global_id(), config.PROFILE_ID,
+                    source_id, target_id, weight, edge_type,
+                )
             )
         db.commit()
     finally:
@@ -614,6 +695,12 @@ def get_stats() -> dict:
             "edges": db.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
             "root_stories": db.execute("SELECT COUNT(*) FROM stories WHERE parent_id IS NULL").fetchone()[0],
             "child_stories": db.execute("SELECT COUNT(*) FROM stories WHERE parent_id IS NOT NULL").fetchone()[0],
+            "profile": {
+                "id": config.PROFILE_ID,
+                "display_name": config.ACTIVE_PROFILE.display_name,
+                "mode": config.PROFILE_MODE,
+            },
+            "sync_state": config.SYNC_STATE,
         }
         return stats
     finally:

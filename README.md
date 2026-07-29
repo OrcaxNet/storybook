@@ -56,7 +56,7 @@ embed 查询（关键词 + 查询文本）→ vec0 top-K（取 `top_k*2`，按 `
 
 ### 存储层（`store.py`）
 
-单文件 `data/memory.db`（SQLite + sqlite-vec 扩展）。三张表 `sessions` / `stories` / `edges` 外加 `story_vectors` vec0 虚表。**embedding 存两处且必须同步**：`stories.embedding`（float32 BLOB）与 `story_vectors` 一行。`search_by_vector` 用 L2 距离查询并换算为余弦相似度 `1 - dist²/2`（对 L2 归一化向量精确）。
+每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。三张表 `sessions` / `stories` / `edges` 外加 `story_vectors` vec0 虚表；持久对象带与路径无关的 `global_id`、`profile_id` 和 `sync_state=local_only`。**embedding 存两处且必须同步**：`stories.embedding`（float32 BLOB）与 `story_vectors` 一行。`search_by_vector` 用 L2 距离查询并换算为余弦相似度 `1 - dist²/2`（对 L2 归一化向量精确）。
 
 ## 🔧 环境要求
 
@@ -83,6 +83,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .
 # （项目目录移动后 shebang 可能失效，重新跑一次即可）
 
 # 3. 验证
+storybook profile show
 storybook stats
 ```
 
@@ -91,6 +92,28 @@ storybook stats
 ```bash
 PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 ```
+
+## 👤 用户级 Profile 与共享存储
+
+首次运行会创建随机 UUID 的 `local` Profile。Claude Code 采集、Cursor 采集、CLI、hook 与 MCP（包括 Codex 等 MCP-aware agent）都经同一份 registry 解析当前数据库，因此切换项目 cwd、移动或重命名 Storybook 仓库不会改变记忆归属。
+
+| 平台 | Profile 数据根 |
+|------|----------------|
+| macOS | `~/Library/Application Support/Storybook/profiles/{profile_id}/` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/storybook/profiles/{profile_id}/` |
+| Windows | `%LOCALAPPDATA%\Storybook\profiles\{profile_id}\` |
+
+数据库/索引位于 Profile 数据根，缓存与日志走各平台的 cache/state 目录；目录权限在 POSIX 上为 `0700`，registry 与数据库为 `0600`。registry 只持久化随机 UUID、显示名、模式和同步状态，不把用户名、hostname 或绝对路径当作主键。
+
+```bash
+storybook profile show                    # 当前 Profile、数据目录与 local-only 状态
+storybook profile list                    # 列出所有 Profile
+storybook profile create client-a         # 默认创建 isolated Profile
+storybook profile switch client-a         # UUID 或显示名均可
+storybook sync status                     # v0.2 明确显示 local_only、跨设备同步未启用
+```
+
+可用 `STORYBOOK_PROFILE=<UUID|NAME>` 为单个进程选择 Profile 而不修改 registry；`STORYBOOK_HOME=/private/path` 可显式收拢/隔离 registry、数据库、缓存和日志。旧仓库 `data/memory.db` 不会被删除或覆盖；安全迁移由独立的 migration 流程负责。
 
 ## 🧪 测试
 
@@ -113,7 +136,10 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 
 - **store**：Session/Story CRUD、`_edge_pair` 无向边归一、`search_by_vector` 的 `1 - dist²/2`
   相似度换算（与 numpy 暴力余弦交叉验证）、双写一致性（`add_story`/`update_story` 后
-  `stories.embedding` 与 `story_vectors` 同步；分裂后父 story 向量从索引移除）。
+  `stories.embedding` 与 `story_vectors` 同步；分裂后父 story 向量从索引移除），以及旧 schema
+  对 `global_id` / `profile_id` / `sync_state` 的幂等补齐。
+- **profiles**：macOS/Linux/Windows 路径、XDG 覆盖、随机 UUID registry、local/isolated
+  切换、跨 cwd 一致性、损坏 registry 拒绝覆盖和最小权限。
 - **processor**：create / merge / update 三分支 + split 路径，mock `llm`/`embeddings` 返回固定值，
   验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
@@ -126,7 +152,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 ## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
 
 PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段。`storybook eval` 建立可重复的检索质量基线，
-作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染 `data/memory.db`。
+作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染用户 Profile 数据库。
 
 ```bash
 storybook eval all                              # 跑全部三轮评测（默认）
@@ -176,6 +202,10 @@ storybook benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 
 ```bash
 storybook init                       # 初始化数据库 schema + vec0 虚表（其它命令也会自动初始化）
+storybook profile show|list          # 查看用户级 Profile 与数据目录
+storybook profile create NAME        # 创建 isolated Profile（可加 --switch）
+storybook profile switch ID_OR_NAME  # 切换当前 Profile
+storybook sync status                # v0.2 显示 local_only
 storybook import-data                # 默认：从 ~/.claude/projects 采集 Claude Code 会话（增量、按 sessionId 去重）
 storybook import-data --claude       # 同上（显式写法）
 storybook import-data --sample [--n 100]   # 生成并导入模拟会话（无需真实会话即可体验）
@@ -209,7 +239,7 @@ storybook stats                         # 看看沉淀了多少 Story
 
 ## 🌙 做梦周期自动化
 
-「做梦」无需手动触发。三种自动化入口（均复用同一把文件锁，互不重叠；运行日志落 `logs/dream.log`）：
+「做梦」无需手动触发。三种自动化入口（均复用同一把文件锁，互不重叠；运行日志落当前 Profile 日志目录的 `dream.log`）：
 
 | 入口 | 用途 | 平台 |
 |------|------|------|
@@ -219,7 +249,7 @@ storybook stats                         # 看看沉淀了多少 Story
 
 ### macOS：launchd 定时任务
 
-`scripts/` 下提供 plist 模板与一键安装脚本。安装脚本会把模板里的占位符替换为当前 venv / 仓库 / 日志的真实路径，写入 `~/Library/LaunchAgents/com.storybook.dream.plist` 并加载。
+`scripts/` 下提供 plist 模板与一键安装脚本。安装脚本会把模板里的占位符替换为当前 venv 和 Profile 日志目录，写入 `~/Library/LaunchAgents/com.storybook.dream.plist` 并加载；plist 不再把仓库设为工作目录。
 
 ```bash
 # 安装：每 4 小时（默认）自动跑一次 dream --once
@@ -232,7 +262,7 @@ storybook stats                         # 看看沉淀了多少 Story
 # 常用调试命令
 launchctl start com.storybook.dream            # 立即触发一次
 launchctl print gui/$(id -u)/com.storybook.dream  # 查看状态
-tail -f logs/dream.log                            # 看运行日志
+storybook profile show                           # 先查看当前 Profile 日志目录
 ```
 
 plist 触发的是 `<venv>/bin/python -m storybook.cli dream --once`，`StartInterval` 可配置（默认 14400s = 4h），`RunAtLoad=true`（登录时先追补一次离线期间的新会话）。launchd 无 shell 环境，故 `storybook` 必须装在 venv 里、`.env` 由 `config.py` 自动加载——无需手动 `export`。
@@ -242,12 +272,11 @@ plist 触发的是 `<venv>/bin/python -m storybook.cli dream --once`，`StartInt
 非 macOS 用 `storybook dream` 守护进程替代 launchd，由 systemd / nohup 托管：
 
 ```bash
-# 直接前台 / nohup 后台跑
-nohup .venv/bin/python -m storybook.cli dream >> logs/dream-daemon.log 2>&1 &
+# 直接前台 / nohup 后台跑（结构化日志另写当前 Profile 日志目录）
+nohup .venv/bin/python -m storybook.cli dream >/dev/null 2>&1 &
 
 # 或用 systemd user 服务（模板：scripts/com.storybook.dream.service）
 sed -e "s|__PYTHON_BIN__|$PWD/.venv/bin/python|" \
-    -e "s|__STORYBOOK_DIR__|$PWD|" \
     scripts/com.storybook.dream.service > ~/.config/systemd/user/storybook-dream.service
 systemctl --user daemon-reload
 systemctl --user enable --now storybook-dream.service
@@ -256,7 +285,7 @@ journalctl --user -u storybook-dream.service -f
 
 ### 并发保护
 
-所有做梦周期入口（手动 `process` / `--watch` / `dream --once` / `dream` 守护）共用 `data/dream.lock` 文件锁（`fcntl.flock` 非阻塞）。**已有周期在跑时，新触发立即跳过、不重复执行**，避免两个 process 同时写库。进程崩溃时 OS 自动释放锁，无 stale-pid 问题。
+所有做梦周期入口（手动 `process` / `--watch` / `dream --once` / `dream` 守护）共用当前 Profile 数据库目录下的 `dream.lock` 文件锁（`fcntl.flock` 非阻塞）。不同 Profile 互不阻塞；同一 Profile 已有周期在跑时，新触发立即跳过、不重复执行。进程崩溃时 OS 自动释放锁，无 stale-pid 问题。
 
 ## 🔌 MCP 接入（供 agent 运行时召回）
 
@@ -313,7 +342,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 ### 说明
 
-- server 与 CLI 共享同一份配置（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
+- server、CLI、Claude/Cursor collector 和 Codex 等 MCP 客户端都经 Profile registry 共享同一数据目录（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
 - `recall` 复用 CLI `search` 的全部语义，**包括副作用**：命中记忆的 `access_count` 自增、共同召回的关联边权重提权（"反复回忆加深记忆路径"）。
 - `recall` 需要本地 Ollama 生成查询向量；Ollama 不可用时返回可操作错误（提示 `storybook doctor`）。`get_story` / `stats` 不依赖 Ollama。
 - `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**--Ollama 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
@@ -404,6 +433,8 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
+| `STORYBOOK_PROFILE` | registry 当前项 | 仅当前进程选择 Profile（UUID 或显示名），不改 registry |
+| `STORYBOOK_HOME` | 平台用户目录 | 显式收拢/隔离 registry、数据、缓存与日志 |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama 服务地址 |
 | `STORYBOOK_LLM_MODEL` | `qwythos-hermes:latest` | 做梦加工用的 LLM |
 | `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
@@ -436,6 +467,7 @@ storybook/
 ├── src/storybook/
 │   ├── cli.py          # CLI 命令入口
 │   ├── config.py       # 路径 / 模型 / 阈值常量
+│   ├── profiles.py     # 用户级 registry、平台目录、local/isolated Profile
 │   ├── collector.py    # 会话采集（Claude Code / Cursor / JSON / 模拟）
 │   ├── store.py        # SQLite + sqlite-vec 存储层
 │   ├── processor.py    # 做梦周期（dream cycle）
@@ -447,8 +479,7 @@ storybook/
 │   ├── dreamd.py       # 做梦周期自动化（锁 / 监听 / 定时守护 / 日志）
 │   ├── prime.py        # 会话启动主动注入（晨间简报，复用 search）
 │   └── mcp_server.py   # MCP server（recall / get_story / stats / prime_context）
-├── data/               # 运行时数据库 memory.db（不纳入版本管理）
-├── logs/               # 运行时日志（不纳入版本管理）
+├── data/               # benchmark/报告等仓库资源（不再存运行时主数据库）
 ├── scripts/            # launchd plist 模板 + install_launchd.sh + systemd 单元模板
 ├── docs/TECH_DESIGN.md # 原始设计文档
 ├── tests/              # pytest 测试套件（store/processor/search/dreamd + 集成，全 mock Ollama）

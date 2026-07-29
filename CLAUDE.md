@@ -21,6 +21,10 @@ Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
 
 ```
 storybook init                          # create SQLite schema + vec0 virtual table (also auto-run by other commands)
+storybook profile show|list             # inspect the user-level Profile registry
+storybook profile create NAME           # create an isolated Profile
+storybook profile switch ID_OR_NAME     # switch the active Profile
+storybook sync status                   # v0.2: explicit local_only status
 storybook doctor [--fix]                # env health check (Ollama/models/dim/sqlite-vec/vector double-write); --fix repairs double-write inconsistency
 storybook import-data                   # default: collect Claude Code sessions from ~/.claude/projects (incremental, dedup by sessionId)
 storybook import-data --claude          # same as above (explicit)
@@ -43,7 +47,7 @@ The pytest suite lives in `tests/` and mocks Ollama by default. `test_logs/*.jso
 Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `storybook doctor` (env + vector double-write consistency self-check, reads via `store`).
 
 ### Storage layer (`store.py`) — SQLite + sqlite-vec
-Single file at `data/memory.db`. Three tables (`sessions`, `stories`, `edges`) plus the **`story_vectors` vec0 virtual table**. Each `get_db()` call opens a fresh connection (WAL mode, foreign keys on) and loads the sqlite-vec extension.
+Each random-UUID user Profile owns `profiles/<profile_id>/db/memory.db` under the platform data directory. `profiles.py` is the sole registry/path resolver used by CLI, collectors, hooks and MCP; repository paths are not memory boundaries. Three tables (`sessions`, `stories`, `edges`) plus the **`story_vectors` vec0 virtual table** carry path-independent `global_id`, `profile_id`, and `sync_state=local_only`. Each `get_db()` call opens a fresh connection (WAL mode, foreign keys on) and loads the sqlite-vec extension.
 
 **Embeddings are stored in two places and must stay in sync:** as a float32 BLOB in `stories.embedding` *and* as a row in the `story_vectors` vec0 table. `add_story`/`update_story` write both; if you add any other path that mutates an embedding, update both. `update_story` deletes-then-reinserts the vec0 row (vec0 rows are immutable).
 
@@ -65,7 +69,8 @@ Embed query (keywords + query) → vec0 top-K (fetches `top_k*2`, filters by `SI
 
 Every query returns and locally records a privacy-safe latency breakdown:
 `cache/embed/vector/graph/rerank/serialize/total`. Diagnostics are written to
-`logs/query_performance.jsonl` with a strict metadata-only schema (never raw query,
+`query_performance.jsonl` in the active Profile's log directory, with a strict
+metadata-only schema (never raw query,
 Story content, absolute paths, hostnames, or repository URLs). `storybook benchmark`
 uses an isolated fixed-seed dataset and reports performance together with recall/MRR.
 
@@ -74,12 +79,13 @@ uses an isolated fixed-seed dataset and reports performance together with recall
 
 ## Configuration knobs (`config.py`)
 
-- Paths: `DB_PATH` (`data/memory.db`), `LOG_DIR`, `PERFORMANCE_LOG_PATH`, `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
+- Paths: `DB_PATH`/`INDEX_DIR`/`CACHE_DIR`/`LOG_DIR` resolve from the active user Profile; `PERFORMANCE_LOG_PATH` follows that Profile's `LOG_DIR`; `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
 - Thresholds: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_MAX_CHARS` (400).
 - Weight rules: `WEIGHT_INCREMENT` (0.1), `WEIGHT_MAX` (1.0), `WEIGHT_PARENT_CHILD` (1.0).
 - LLM call options (temp 0.3, `num_ctx` 8192, 120s timeout) are hardcoded in `llm._chat`/`_generate`, except `think` which follows `config.LLM_THINK` (`STORYBOOK_LLM_THINK` env, default **off**). `qwythos-hermes` is Qwen3-arch with a thinking mode that makes extraction calls ~9× slower; thinking is unnecessary for keyword/summary/split tasks, so it's off by default. Set `STORYBOOK_LLM_THINK=1` only if retrieval accuracy drops.
 
 ## Notes
 
+- This is a git repository; preserve unrelated worktree changes.
 - `docs/TECH_DESIGN.md` is the original design doc; some directory layout and `storybook import` examples predate the implementation (the command is now `import-data`).
 - LLM output parsing is tolerant: it slices between `[`/`]` for keyword JSON and splits on `TITLE:`/`CONTENT:` markers, with string-split fallbacks when the model doesn't follow the format.

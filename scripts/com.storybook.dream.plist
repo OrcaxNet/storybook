@@ -10,8 +10,7 @@
   install 脚本会把下列占位符替换为当前环境的真实路径后写入
   ~/Library/LaunchAgents/com.storybook.dream.plist：
       __PYTHON_BIN__       venv 的 python（.venv/bin/python）
-      __STORYBOOK_DIR__    storybook 仓库根目录（WorkingDirectory）
-      __LOG_DIR__          日志目录（<repo>/logs）
+      __LOG_DIR__          当前 Profile registry 解析出的日志目录
       __START_INTERVAL__   触发间隔（秒），由 --interval 决定
 
   手动加载/卸载（脚本内部即用此命令）：
@@ -35,9 +34,6 @@
         <string>--once</string>
     </array>
 
-    <key>WorkingDirectory</key>
-    <string>__STORYBOOK_DIR__</string>
-
     <!-- 每 N 秒触发一次（默认 14400 = 4 小时）-->
     <key>StartInterval</key>
     <integer>__START_INTERVAL__</integer>
@@ -54,7 +50,7 @@
     <key>Nice</key>
     <integer>10</integer>
 
-    <!-- 日志（launchd 无 shell，stdout/stderr 落盘到此处；dreamd 另写 logs/dream.log）-->
+    <!-- 日志（launchd 无 shell，stdout/stderr 与 dream.log 都落在当前 Profile 日志目录）-->
     <key>StandardOutPath</key>
     <string>__LOG_DIR__/dream-launchd.out.log</string>
     <key>StandardErrorPath</key>

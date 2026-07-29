@@ -1,16 +1,9 @@
-"""配置管理 — 所有路径、模型名、阈值常量集中管理"""
+"""配置管理 — Profile 路径、模型名、阈值常量集中管理。"""
 import os
 from pathlib import Path
 
-# ── 路径 ──
+# ── 安装根与 .env ──
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
-DB_PATH = DATA_DIR / "memory.db"
-PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_env_file(path: Path) -> None:
@@ -48,6 +41,52 @@ def _load_env_file(path: Path) -> None:
 
 # 启动时自动加载项目根 .env（无则跳过、不报错）；须在读 os.getenv 之前执行
 _load_env_file(BASE_DIR / ".env")
+
+# ── 用户级 Profile 与运行态路径 ──
+# registry 是 CLI、MCP、hook、Cursor/Claude/Codex adapter 的唯一数据目录入口。
+# 绝对路径只在本机运行态推导，不写入数据库对象 ID 或 registry 主键。
+from . import profiles as profiles_module  # noqa: E402  -- .env 须先加载
+
+PROFILE_REGISTRY = profiles_module.default_registry()
+
+
+def refresh_profile(profile_ref: str | None = None):
+    """重新解析当前 Profile，并原子刷新所有兼容路径常量。"""
+
+    global ACTIVE_PROFILE, PROFILE_PATHS, PROFILE_ID, PROFILE_MODE, SYNC_STATE
+    global DATA_DIR, DB_DIR, DB_PATH, INDEX_DIR, CACHE_DIR, LOG_DIR
+    global PERFORMANCE_LOG_PATH
+
+    if profile_ref:
+        profile = PROFILE_REGISTRY.resolve(profile_ref)
+    else:
+        profile = PROFILE_REGISTRY.active_profile()
+    paths = PROFILE_REGISTRY.ensure_profile_directories(profile)
+
+    ACTIVE_PROFILE = profile
+    PROFILE_PATHS = paths
+    PROFILE_ID = profile.id
+    PROFILE_MODE = profile.mode
+    SYNC_STATE = profile.sync_state
+    DATA_DIR = paths.root
+    DB_DIR = paths.database_dir
+    DB_PATH = paths.database
+    INDEX_DIR = paths.index_dir
+    CACHE_DIR = paths.cache_dir
+    LOG_DIR = paths.log_dir
+    PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
+    return profile
+
+
+def switch_profile(profile_ref: str):
+    """切换 registry 的 active Profile，并刷新当前进程配置。"""
+
+    profile = PROFILE_REGISTRY.switch_profile(profile_ref)
+    refresh_profile(profile.id)
+    return profile
+
+
+refresh_profile()
 
 # ── Ollama ──
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")

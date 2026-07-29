@@ -10,6 +10,7 @@ import os
 import platform
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -245,10 +246,14 @@ def _seed_dataset(bench, *, story_count: int, required_topics: set[str]) -> dict
                 blob = vector.astype(np.float32, copy=False).tobytes()
                 db.execute(
                     """INSERT INTO stories
-                       (id, title, content, keywords, embedding, source_session_ids)
-                       VALUES (?, ?, ?, '[]', ?, '[]')""",
+                       (id, global_id, profile_id, sync_state,
+                        title, content, keywords, embedding, source_session_ids)
+                       VALUES (?, ?, ?, ?, ?, ?, '[]', ?, '[]')""",
                     (
                         story_id,
+                        str(uuid.uuid4()),
+                        config.PROFILE_ID,
+                        config.SYNC_STATE,
                         f"Synthetic benchmark story {story_id:05d}",
                         "Deterministic synthetic benchmark content.",
                         blob,

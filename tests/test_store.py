@@ -6,6 +6,11 @@
 """
 from __future__ import annotations
 
+import os
+import sqlite3
+import stat
+import uuid
+
 import numpy as np
 import pytest
 
@@ -25,6 +30,9 @@ class TestSessionCRUD:
         assert s["source"] == "manual"
         assert s["raw_content"] == "raw content"
         assert s["status"] == "pending"
+        uuid.UUID(s["global_id"])
+        assert s["profile_id"] == config.PROFILE_ID
+        assert s["sync_state"] == "local_only"
 
     def test_count_and_pending(self):
         assert store.count_sessions() == 0
@@ -69,6 +77,9 @@ class TestStoryCRUD:
         assert story["parent_id"] is None
         assert story["version"] == 1
         assert story["access_count"] == 0
+        uuid.UUID(story["global_id"])
+        assert story["profile_id"] == config.PROFILE_ID
+        assert story["sync_state"] == "local_only"
         # embedding 应被还原为 list[float]，长度 = EMBED_DIM
         assert len(story["embedding"]) == config.EMBED_DIM
 
@@ -149,6 +160,9 @@ class TestEdges:
         edges = store.get_edges(a)
         assert len(edges) == 1
         assert edges[0]["weight"] == pytest.approx(0.7)
+        uuid.UUID(edges[0]["global_id"])
+        assert edges[0]["profile_id"] == config.PROFILE_ID
+        assert edges[0]["sync_state"] == "local_only"
         # 从另一端也能查到同一条
         assert len(store.get_edges(b)) == 1
 
@@ -350,3 +364,69 @@ class TestStats:
         assert stats["edges"] == 1
         assert stats["root_stories"] == 1   # parent_id IS NULL
         assert stats["child_stories"] == 1  # parent_id IS NOT NULL
+        assert stats["profile"]["id"] == config.PROFILE_ID
+        assert stats["sync_state"] == "local_only"
+
+
+class TestProfileIdentityMigration:
+    def test_init_db_backfills_existing_v01_rows(self):
+        config.DB_PATH.unlink()
+        legacy = sqlite3.connect(config.DB_PATH)
+        legacy.executescript(
+            """
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                raw_content TEXT NOT NULL,
+                problem_desc TEXT,
+                code_snippets TEXT,
+                conclusion TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT (datetime('now')),
+                processed_at TEXT
+            );
+            CREATE TABLE stories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                keywords TEXT NOT NULL DEFAULT '[]',
+                embedding BLOB,
+                parent_id INTEGER,
+                source_session_ids TEXT DEFAULT '[]',
+                access_count INTEGER DEFAULT 0,
+                version INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                weight REAL DEFAULT 0.0,
+                edge_type TEXT DEFAULT 'semantic',
+                created_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(source_id, target_id)
+            );
+            INSERT INTO sessions (source, raw_content) VALUES ('legacy', 'raw');
+            INSERT INTO stories (title, content) VALUES ('legacy', 'content');
+            INSERT INTO edges (source_id, target_id) VALUES (1, 1);
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        store.init_db()
+
+        db = store.get_db()
+        try:
+            for table in ("sessions", "stories", "edges"):
+                row = db.execute(f"SELECT * FROM {table} WHERE id = 1").fetchone()
+                uuid.UUID(row["global_id"])
+                assert row["profile_id"] == config.PROFILE_ID
+                assert row["sync_state"] == "local_only"
+        finally:
+            db.close()
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_database_file_is_private(self):
+        assert stat.S_IMODE(config.DB_PATH.stat().st_mode) == 0o600
