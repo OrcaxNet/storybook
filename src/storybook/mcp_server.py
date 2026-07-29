@@ -20,12 +20,10 @@ MCP SDK 采用延迟导入：base 安装无需 ``mcp`` 依赖，仅在使用 MCP
 from __future__ import annotations
 
 import logging
-from typing import Any
 
-from . import config  # noqa: F401  -- 触发 config 初始化（.env 自动加载、目录创建）
-from . import store
-from . import search as search_module
+from . import config, store  # config 触发 .env / 目录初始化
 from . import prime as prime_module
+from . import search as search_module
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +88,11 @@ def _build_recall_result(result: dict) -> dict:
         "query": result.get("query"),
         "count": len(matches),
         "matches": matches,
+        "request_id": result.get("request_id"),
+        "mode": result.get("mode", "vector"),
+        "degraded": bool(result.get("degraded")),
+        "degraded_reason": result.get("degraded_reason"),
+        "latency_ms": result.get("latency_ms", {}),
     }
 
 

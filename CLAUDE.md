@@ -29,12 +29,14 @@ storybook import-data --cursor              # scan ~/Library/Application Support
 storybook import-data <file|dir>            # import JSON (list, {sessions:[...]}, or {messages:[...]} chat-log shape)
 storybook process [--session ID]        # "dream cycle": process all pending sessions (or one)
 storybook search "<query>" [--top 3]    # vector search + related-story activation
+storybook status --performance          # recent query p50/p95 + cache/fallback ratios
+storybook benchmark --model-state warm  # isolated 10k Story performance/quality baseline
 storybook stats | storybook list | storybook show <id>
 ```
 
 Note the command is **`import-data`**, not `import` (click auto-hyphenates the `import_data` function). With no flags/path it defaults to `--claude`. The `--claude`, `--sample`, `--cursor`, and `<path>` forms are mutually exclusive.
 
-There is **no test suite**. `test_logs/*.json` and `hermes_sessions.json` are sample data sources for `import-data`.
+The pytest suite lives in `tests/` and mocks Ollama by default. `test_logs/*.json` and `hermes_sessions.json` are sample data sources for `import-data`.
 
 ## Architecture
 
@@ -61,18 +63,23 @@ Thresholds live in `config.py`, including `SIM_THRESHOLD_UPDATE_ONLY` (0.92, the
 ### Retrieval (`search.search`)
 Embed query (keywords + query) → vec0 top-K (fetches `top_k*2`, filters by `SIM_THRESHOLD_SEARCH=0.50`) → for each hit, surface related stories via `edges` (weight desc) and bump edge weights between co-retrieved stories. Hits also increment `stories.access_count`.
 
+Every query returns and locally records a privacy-safe latency breakdown:
+`cache/embed/vector/graph/rerank/serialize/total`. Diagnostics are written to
+`logs/query_performance.jsonl` with a strict metadata-only schema (never raw query,
+Story content, absolute paths, hostnames, or repository URLs). `storybook benchmark`
+uses an isolated fixed-seed dataset and reports performance together with recall/MRR.
+
 ### Edge graph
 `edges` table, `UNIQUE(source_id, target_id)`. Types: `semantic`, `parent_child` (1.0, fixed), `sibling` (0.5). Edges are **undirected**: `add_or_update_edge`/`increment_edge_weight` normalize endpoint order to `(min_id, max_id)` via `_edge_pair`, so call direction doesn't matter and `(A,B)`/`(B,A)` can't create duplicate rows. `add_or_update_edge` takes `max(existing, new)`; `increment_edge_weight` adds a delta capped at `WEIGHT_MAX` (1.0). Queries (`get_related_stories`) match either endpoint.
 
 ## Configuration knobs (`config.py`)
 
-- Paths: `DB_PATH` (`data/memory.db`), `LOG_DIR`, `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
+- Paths: `DB_PATH` (`data/memory.db`), `LOG_DIR`, `PERFORMANCE_LOG_PATH`, `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
 - Thresholds: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_MAX_CHARS` (400).
 - Weight rules: `WEIGHT_INCREMENT` (0.1), `WEIGHT_MAX` (1.0), `WEIGHT_PARENT_CHILD` (1.0).
 - LLM call options (temp 0.3, `num_ctx` 8192, 120s timeout) are hardcoded in `llm._chat`/`_generate`, except `think` which follows `config.LLM_THINK` (`STORYBOOK_LLM_THINK` env, default **off**). `qwythos-hermes` is Qwen3-arch with a thinking mode that makes extraction calls ~9× slower; thinking is unnecessary for keyword/summary/split tasks, so it's off by default. Set `STORYBOOK_LLM_THINK=1` only if retrieval accuracy drops.
 
 ## Notes
 
-- Not a git repository.
-- `docs/TECH_DESIGN.md` is the original design doc; its directory layout and `storybook import` examples predate the implementation (command is `import-data`, no `tests/` or `scripts/` dirs exist, no launchd plist is set up).
+- `docs/TECH_DESIGN.md` is the original design doc; some directory layout and `storybook import` examples predate the implementation (the command is now `import-data`).
 - LLM output parsing is tolerant: it slices between `[`/`]` for keyword JSON and splits on `TITLE:`/`CONTENT:` markers, with string-split fallbacks when the model doesn't follow the format.

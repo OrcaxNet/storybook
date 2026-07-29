@@ -15,6 +15,8 @@ CLI 入口 — storybook 命令
   storybook dream --once            跑一次完整做梦周期（采集+加工）后退出；launchd 入口
   storybook dream                   定时守护进程（非 macOS 兜底，每 DREAM_INTERVAL 秒一轮）
   storybook search <query>          搜索记忆
+  storybook status --performance    最近查询性能摘要
+  storybook benchmark               10k Story warm/cold 查询基准
   storybook stats                   查看统计
   storybook list                    列出所有story
   storybook show <story_id>         查看story详情
@@ -24,20 +26,23 @@ CLI 入口 — storybook 命令
 import json
 import logging
 import os
-import sys
 import threading
 from pathlib import Path
 
 import click
 
-from . import config
-from . import store
-from . import collector
-from . import processor
-from . import search as search_module
-from . import health
-from . import dreamd
+from . import (
+    collector,
+    config,
+    dreamd,
+    health,
+    perf_benchmark,
+    performance,
+    processor,
+    store,
+)
 from . import eval as eval_module
+from . import search as search_module
 
 
 def setup_logging(verbose: bool = False):
@@ -220,7 +225,7 @@ def import_data(path, claude, cursor, sample, n):
                         sessions.extend(data["sessions"])
                     elif isinstance(data, dict):
                         sessions.append(data)
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 -- 单个坏文件不阻断目录导入
                     click.echo(f"  ⚠️ 跳过 {fname}: {e}")
         else:
             with open(path, "r", encoding="utf-8") as f:
@@ -372,6 +377,49 @@ def stats():
     click.echo("──────────────────────────────\n")
 
 
+@cli.command()
+@click.option("--performance", "include_performance", is_flag=True,
+              help="汇总最近 100 次查询的 p50/p95、cache 与 fallback 比例")
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
+def status(include_performance, as_json):
+    """📟 查看本地运行状态与可选查询性能摘要。"""
+    store.init_db()
+    stats_data = store.get_stats()
+    payload = {
+        "status": "ready",
+        "stories": stats_data["stories"],
+        "sessions": stats_data["sessions"],
+        "pending": stats_data["pending"],
+    }
+    if include_performance:
+        payload["performance"] = performance.summarize_query_performance(limit=100)
+
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    click.echo("Overall        READY")
+    click.echo(f"Stories        {payload['stories']}")
+    click.echo(f"Sessions       {payload['sessions']} ({payload['pending']} pending)")
+    if include_performance:
+        summary = payload["performance"]
+        if not summary["sample_size"]:
+            click.echo("Search (0)     暂无查询诊断数据")
+            return
+        total = summary["latency_ms"]["total"]
+        click.echo(
+            f"Search ({summary['sample_size']})   "
+            f"p50 {total['p50']:.1f}ms · p95 {total['p95']:.1f}ms · "
+            f"cache {summary['cache_hit_ratio']:.1%} · "
+            f"fallback {summary['fallback_ratio']:.1%}"
+        )
+        stage_bits = [
+            f"{stage} {summary['latency_ms'][stage]['p95']:.1f}"
+            for stage in performance.LATENCY_STAGES[:-1]
+        ]
+        click.echo("Stage p95(ms)  " + " · ".join(stage_bits))
+
+
 @cli.command(name="list")
 @click.option("--limit", "-l", default=20, help="显示数量")
 def list_cmd(limit):
@@ -463,6 +511,41 @@ def eval(part, report, benchmark_path):
         out = Path(report)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        click.echo(f"\n📝 JSON 报告已写入: {out}")
+
+
+@cli.command(name="benchmark")
+@click.option("--model-state", type=click.Choice(["warm", "cold"]), default="warm",
+              show_default=True, help="warm 会先预热；cold 每批请求前卸载 embedding 模型")
+@click.option("--stories", type=click.IntRange(min=1), default=10_000,
+              show_default=True, help="隔离数据集 Story 数")
+@click.option("--queries", type=click.IntRange(min=1), default=50,
+              show_default=True, help="固定查询数")
+@click.option("--repeats", type=click.IntRange(min=1), default=20,
+              show_default=True, help="每条查询重复次数")
+@click.option("--concurrency", "concurrencies", multiple=True,
+              type=click.IntRange(min=1), default=(1, 5), show_default=True,
+              help="并发度；可重复指定")
+@click.option("--report", "-r", type=click.Path(dir_okay=False, writable=True),
+              help="把无原始 query 的完整 JSON 报告写入该路径")
+@click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
+              help="自定义质量 benchmark JSON")
+def benchmark(model_state, stories, queries, repeats, concurrencies, report,
+              benchmark_path):
+    """📈 运行隔离的查询性能与质量基准。"""
+    result = perf_benchmark.run_performance_benchmark(
+        story_count=stories,
+        query_count=queries,
+        repeats=repeats,
+        concurrencies=tuple(concurrencies),
+        model_state=model_state,
+        benchmark_path=benchmark_path,
+    )
+    click.echo(perf_benchmark.format_benchmark_report(result))
+    if report:
+        out = Path(report)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         click.echo(f"\n📝 JSON 报告已写入: {out}")
 
 
