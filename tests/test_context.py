@@ -1,8 +1,11 @@
 """ContextEnvelope persistence, privacy and environment-aware recall tests."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import sqlite3
+import stat
 import uuid
 
 import pytest
@@ -155,6 +158,35 @@ class TestContextEnvelopePersistence:
             == original["runtime"]["remote_host_hash"]
         )
 
+    def test_corrupt_hmac_key_is_repaired_once_and_remains_stable(self, tmp_db):
+        key_path = tmp_db.parent / ".context_hmac_key"
+        key_path.write_bytes(b"short")
+        key_path.chmod(0o644)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            hashes = list(executor.map(
+                lambda _: context_module.external_session_hash("stable-session"),
+                range(16),
+            ))
+
+        assert len(set(hashes)) == 1
+        assert len(key_path.read_bytes()) == 32
+        if os.name != "nt":
+            assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
+
+    def test_invalid_device_id_is_repaired_and_remains_stable(self, tmp_db):
+        device_path = tmp_db.parent / ".device_id"
+        device_path.write_text("not-a-uuid", encoding="ascii")
+        device_path.chmod(0o644)
+
+        first = context_module.capture_context()["device"]["id"]
+        second = context_module.capture_context()["device"]["id"]
+
+        assert first == second == device_path.read_text(encoding="ascii")
+        uuid.UUID(first)
+        if os.name != "nt":
+            assert stat.S_IMODE(device_path.stat().st_mode) == 0o600
+
     def test_workspace_and_sensitive_alias_provenance_tracks_real_source(self):
         captured = context_module.capture_context(
             workspace_path="/Users/alice/private/payments-api",
@@ -194,6 +226,21 @@ class TestContextEnvelopePersistence:
         )
 
         assert https == scp_ssh == url_ssh
+
+    def test_default_repo_ports_do_not_split_the_same_repository(self):
+        expected = context_module.repository_fingerprint(
+            "git@github.com:acme/payments.git"
+        )
+
+        assert context_module.repository_fingerprint(
+            "https://github.com:443/acme/payments.git"
+        ) == expected
+        assert context_module.repository_fingerprint(
+            "ssh://git@github.com:22/acme/payments.git"
+        ) == expected
+        assert context_module.repository_fingerprint(
+            "https://github.com:8443/acme/payments.git"
+        ) != expected
 
     def test_cursor_cache_directory_is_not_fabricated_as_workspace(self, tmp_path):
         cache_dir = tmp_path / "workspaceStorage" / "opaque-cache-id"
@@ -260,6 +307,20 @@ class TestContextEnvelopePersistence:
         assert context["provenance"]["workspace.repo_fingerprint"] == "detected"
         assert context["provenance"]["workspace.project_label"] == "inferred"
         assert "/Users/alice/private/payments-api" not in json.dumps(context)
+
+    @pytest.mark.parametrize(
+        "uri",
+        ["file:relative/payments-api", "file://remote.internal/payments-api"],
+    )
+    def test_cursor_rejects_non_absolute_or_non_local_file_uri(self, tmp_path, uri):
+        cache_dir = tmp_path / "workspaceStorage" / "opaque-cache-id"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "workspace.json").write_text(
+            json.dumps({"folder": uri}),
+            encoding="utf-8",
+        )
+
+        assert collector._cursor_workspace_path(cache_dir / "state.vscdb") is None
 
     def test_claude_adapter_reports_context_without_raw_external_id(self, tmp_path):
         log = tmp_path / "session-raw-id.jsonl"

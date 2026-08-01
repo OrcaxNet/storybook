@@ -7,12 +7,14 @@ URLs never leave this module.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
 import os
 import platform
 import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,11 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from . import config
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl.
+    fcntl = None
 
 
 PROVENANCE_VALUES = frozenset({
@@ -58,6 +65,7 @@ _CANONICAL_HASH_RE = re.compile(
     r"^(?P<algorithm>hmac-sha256|sha256):(?P<digest>[0-9a-f]{64})$",
     re.IGNORECASE,
 )
+_IDENTITY_THREAD_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
@@ -112,50 +120,72 @@ def _identity_path(name: str) -> Path:
     return path
 
 
-def _load_or_create_bytes(name: str, size: int) -> bytes:
-    """Load a private local identity file, creating it race-safely if absent."""
+@contextmanager
+def _locked_identity_file(name: str):
+    """Open one private identity file under an inter-thread/process lock."""
 
     path = _identity_path(name)
-    try:
-        data = path.read_bytes()
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    with _IDENTITY_THREAD_LOCK:
+        fd = os.open(path, flags, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+            yield fd
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _read_identity(fd: int, expected_size: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    return os.read(fd, expected_size + 1)
+
+
+def _write_identity(fd: int, data: bytes) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    remaining = memoryview(data)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:  # pragma: no cover - defensive OS failure guard.
+            raise OSError("failed to persist local identity")
+        remaining = remaining[written:]
+    os.fsync(fd)
+
+
+def _load_or_create_bytes(name: str, size: int) -> bytes:
+    """Load or durably repair a fixed-size private local identity."""
+
+    with _locked_identity_file(name) as fd:
+        data = _read_identity(fd, size)
         if len(data) == size:
             return data
-    except FileNotFoundError:
-        pass
-
-    data = os.urandom(size)
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        existing = path.read_bytes()
-        return existing if len(existing) == size else data
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-    if os.name != "nt":
-        path.chmod(0o600)
-    return data
+        data = os.urandom(size)
+        _write_identity(fd, data)
+        return data
 
 
 def _local_device_id() -> str:
-    path = _identity_path(".device_id")
-    try:
-        existing = _uuid_or_none(path.read_text(encoding="ascii").strip())
+    with _locked_identity_file(".device_id") as fd:
+        raw = _read_identity(fd, 36)
+        try:
+            existing = _uuid_or_none(raw.decode("ascii").strip())
+        except UnicodeDecodeError:
+            existing = None
         if existing:
+            canonical = existing.encode("ascii")
+            if raw != canonical:
+                _write_identity(fd, canonical)
             return existing
-    except FileNotFoundError:
-        pass
-
-    value = str(uuid.uuid4())
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        existing = _uuid_or_none(path.read_text(encoding="ascii").strip())
-        return existing or value
-    with os.fdopen(fd, "w", encoding="ascii") as f:
-        f.write(value)
-    if os.name != "nt":
-        path.chmod(0o600)
-    return value
+        value = str(uuid.uuid4())
+        _write_identity(fd, value.encode("ascii"))
+        return value
 
 
 def local_hash(value: Any, namespace: str) -> str | None:
@@ -207,7 +237,13 @@ def repository_fingerprint(repo_url: Any) -> str | None:
             port = parsed.port
         except ValueError:
             port = None
-        if port:
+        default_port = {
+            "http": 80,
+            "https": 443,
+            "ssh": 22,
+            "git+ssh": 22,
+        }.get(parsed.scheme.lower())
+        if port and port != default_port:
             host = f"{host}:{port}"
         identity = host + unquote(parsed.path)
     else:

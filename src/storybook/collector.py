@@ -102,10 +102,12 @@ def _cursor_workspace_path(vscdb_path: Path) -> str | None:
     parsed = urlsplit(raw_uri)
     if parsed.scheme.lower() != "file":
         return None
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        return None
     path = unquote(parsed.path)
-    if parsed.netloc and parsed.netloc not in ("", "localhost"):
-        path = f"//{parsed.netloc}{path}"
-    return path or None
+    if not path or "\0" in path or not Path(path).is_absolute():
+        return None
+    return path
 
 
 def _parse_cursor_conversation(
