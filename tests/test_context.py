@@ -70,6 +70,35 @@ class TestContextEnvelopePersistence:
         assert envelope["workspace"]["id"] is None
         assert envelope["provenance"]["workspace.id"] == "unknown"
 
+    def test_historical_import_missing_or_null_context_stays_unknown(
+        self, monkeypatch
+    ):
+        def fail_local_detection(*args, **kwargs):
+            raise AssertionError("historical import read the local environment")
+
+        monkeypatch.setattr(context_module, "capture_context", fail_local_detection)
+        count = collector.import_sessions([
+            {"source": "json", "raw_content": "missing context"},
+            {"source": "json", "raw_content": "null context", "context": None},
+        ])
+
+        assert count == 2
+        rows = store.get_pending_sessions()
+        assert len(rows) == 2
+        for row in rows:
+            envelope = json.loads(row["context_json"])
+            assert all(value is None for value in envelope["device"].values())
+            assert envelope["runtime"] == {
+                "kind": None,
+                "remote_host_hash": None,
+                "container_id_hash": None,
+                "shell": None,
+                "versions": {},
+            }
+            for field, provenance in envelope["provenance"].items():
+                if field.startswith(("device.", "runtime.")):
+                    assert provenance == "unknown"
+
     def test_partial_historical_envelope_does_not_detect_current_machine(
         self, monkeypatch
     ):

@@ -160,16 +160,24 @@ def _parse_cursor_conversation(
 
 
 def import_sessions(sessions: list[dict]) -> int:
-    """批量导入会话到数据库，返回导入数量"""
+    """批量导入历史会话到数据库，返回导入数量。
+
+    ``None`` 在 ``store.add_session`` 的实时写入契约中表示探测当前机器。
+    历史记录缺少 context 则代表没有环境证据，必须传入显式空 envelope，
+    否则同一份导入文件会随导入机器不同而产生不同的 device/runtime。
+    """
     count = 0
     for s in sessions:
+        historical_context = s.get("context")
+        if historical_context is None:
+            historical_context = {}
         store.add_session(
             source=s.get("source", "manual"),
             raw_content=s.get("raw_content", ""),
             problem_desc=s.get("problem_desc", ""),
             code_snippets=s.get("code_snippets", "[]"),
             conclusion=s.get("conclusion", ""),
-            context=s.get("context"),
+            context=historical_context,
         )
         count += 1
     logger.info("导入了 %d 条会话", count)
