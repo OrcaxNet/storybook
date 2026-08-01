@@ -21,6 +21,7 @@ from .base import (
 _BEGIN = "# >>> storybook setup managed; do not edit this block >>>"
 _END = "# <<< storybook setup managed <<<"
 _SECTION = re.compile(r"(?m)^\s*\[([^\]]+)]\s*(?:#.*)?$")
+_MISSING = object()
 
 
 def _quote(value: str) -> str:
@@ -39,6 +40,15 @@ def _render_block(context: AdapterContext) -> str:
         "tool_timeout_sec = 60\n"
         f"{_END}\n"
     )
+
+
+def _target_node(context: AdapterContext) -> dict[str, Any]:
+    return {
+        "command": context.launcher.command,
+        "args": [*context.launcher.args, "mcp"],
+        "startup_timeout_sec": 20,
+        "tool_timeout_sec": 60,
+    }
 
 
 def _managed_range(text: str) -> tuple[int, int] | None:
@@ -82,6 +92,21 @@ def _parse(text: str, path: Path) -> dict[str, Any]:
         raise AdapterError("SB_SETUP_CONFIG_INVALID", f"无法解析 {path}: {exc}") from exc
 
 
+def _current_node(parsed: Mapping[str, Any], path: Path) -> Any:
+    servers = parsed.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        raise AdapterError(
+            "SB_SETUP_CONFIG_INVALID", f"{path} 的 mcp_servers 必须是 table"
+        )
+    current = servers.get("storybook", _MISSING)
+    if current is not _MISSING and not isinstance(current, dict):
+        raise AdapterError(
+            "SB_SETUP_CONFIG_INVALID",
+            f"{path} 的 mcp_servers.storybook 必须是 table",
+        )
+    return current
+
+
 class CodexAdapter(AgentAdapter):
     name = "codex"
     display_name = "Codex"
@@ -105,14 +130,14 @@ class CodexAdapter(AgentAdapter):
 
     def plan(self, context: AdapterContext, *, selected: bool) -> AdapterPlan:
         path, text, parsed = self._read(context)
-        current = parsed.get("mcp_servers", {}).get("storybook")
-        target = {
-            "command": context.launcher.command,
-            "args": [*context.launcher.args, "mcp"],
-            "startup_timeout_sec": 20,
-            "tool_timeout_sec": 60,
-        }
-        changed = selected and current != target
+        current = _current_node(parsed, path)
+        target = _target_node(context)
+        managed_range = _managed_range(text)
+        needs_change = current != target
+        if managed_range is not None:
+            current_block = text[managed_range[0]:managed_range[1]]
+            needs_change = needs_change or current_block != _render_block(context)
+        changed = selected and needs_change
         return AdapterPlan(
             adapter=self.name,
             display_name=self.display_name,
@@ -129,12 +154,14 @@ class CodexAdapter(AgentAdapter):
 
     def apply(self, context: AdapterContext, backup_dir: Path) -> dict[str, Any]:
         path, text, parsed = self._read(context)
+        current = _current_node(parsed, path)
+        target = _target_node(context)
         block = _render_block(context)
         managed_range = _managed_range(text)
         previous_blocks = ""
         if managed_range:
             current_block = text[managed_range[0]:managed_range[1]]
-            if current_block == block:
+            if current == target and current_block == block:
                 return {
                     "adapter": self.name,
                     "changed": False,
@@ -145,6 +172,15 @@ class CodexAdapter(AgentAdapter):
             previous_blocks = ""
             base = text[:managed_range[0]] + text[managed_range[1]:]
         else:
+            # 用户已有语义相同的配置时不夺取 ownership，也不为了 marker 改写文件。
+            if current == target:
+                return {
+                    "adapter": self.name,
+                    "changed": False,
+                    "files": [],
+                    "previous_blocks": "",
+                    "managed_block": block,
+                }
             ranges = _storybook_section_ranges(text)
             previous_blocks = "\n".join(text[start:end].rstrip() for start, end in ranges)
             base = _without_ranges(text, ranges)
@@ -188,11 +224,6 @@ class CodexAdapter(AgentAdapter):
 
     def verify(self, context: AdapterContext) -> tuple[bool, str]:
         path, _, parsed = self._read(context)
-        current = parsed.get("mcp_servers", {}).get("storybook")
-        expected = {
-            "command": context.launcher.command,
-            "args": [*context.launcher.args, "mcp"],
-            "startup_timeout_sec": 20,
-            "tool_timeout_sec": 60,
-        }
+        current = _current_node(parsed, path)
+        expected = _target_node(context)
         return current == expected, f"{path}: storybook MCP {'ready' if current == expected else 'missing or changed'}"

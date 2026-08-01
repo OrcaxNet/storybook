@@ -156,16 +156,27 @@ class ClaudeCodeAdapter(JsonMCPAdapter):
             ],
         }
 
-    def plan(self, context: AdapterContext, *, selected: bool) -> AdapterPlan:
-        base = super().plan(context, selected=selected)
-        settings_path = self.settings_path(context)
-        settings = read_json_object(settings_path)
-        session_hooks = settings.get("hooks", {}).get("SessionStart", [])
-        if session_hooks and not isinstance(session_hooks, list):
+    def _session_hooks(
+        self, settings: dict[str, Any], settings_path: Path
+    ) -> list[Any]:
+        hooks = settings.get("hooks", {})
+        if not isinstance(hooks, dict):
+            raise AdapterError(
+                "SB_SETUP_CONFIG_INVALID", f"{settings_path} 的 hooks 必须是 object"
+            )
+        session_hooks = hooks.get("SessionStart", [])
+        if not isinstance(session_hooks, list):
             raise AdapterError(
                 "SB_SETUP_CONFIG_INVALID",
                 f"{settings_path} 的 hooks.SessionStart 必须是 array",
             )
+        return session_hooks
+
+    def plan(self, context: AdapterContext, *, selected: bool) -> AdapterPlan:
+        base = super().plan(context, selected=selected)
+        settings_path = self.settings_path(context)
+        settings = read_json_object(settings_path)
+        session_hooks = self._session_hooks(settings, settings_path)
         hook_changed = selected and self.managed_hook(context) not in session_hooks
         return AdapterPlan(
             adapter=base.adapter,
@@ -184,17 +195,7 @@ class ClaudeCodeAdapter(JsonMCPAdapter):
     def apply(self, context: AdapterContext, backup_dir: Path) -> dict[str, Any]:
         settings_path = self.settings_path(context)
         settings = read_json_object(settings_path)
-        hooks = settings.get("hooks", {})
-        if not isinstance(hooks, dict):
-            raise AdapterError(
-                "SB_SETUP_CONFIG_INVALID", f"{settings_path} 的 hooks 必须是 object"
-            )
-        session_hooks = hooks.get("SessionStart", [])
-        if not isinstance(session_hooks, list):
-            raise AdapterError(
-                "SB_SETUP_CONFIG_INVALID",
-                f"{settings_path} 的 hooks.SessionStart 必须是 array",
-            )
+        session_hooks = self._session_hooks(settings, settings_path)
         # 两个配置文件先全部校验，再开始任何写入；第二步失败时回滚第一步。
         state = super().apply(context, backup_dir)
         managed_hook = self.managed_hook(context)

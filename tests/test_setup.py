@@ -85,6 +85,7 @@ def test_dry_run_fresh_home_performs_zero_writes(tmp_path):
         {
             "STORYBOOK_HOME": str(storybook_home),
             "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
             "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
         }
     )
@@ -261,6 +262,99 @@ def test_malformed_agent_config_has_stable_error_code(isolated_setup):
 
     assert raised.value.code == "SB_SETUP_CONFIG_INVALID"
     assert "修复配置语法" in (raised.value.hint or "")
+
+
+def test_codex_semantically_configured_without_marker_is_not_rewritten(
+    isolated_setup,
+):
+    manager, roots = isolated_setup
+    path = manager.home / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "[mcp_servers.storybook]\n"
+        'command = "/opt/storybook/bin/storybook"\n'
+        'args = ["mcp"]\n'
+        "startup_timeout_sec = 20\n"
+        "tool_timeout_sec = 60\n",
+        encoding="utf-8",
+    )
+    fixed_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(path, ns=(fixed_mtime_ns, fixed_mtime_ns))
+    before = path.read_bytes()
+
+    plan = manager.plan(("codex",)).as_dict()
+    codex_plan = next(item for item in plan["adapters"] if item["adapter"] == "codex")
+    result = manager.execute(requested_agents=("codex",), download_models=False)
+
+    assert codex_plan["changed"] is False
+    assert result["adapters"] == [{"name": "codex", "changed": False}]
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == fixed_mtime_ns
+    assert not (roots.state / "setup-backups").exists()
+
+
+@pytest.mark.parametrize(
+    ("agent", "relative_path", "content", "message_fragment"),
+    [
+        (
+            "codex",
+            ".codex/config.toml",
+            'mcp_servers = "valid-toml-but-wrong-shape"\n',
+            "mcp_servers 必须是 table",
+        ),
+        (
+            "claude",
+            ".claude/settings.json",
+            '{"hooks": []}\n',
+            "hooks 必须是 object",
+        ),
+    ],
+)
+def test_wrong_shape_agent_config_returns_json_error_without_traceback(
+    tmp_path, agent, relative_path, content, message_fragment
+):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    config_path = user_home / relative_path
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(content, encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "STORYBOOK_HOME": str(storybook_home),
+            "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "storybook.cli",
+            "setup",
+            "--dry-run",
+            "--json",
+            "--agent",
+            agent,
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "SB_SETUP_CONFIG_INVALID"
+    assert message_fragment in payload["error"]["message"]
+    assert "修复配置语法" in payload["error"]["hint"]
+    assert "Traceback" not in completed.stderr
+    assert "AttributeError" not in completed.stderr
+    assert not storybook_home.exists()
 
 
 def test_model_unavailable_returns_degraded_not_failed(isolated_setup, monkeypatch):
