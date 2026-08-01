@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from storybook import store, processor, collector, search as search_module
+from storybook import feedback, store, processor, collector, search as search_module
 from ._helpers import basis, vector_in_index
 
 TEST_LOGS = Path(__file__).resolve().parent.parent / "test_logs"
@@ -91,6 +91,7 @@ class TestGenerateSampleSessionsFlow:
         top = result["top_matches"][0]
         assert top["similarity"] == pytest.approx(1.0, abs=2e-3)
         # access_count 自增
+        assert feedback.flush_feedback(timeout=1.0)
         assert store.get_story(top["story_id"])["access_count"] == 1
 
 

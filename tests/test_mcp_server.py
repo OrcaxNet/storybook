@@ -119,11 +119,13 @@ class TestRecallMemories:
         out = mcp_server.recall_memories("q", top_k=3)
         assert out["count"] == 3
 
-    def test_embedding_failure_raises_actionable_error(self, fake_embedder):
+    def test_embedding_failure_returns_degraded_state(self, fake_embedder):
         fake_embedder.register("q", None)   # 模拟向量生成失败（Ollama 不可用等）
-        with pytest.raises(RuntimeError) as exc:
-            mcp_server.recall_memories("q")
-        assert "storybook doctor" in str(exc.value)
+        out = mcp_server.recall_memories("q")
+        assert out["count"] == 0
+        assert out["degraded"] is True
+        assert out["result_state"] == "degraded_empty"
+        assert out["fallback_status"] == "ok"
 
     def test_empty_query_raises(self):
         with pytest.raises(ValueError):

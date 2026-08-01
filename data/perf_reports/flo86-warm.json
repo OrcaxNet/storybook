@@ -1,0 +1,390 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-01T20:05:27.046491+00:00",
+  "machine": {
+    "os": "Darwin",
+    "os_release": "25.3.0",
+    "arch": "arm64",
+    "cpu": "arm",
+    "cpu_count": 10,
+    "memory_bytes": 17179869184
+  },
+  "model": {
+    "embedding": "qwen3-embedding:0.6b",
+    "dimension": 1024,
+    "state": "warm"
+  },
+  "dataset": {
+    "stories": 10000,
+    "seed": 20260729,
+    "query_count": 50,
+    "variants": [
+      "exact",
+      "synonym",
+      "cross_lang"
+    ],
+    "database_bytes": 89997312
+  },
+  "workload": {
+    "repeats_per_query": 20,
+    "concurrencies": [
+      1,
+      5
+    ],
+    "requests_per_scenario": 1000
+  },
+  "scenarios": [
+    {
+      "concurrency": 1,
+      "sample_count": 1000,
+      "latency_ms": {
+        "cache": {
+          "p50": 0.017,
+          "p95": 0.029,
+          "p99": 0.046
+        },
+        "embed": {
+          "p50": 0.0,
+          "p95": 3.304,
+          "p99": 74.176
+        },
+        "vector": {
+          "p50": 0.0,
+          "p95": 0.323,
+          "p99": 6.907
+        },
+        "fallback": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "graph": {
+          "p50": 0.0,
+          "p95": 0.021,
+          "p99": 0.495
+        },
+        "rerank": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.004
+        },
+        "serialize": {
+          "p50": 0.007,
+          "p95": 0.017,
+          "p99": 0.021
+        },
+        "total": {
+          "p50": 0.173,
+          "p95": 15.633,
+          "p99": 82.773
+        }
+      },
+      "latency_by_mode": {
+        "cache": {
+          "cache": {
+            "p50": 0.017,
+            "p95": 0.028,
+            "p99": 0.042
+          },
+          "embed": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "vector": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "rerank": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "serialize": {
+            "p50": 0.006,
+            "p95": 0.01,
+            "p99": 0.013
+          },
+          "total": {
+            "p50": 0.155,
+            "p95": 1.935,
+            "p99": 5.163
+          }
+        },
+        "vector": {
+          "cache": {
+            "p50": 0.021,
+            "p95": 0.045,
+            "p99": 0.053
+          },
+          "embed": {
+            "p50": 73.009,
+            "p95": 75.984,
+            "p99": 76.287
+          },
+          "vector": {
+            "p50": 6.747,
+            "p95": 7.58,
+            "p99": 11.265
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 0.466,
+            "p95": 0.583,
+            "p99": 1.049
+          },
+          "rerank": {
+            "p50": 0.003,
+            "p95": 0.004,
+            "p99": 0.004
+          },
+          "serialize": {
+            "p50": 0.019,
+            "p95": 0.022,
+            "p99": 0.025
+          },
+          "total": {
+            "p50": 81.118,
+            "p95": 85.252,
+            "p99": 87.926
+          }
+        }
+      },
+      "cache_hit_ratio": 0.95,
+      "fallback_ratio": 0.0,
+      "degraded_ratio": 0.0,
+      "fallback": {
+        "attempts": 0,
+        "success_rate": null,
+        "false_empty_rate": null
+      },
+      "quality": {
+        "overall": {
+          "count": 1000,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "mrr": 1.0
+        },
+        "by_variant": {
+          "exact": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 320,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          }
+        }
+      }
+    },
+    {
+      "concurrency": 5,
+      "sample_count": 1000,
+      "latency_ms": {
+        "cache": {
+          "p50": 0.045,
+          "p95": 0.2,
+          "p99": 0.456
+        },
+        "embed": {
+          "p50": 0.0,
+          "p95": 4.232,
+          "p99": 162.795
+        },
+        "vector": {
+          "p50": 0.0,
+          "p95": 0.319,
+          "p99": 7.935
+        },
+        "fallback": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "graph": {
+          "p50": 0.0,
+          "p95": 0.02,
+          "p99": 0.551
+        },
+        "rerank": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.005
+        },
+        "serialize": {
+          "p50": 0.008,
+          "p95": 0.015,
+          "p99": 0.021
+        },
+        "total": {
+          "p50": 1.565,
+          "p95": 15.911,
+          "p99": 172.229
+        }
+      },
+      "latency_by_mode": {
+        "cache": {
+          "cache": {
+            "p50": 0.043,
+            "p95": 0.17,
+            "p99": 0.225
+          },
+          "embed": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "vector": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "rerank": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "serialize": {
+            "p50": 0.008,
+            "p95": 0.01,
+            "p99": 0.012
+          },
+          "total": {
+            "p50": 1.526,
+            "p95": 3.075,
+            "p99": 6.085
+          }
+        },
+        "vector": {
+          "cache": {
+            "p50": 0.204,
+            "p95": 0.74,
+            "p99": 0.873
+          },
+          "embed": {
+            "p50": 133.096,
+            "p95": 178.313,
+            "p99": 184.584
+          },
+          "vector": {
+            "p50": 7.531,
+            "p95": 8.866,
+            "p99": 9.821
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 0.512,
+            "p95": 0.628,
+            "p99": 0.737
+          },
+          "rerank": {
+            "p50": 0.004,
+            "p95": 0.006,
+            "p99": 0.008
+          },
+          "serialize": {
+            "p50": 0.019,
+            "p95": 0.026,
+            "p99": 0.031
+          },
+          "total": {
+            "p50": 143.706,
+            "p95": 187.447,
+            "p99": 193.81
+          }
+        }
+      },
+      "cache_hit_ratio": 0.95,
+      "fallback_ratio": 0.0,
+      "degraded_ratio": 0.0,
+      "fallback": {
+        "attempts": 0,
+        "success_rate": null,
+        "false_empty_rate": null
+      },
+      "quality": {
+        "overall": {
+          "count": 1000,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "mrr": 1.0
+        },
+        "by_variant": {
+          "exact": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 320,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          }
+        }
+      }
+    }
+  ],
+  "setup_and_run_ms": 11299.002,
+  "privacy": {
+    "raw_queries_recorded": false,
+    "story_content_recorded": false,
+    "absolute_paths_recorded": false,
+    "repository_urls_recorded": false,
+    "hostname_recorded": false
+  }
+}

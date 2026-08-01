@@ -5,7 +5,11 @@ import json
 import sqlite3
 import logging
 import os
+import re
+import time
 import uuid
+from itertools import combinations
+from pathlib import Path
 from typing import Optional
 
 import sqlite_vec
@@ -75,25 +79,36 @@ CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_stories_parent ON stories(parent_id);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+
+-- 查询缓存只依赖可检索内容版本；访问计数与共同召回反馈不会推进该版本。
+CREATE TABLE IF NOT EXISTS query_state (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO query_state(key, value) VALUES ('index_version', 1);
 """
 
 
-def get_db() -> sqlite3.Connection:
+def get_db(
+    db_path: str | Path | None = None, *, load_vector_extension: bool = True
+) -> sqlite3.Connection:
     """获取数据库连接（每次调用创建新连接，用完即关）"""
-    config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(config.DB_PATH))
+    path = Path(db_path) if db_path is not None else config.DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(path))
     if os.name != "nt":
-        config.DB_PATH.chmod(0o600)
+        path.chmod(0o600)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     # MCP server（agent 运行时 recall，会写 access_count/边权）与做梦周期 process
     # 可能并发写同一库；设 busy_timeout 让后到的写等待而非立刻报 database is locked。
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA foreign_keys=ON")
-    # 加载 sqlite-vec 扩展
-    db.enable_load_extension(True)
-    sqlite_vec.load(db)
-    db.enable_load_extension(False)
+    if load_vector_extension:
+        # 加载 sqlite-vec 扩展
+        db.enable_load_extension(True)
+        sqlite_vec.load(db)
+        db.enable_load_extension(False)
     return db
 
 
@@ -104,6 +119,7 @@ def init_db():
     try:
         db.executescript(_SCHEMA)
         _ensure_identity_columns(db)
+        _ensure_fts_index(db)
         # 创建 sqlite-vec 虚拟表
         db.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS story_vectors USING vec0(
@@ -115,6 +131,75 @@ def init_db():
         logger.info("数据库初始化完成: %s", config.DB_PATH)
     finally:
         db.close()
+
+
+def _ensure_fts_index(db: sqlite3.Connection) -> None:
+    """创建与 ``stories`` 外部内容表同步的 FTS5 索引。
+
+    旧数据库首次升级时执行一次 ``rebuild``；后续由触发器增量同步，避免每次
+    ``init_db`` 都扫描全部 Story。
+    """
+
+    existed = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='story_fts'"
+    ).fetchone() is not None
+    try:
+        db.execute(
+            """CREATE VIRTUAL TABLE IF NOT EXISTS story_fts USING fts5(
+                   title, content, keywords,
+                   content='stories', content_rowid='id', tokenize='unicode61'
+               )"""
+        )
+    except sqlite3.OperationalError:
+        # 少数 SQLite 构建未启用 FTS5；关键词 LIKE fallback 仍可工作。
+        logger.warning("SQLite FTS5 不可用，将使用关键词 fallback")
+        return
+    db.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS story_fts_insert AFTER INSERT ON stories BEGIN
+            INSERT INTO story_fts(rowid, title, content, keywords)
+            VALUES (new.id, new.title, new.content, new.keywords);
+        END;
+        CREATE TRIGGER IF NOT EXISTS story_fts_delete AFTER DELETE ON stories BEGIN
+            INSERT INTO story_fts(story_fts, rowid, title, content, keywords)
+            VALUES ('delete', old.id, old.title, old.content, old.keywords);
+        END;
+        CREATE TRIGGER IF NOT EXISTS story_fts_update
+        AFTER UPDATE OF title, content, keywords ON stories BEGIN
+            INSERT INTO story_fts(story_fts, rowid, title, content, keywords)
+            VALUES ('delete', old.id, old.title, old.content, old.keywords);
+            INSERT INTO story_fts(rowid, title, content, keywords)
+            VALUES (new.id, new.title, new.content, new.keywords);
+        END;
+        """
+    )
+    if not existed:
+        db.execute("INSERT INTO story_fts(story_fts) VALUES ('rebuild')")
+
+
+def get_index_version(db_path: str | Path | None = None) -> int:
+    """返回当前可检索内容版本，供跨进程缓存 key 使用。"""
+
+    path = Path(db_path) if db_path is not None else config.DB_PATH
+    db = sqlite3.connect(str(path), timeout=0.05)
+    try:
+        db.execute("PRAGMA query_only=ON")
+        row = db.execute(
+            "SELECT value FROM query_state WHERE key = 'index_version'"
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        db.close()
+
+
+def _bump_index_version(db: sqlite3.Connection) -> int:
+    db.execute(
+        "UPDATE query_state SET value = value + 1 WHERE key = 'index_version'"
+    )
+    row = db.execute(
+        "SELECT value FROM query_state WHERE key = 'index_version'"
+    ).fetchone()
+    return int(row[0])
 
 
 def _new_global_id() -> str:
@@ -285,6 +370,8 @@ def repair_vector_consistency() -> dict:
                 cleared += 1
             except Exception as e:
                 failed.append((sid, f"clear: {e}"))
+        if rebuilt or cleared:
+            _bump_index_version(db)
         db.commit()
     finally:
         db.close()
@@ -383,6 +470,7 @@ def add_story(title: str, content: str, keywords: list[str],
             "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",
             (story_id, emb_blob)
         )
+        _bump_index_version(db)
         db.commit()
         logger.info("新建 story #%d: %s", story_id, title)
         return story_id
@@ -425,6 +513,8 @@ def update_story(story_id: int, title: str = None, content: str = None,
                 "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",
                 (story_id, emb_blob)
             )
+        if any(value is not None for value in (title, content, keywords, embedding)):
+            _bump_index_version(db)
         db.commit()
         logger.info("更新 story #%d", story_id)
     finally:
@@ -439,8 +529,13 @@ def delete_story_vector(story_id: int):
     """
     db = get_db()
     try:
-        db.execute("DELETE FROM story_vectors WHERE story_id = ?", (story_id,))
-        db.execute("UPDATE stories SET embedding = NULL WHERE id = ?", (story_id,))
+        cur = db.execute("DELETE FROM story_vectors WHERE story_id = ?", (story_id,))
+        updated = db.execute(
+            "UPDATE stories SET embedding = NULL WHERE id = ? AND embedding IS NOT NULL",
+            (story_id,),
+        )
+        if cur.rowcount or updated.rowcount:
+            _bump_index_version(db)
         db.commit()
         logger.info("已从检索索引移除 story #%d 的向量", story_id)
     finally:
@@ -490,6 +585,41 @@ def increment_access_count(story_id: int):
         db.close()
 
 
+def apply_recall_feedback(
+    story_ids: list[int], *, db_path: str | Path | None = None
+) -> None:
+    """单事务写入一次召回的访问计数与共同召回边权反馈。
+
+    查询线程通过后台队列调用本函数；这里刻意不推进 ``index_version``，避免
+    纯反馈写使查询结果缓存每次都失效。
+    """
+
+    unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
+    if not unique_ids:
+        return
+    db = get_db(db_path, load_vector_extension=False)
+    try:
+        db.executemany(
+            "UPDATE stories SET access_count = access_count + 1 WHERE id = ?",
+            [(story_id,) for story_id in unique_ids],
+        )
+        for source_id, target_id in combinations(sorted(unique_ids), 2):
+            db.execute(
+                """UPDATE edges
+                   SET weight = MIN(weight + ?, ?)
+                   WHERE source_id = ? AND target_id = ?""",
+                (
+                    config.WEIGHT_INCREMENT,
+                    config.WEIGHT_MAX,
+                    source_id,
+                    target_id,
+                ),
+            )
+        db.commit()
+    finally:
+        db.close()
+
+
 def count_stories() -> int:
     db = get_db()
     try:
@@ -517,12 +647,15 @@ def add_or_update_edge(source_id: int, target_id: int, weight: float,
             "SELECT * FROM edges WHERE source_id = ? AND target_id = ?",
             (source_id, target_id)
         ).fetchone()
+        changed = False
         if existing:
             new_weight = min(max(existing["weight"], weight), config.WEIGHT_MAX)
-            db.execute(
-                "UPDATE edges SET weight = ? WHERE source_id = ? AND target_id = ?",
-                (new_weight, source_id, target_id)
-            )
+            if new_weight != existing["weight"]:
+                db.execute(
+                    "UPDATE edges SET weight = ? WHERE source_id = ? AND target_id = ?",
+                    (new_weight, source_id, target_id)
+                )
+                changed = True
         else:
             db.execute(
                 """INSERT INTO edges (
@@ -534,6 +667,9 @@ def add_or_update_edge(source_id: int, target_id: int, weight: float,
                     source_id, target_id, weight, edge_type,
                 )
             )
+            changed = True
+        if changed:
+            _bump_index_version(db)
         db.commit()
     finally:
         db.close()
@@ -591,6 +727,34 @@ def get_related_stories(story_id: int, limit: int = 5) -> list[dict]:
             (story_id, story_id, story_id, limit)
         ).fetchall()
         return [_row_to_story(r) for r in rows]
+    finally:
+        db.close()
+
+
+def get_related_stories_batch(
+    story_ids: list[int], limit: int = 5
+) -> dict[int, list[dict]]:
+    """在一个只读连接中批量读取多条 Story 的关联项。"""
+
+    unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
+    related_by_story = {story_id: [] for story_id in unique_ids}
+    if not unique_ids:
+        return related_by_story
+    db = get_db(load_vector_extension=False)
+    try:
+        for story_id in unique_ids:
+            rows = db.execute(
+                """SELECT s.*, e.weight, e.edge_type
+                   FROM edges e
+                   JOIN stories s ON s.id = CASE
+                       WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
+                   WHERE e.source_id = ? OR e.target_id = ?
+                   ORDER BY e.weight DESC
+                   LIMIT ?""",
+                (story_id, story_id, story_id, limit),
+            ).fetchall()
+            related_by_story[story_id] = [_row_to_story(row) for row in rows]
+        return related_by_story
     finally:
         db.close()
 
@@ -664,6 +828,125 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
         return results[:top_k]
     finally:
         db.close()
+
+
+def search_by_lexical(
+    query: str, top_k: int = 5, *, timeout_seconds: float = 0.5
+) -> list[dict]:
+    """FTS5 + 参数化关键词子串的低时延降级检索。
+
+    FTS5 负责常规词法命中；LIKE 分支补齐中文连续文本和关键词 JSON 中 FTS
+    tokenizer 难以稳定切分的情况。SQLite progress handler 与 busy_timeout 共同
+    保证调用方给定的 deadline。
+    """
+
+    terms = _lexical_terms(query)
+    if not terms or top_k <= 0:
+        return []
+    deadline = time.perf_counter() + max(0.001, timeout_seconds)
+    db = get_db(load_vector_extension=False)
+    busy_timeout_ms = max(1, int(timeout_seconds * 1000))
+    db.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+    db.set_progress_handler(
+        lambda: 1 if time.perf_counter() >= deadline else 0,
+        500,
+    )
+    try:
+        candidates: dict[int, sqlite3.Row] = {}
+        fts_query = " OR ".join(f'"{term}"' for term in terms)
+        try:
+            rows = db.execute(
+                """SELECT s.id, s.title, s.content, s.keywords
+                   FROM story_fts
+                   JOIN stories s ON s.id = story_fts.rowid
+                   WHERE story_fts MATCH ? AND s.embedding IS NOT NULL
+                   ORDER BY bm25(story_fts, 8.0, 2.0, 5.0)
+                   LIMIT ?""",
+                (fts_query, max(top_k * 8, 16)),
+            ).fetchall()
+            candidates.update({int(row["id"]): row for row in rows})
+        except sqlite3.OperationalError as exc:
+            if "interrupted" in str(exc).lower():
+                raise TimeoutError("lexical fallback timed out") from exc
+            logger.warning("FTS 查询失败，继续关键词 fallback")
+
+        clauses = []
+        params: list[object] = []
+        for term in terms:
+            clauses.append(
+                "(instr(lower(s.title), ?) > 0 OR "
+                "instr(lower(s.content), ?) > 0 OR "
+                "instr(lower(s.keywords), ?) > 0)"
+            )
+            params.extend((term, term, term))
+        rows = db.execute(
+            f"""SELECT s.id, s.title, s.content, s.keywords
+                FROM stories s
+                WHERE s.embedding IS NOT NULL AND ({' OR '.join(clauses)})
+                LIMIT ?""",
+            (*params, max(top_k * 32, 256)),
+        ).fetchall()
+        candidates.update({int(row["id"]): row for row in rows})
+
+        exact = query.strip().casefold()
+        ranked = []
+        for row in candidates.values():
+            title = row["title"].casefold()
+            content = row["content"].casefold()
+            keywords_text = row["keywords"].casefold()
+            score = 0.0
+            if exact:
+                score += 6.0 if exact in title else 0.0
+                score += 3.0 if exact in content else 0.0
+                score += 4.0 if exact in keywords_text else 0.0
+            for term in terms:
+                score += 3.0 if term in title else 0.0
+                score += 1.0 if term in content else 0.0
+                score += 2.0 if term in keywords_text else 0.0
+            if score <= 0:
+                # 仅 FTS tokenizer 命中的结果仍保留一个稳定的最低分。
+                score = 0.5
+            max_score = 13.0 + 6.0 * len(terms)
+            ranked.append({
+                "story_id": row["id"],
+                "title": row["title"],
+                "content": row["content"],
+                "keywords": json.loads(row["keywords"]),
+                "similarity": round(min(1.0, score / max_score), 4),
+                "lexical_score": round(score, 4),
+            })
+        ranked.sort(
+            key=lambda item: (-item["lexical_score"], item["story_id"])
+        )
+        return ranked[:top_k]
+    except sqlite3.OperationalError as exc:
+        if "interrupted" in str(exc).lower():
+            raise TimeoutError("lexical fallback timed out") from exc
+        raise
+    finally:
+        db.set_progress_handler(None, 0)
+        db.close()
+
+
+def _lexical_terms(query: str) -> list[str]:
+    raw_terms = re.findall(
+        r"[a-z0-9_]+|[\u3400-\u4dbf\u4e00-\u9fff]+",
+        query.casefold(),
+    )
+    terms: list[str] = []
+    for token in raw_terms:
+        if token not in terms:
+            terms.append(token)
+        if re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff]+", token) and len(token) > 2:
+            for index in range(len(token) - 1):
+                bigram = token[index:index + 2]
+                if bigram not in terms:
+                    terms.append(bigram)
+                if len(terms) >= 8:
+                    break
+        if len(terms) >= 8:
+            break
+    return terms
 
 
 # ═══════════════════════════════════════════════
