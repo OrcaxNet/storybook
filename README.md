@@ -8,14 +8,14 @@
 
 Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JSON 文件或内置模拟器），对每条会话跑一遍 **做梦周期（dream cycle）**：按“独立可复用结论 + 环境适用性”形成一个或多个 Story v2。每条 Story 保存 `title + abstract + structured detail + sources`；detail 与证据不硬截断，只有用于检索/展示的 abstract 有预算，并与已有记忆按相似度**合并 / 更新 / 新建**。
 
-检索时，先做向量相似度召回，再沿关联边激活相关 Story，共同被召回的 Story 之间的边权重会被强化——像人脑在反复回忆中加深记忆路径。
+检索时，以向量/词法直接命中为 seed，在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。每条图命中都返回 seed、完整路径、边 provenance 和分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
 
 整个系统**完全离线**：LLM 与 embedding 都走本地 Ollama，不依赖任何云端服务。
 
 ## ✨ 特性
 
 - 🧠 **语义边界记忆整理**：长而不可拆的经历保持完整；短会话中的多个独立结论拆成多条 Story，并共享来源 Session
-- 🔗 **带权关联图**：Story 间有 `semantic` / `parent_child` / `sibling` 三类无向边，检索时沿边激活
+- 🔗 **可解释 Memory Graph**：`semantic` / `temporal` / `causal` / `same_environment` / `parent_child` / `co_recall` / `supersedes` 多类型边，有明确方向、provenance、版本与软删除规则
 - 📐 **可演进双索引**：当前 `story_vectors` 持续服务，模型/版本切换先增量写 shadow，完整后原子切换；失败可续跑
 - 🔍 **低时延联想检索**：MCP 启动预热 + Ollama keep-alive；按 `index_version` 失效的查询向量/结果双缓存；向量不可用或超时时在独立 500ms 预算内切到 FTS/关键词 fallback
 - 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
@@ -47,13 +47,13 @@ collector → store → processor (用 llm + embeddings) → search
 
 ### 检索（`search.search`）
 
-直接 embed 查询文本 → vec0 top-K（扩大候选后按 `SIM_THRESHOLD_SEARCH=0.50` 过滤）→ 对每个命中，沿 `edges` 表（权重降序）浮现相关 Story，并对共同召回的 Story 之间加边权重；命中 Story 的 `access_count` 自增。
+直接 embed 查询文本 → vec0 top-K（扩大候选后按 `SIM_THRESHOLD_SEARCH=0.50` 过滤）→ 以直接命中为 seed 执行有界 Graph RAG → 合并去重、环境软加权并排序。`graph_enabled=false` 可回退到直接检索；预算用尽时保留已有结果并返回顶层 `truncated=true` 及原因。
 
 查询响应包含 `request_id`、`mode`、`degraded` 与 `latency_ms.{cache,embed,vector,graph,rerank,serialize,total}`。同一份阶段数据会写入本地 `logs/query_performance.jsonl`，但落盘接口只接受固定白名单字段：不保存原始 query、Story 内容、绝对路径、hostname 或仓库 URL。文件权限为 `0600`，超过大小上限后只保留最近记录。
 
 ### 关联图
 
-`edges` 表，`UNIQUE(source_id, target_id)`。边类型：`semantic`、`parent_child`（固定 1.0）、`sibling`（0.5）。边是**无向**的：`add_or_update_edge` / `increment_edge_weight` 通过 `_edge_pair` 把端点归一化为 `(min_id, max_id)`，因此调用方向无关、`(A,B)` 与 `(B,A)` 不会重复建行。
+`edges` 以 `UNIQUE(source_id, target_id, edge_type)` 允许同一 Story 对保存多种关系。`temporal`（旧→新）、`causal`（因→果）、`parent_child`（父→子）、`supersedes`（新→旧）是有向边；其余无向。边包含 `provenance_json/version/observations/updated_at/deleted_at`，删除为可审计软删除。Graph RAG 默认从旧 Story 反向跟随 `supersedes` 到新 Story 并抑制旧版；对环、hub、重复路径和噪声共现链做显式抑制。
 
 ### 存储层（`store.py`）
 
@@ -177,7 +177,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **processor**：create / merge / update 三分支 + split 路径，mock `llm`/`embeddings` 返回固定值，
   验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
 - **Story v2**：千 token 原子 Story 无损保存、短会话双结论共享 Session、summary/detail 分层、revision 链，以及 embedding backfill 失败续跑与原子切换。
-- **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
+- **search/graph**：阈值过滤、单/多跳扩散、路径解释、环/hub/重复抑制、supersedes 替换和独立预算截断。
 - **performance**：阶段时钟故障注入、最近窗口百分位、cache/fallback 比例、诊断隐私白名单，以及 warm/cold、并发 1/5 benchmark 编排（测试用小数据集与 mock embedding）。
 - **prime**：query 构造（cwd / first_prompt）、主动注入门槛（高于检索）、token 预算裁剪、静默不注入（空库 / 低于门槛 / embedding 失败 / schema 缺失均不抛错）。
 - **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
@@ -207,6 +207,13 @@ python scripts/eval.py retrieval                # 等价独立脚本（未做 ed
 4. **ablation** — 比较 legacy、默认 `title+abstract+applicability`、全文单向量、title/abstract/applicability 分字段多向量；按 exact/synonym/cross-tool/cross-language 报告 recall@3/MRR 与索引/查询时延。
 
 Story v2 固定报告（2026-08-02，`data/eval_reports/story-v2-ablation-2026-08-02.json`）：四种表示在 24 topic × 4 分组上 recall@3/MRR 均为 100%；默认表示相对 legacy 为 `0.00pp`，通过“下降不超过 2pp”门槛。默认单向量索引均值 84.4ms/story，明显低于全文 205.2ms 与多向量 223.7ms；多向量检索 p95 0.94ms，高于默认 0.34ms，因此选择默认表示。
+
+Memory Graph 固定报告（2026-08-02，`data/eval_reports/memory-graph-2026-08-02.json`）覆盖七类边、单/多跳和负例：人工关联子集中 vector-only → Graph RAG 的 recall@5 为 `0% → 100%`，overall recall@3 为 `100% → 100%`；10k active Story、10,063 条边、50 次扩散的 `graph_ms p95=1.954ms`。可用以下命令复现（无需 Ollama）：
+
+```bash
+python -m storybook.graph_eval --stories 10000 --repeats 50 \
+  --output data/eval_reports/memory-graph.json
+```
 
 当前基线（2026-07-19，`data/eval_reports/baseline-2026-07-19.json`）：recall@3 = 100% ✅ 达标；
 合并正确率 85.7%（`dup-docker-dns` sim 0.83 落在 0.85 阈值下方被误判为 create，阈值敏感性显示 0.82 可达 100%）；
@@ -387,7 +394,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`） | 默认返回 `abstract` 摘要；兼容 `content` 字段仍存在并承载同一摘要，`truncated=true` 表示完整 detail 需按需展开 |
+| `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`）, `graph_enabled?` | 返回直接/图扩散命中；图命中含 `seed_story_id/graph_path/score_components`，顶层 `truncated` 表示图预算安全截断 |
 | `get_story` | `story_id`（必填） | 查看完整 `detail/sources/revisions` 与兼容 `title/content/version`，剥离 1024 维 embedding |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
 | `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / Ollama 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
@@ -497,6 +504,10 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `STORYBOOK_QUERY_WARM_TIMEOUT_SECONDS` | `2` | warm embedding 硬超时，超时即降级 |
 | `STORYBOOK_QUERY_COLD_TIMEOUT_SECONDS` | `5` | cold embedding 硬超时，超时即降级 |
 | `STORYBOOK_QUERY_FALLBACK_TIMEOUT_SECONDS` | `0.5` | FTS/关键词 fallback 独立硬超时 |
+| `STORYBOOK_GRAPH_ENABLED` | `1` | 默认启用 Graph RAG；`0` 仅返回直接检索 |
+| `STORYBOOK_GRAPH_MAX_HOPS` / `MAX_PATHS` / `FAN_OUT` | `2` / `64` / `8` | 图扩散结构预算 |
+| `STORYBOOK_GRAPH_TIME_BUDGET_MS` | `100` | 图扩散墙钟预算，用尽时返回 `truncated=true` |
+| `STORYBOOK_GRAPH_TOKEN_BUDGET` | `1600` | 图扩散候选摘要与路径预算 |
 | `STORYBOOK_LLM_THINK` | `0` | Qwen3 思考模式：`0`=关（提取类任务约 9× 加速），`1`=开（检索准确率不足时再开） |
 | `STORYBOOK_DREAM_INTERVAL` | `14400` | `dream` 守护进程 / launchd 定时间隔（秒），默认 4 小时 |
 | `STORYBOOK_WATCH_POLL_INTERVAL` | `60` | `process --watch` 轮询 `~/.claude/projects` 的间隔（秒） |

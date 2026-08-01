@@ -32,7 +32,16 @@ class TestTrimRelated:
         out = mcp_server._trim_related([
             {"story_id": 1, "title": "A", "content": "全文...", "weight": 0.5, "edge_type": "semantic"},
         ])
-        assert out == [{"story_id": 1, "title": "A", "weight": 0.5, "edge_type": "semantic"}]
+        assert out == [{
+            "story_id": 1,
+            "title": "A",
+            "weight": 0.5,
+            "edge_type": "semantic",
+            "directed": False,
+            "direction": "undirected",
+            "provenance": {},
+            "version": 1,
+        }]
         assert "content" not in out[0]
 
     def test_handles_id_keyed_rows(self):
@@ -291,6 +300,7 @@ class TestServerWiring:
         assert "top_k" in props
         assert "context" in props
         assert "scope" in props
+        assert "graph_enabled" in props
         # query 必填
         assert "query" in tools["recall"].inputSchema.get("required", [])
 

@@ -67,7 +67,7 @@ For each pending session: LLM extracts keywords → embed `keywords + problem_de
 Thresholds live in `config.py`, including `SIM_THRESHOLD_UPDATE_ONLY` (0.92). Only the abstract/recall presentation has a budget; persisted detail and sources are lossless.
 
 ### Retrieval (`search.search`)
-Embed query (keywords + query) → vec0 top-K (fetches `top_k*2`, filters by `SIM_THRESHOLD_SEARCH=0.50`) → for each hit, surface related stories via `edges` (weight desc) and bump edge weights between co-retrieved stories. Hits also increment `stories.access_count`.
+Embed the raw query → vec0 top-K (expanded candidate lane, filtered by `SIM_THRESHOLD_SEARCH=0.50`) → use direct hits as seeds for bounded typed-graph expansion → deduplicate, suppress superseded Stories, apply environment policy, and rank. `graph_enabled=False` preserves a direct-only fallback. Graph candidates expose `seed_story_id`, full `graph_path` (including provenance/version), and `score_components`; independent hop/path/fan-out/time/token budgets return partial results with top-level `truncated=true`.
 
 Every query returns and locally records a privacy-safe latency breakdown:
 `cache/embed/vector/graph/rerank/serialize/total`. Diagnostics are written to
@@ -83,13 +83,13 @@ results and adds explainable warnings; only explicit `scope="strict"` filters
 environment conflicts. Story environment history is a collection derived from all
 source Sessions, never a last-write-wins field.
 
-### Edge graph
-`edges` table, `UNIQUE(source_id, target_id)`. Types: `semantic`, `parent_child` (1.0, fixed), `sibling` (0.5). Edges are **undirected**: `add_or_update_edge`/`increment_edge_weight` normalize endpoint order to `(min_id, max_id)` via `_edge_pair`, so call direction doesn't matter and `(A,B)`/`(B,A)` can't create duplicate rows. `add_or_update_edge` takes `max(existing, new)`; `increment_edge_weight` adds a delta capped at `WEIGHT_MAX` (1.0). Queries (`get_related_stories`) match either endpoint.
+### Memory Graph
+`edges` uses `UNIQUE(source_id, target_id, edge_type)` and supports `semantic`, `temporal`, `causal`, `same_environment`, `parent_child`, `co_recall`, and `supersedes`. Temporal (old→new), causal (cause→effect), parent-child (parent→child), and supersedes (new→old) are directed; the rest canonicalize undirected endpoints. Every edge carries JSON provenance, version, observations, reinforcement timestamps, and a soft-delete timestamp. Legacy `sibling` rows remain readable, while new split siblings are standard semantic edges with `relationship=sibling` provenance. Recall feedback is queued and non-blocking, creates/reinforces capped `co_recall` edges, and supports half-life decay.
 
 ## Configuration knobs (`config.py`)
 
 - Paths: `DB_PATH`/`INDEX_DIR`/`CACHE_DIR`/`LOG_DIR` resolve from the active user Profile; `PERFORMANCE_LOG_PATH` follows that Profile's `LOG_DIR`; `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
-- Thresholds/budgets: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_ABSTRACT_MAX_CHARS` (600).
+- Thresholds/budgets: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_ABSTRACT_MAX_CHARS` (600), plus Graph RAG hop/path/fan-out/time/token budgets in `GRAPH_*`.
 - Weight rules: `WEIGHT_INCREMENT` (0.1), `WEIGHT_MAX` (1.0), `WEIGHT_PARENT_CHILD` (1.0).
 - LLM call options (temp 0.3, `num_ctx` 8192, 120s timeout) are hardcoded in `llm._chat`/`_generate`, except `think` which follows `config.LLM_THINK` (`STORYBOOK_LLM_THINK` env, default **off**). `qwythos-hermes` is Qwen3-arch with a thinking mode that makes extraction calls ~9× slower; thinking is unnecessary for keyword/summary/split tasks, so it's off by default. Set `STORYBOOK_LLM_THINK=1` only if retrieval accuracy drops.
 

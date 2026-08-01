@@ -203,6 +203,49 @@ WEIGHT_INCREMENT = 0.1         # 共同调用每次提升
 WEIGHT_MAX = 1.0               # 权重上限
 WEIGHT_PARENT_CHILD = 1.0      # 父子story默认权重
 
+# ── Memory Graph / Graph RAG ──
+# 边类型是对“经历记忆”的关联建模，不把 Story 强行投影为事实知识图谱。
+# ``sibling`` 仅为 v0.1 兼容别名；新写入应使用下列七种标准类型。
+MEMORY_EDGE_TYPES = (
+    "semantic",
+    "temporal",
+    "causal",
+    "same_environment",
+    "parent_child",
+    "co_recall",
+    "supersedes",
+)
+DIRECTED_EDGE_TYPES = frozenset({
+    "temporal", "causal", "parent_child", "supersedes",
+})
+GRAPH_DEFAULT_ENABLED = os.getenv(
+    "STORYBOOK_GRAPH_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+GRAPH_MAX_HOPS = int(os.getenv("STORYBOOK_GRAPH_MAX_HOPS", "2"))
+GRAPH_MAX_PATHS = int(os.getenv("STORYBOOK_GRAPH_MAX_PATHS", "64"))
+GRAPH_FAN_OUT = int(os.getenv("STORYBOOK_GRAPH_FAN_OUT", "8"))
+GRAPH_TIME_BUDGET_MS = float(os.getenv("STORYBOOK_GRAPH_TIME_BUDGET_MS", "100"))
+GRAPH_TOKEN_BUDGET = int(os.getenv("STORYBOOK_GRAPH_TOKEN_BUDGET", "1600"))
+GRAPH_HOP_DECAY = float(os.getenv("STORYBOOK_GRAPH_HOP_DECAY", "0.82"))
+GRAPH_MIN_SCORE = float(os.getenv("STORYBOOK_GRAPH_MIN_SCORE", "0.55"))
+GRAPH_CO_RECALL_HALF_LIFE_DAYS = float(os.getenv(
+    "STORYBOOK_GRAPH_CO_RECALL_HALF_LIFE_DAYS", "30"
+))
+GRAPH_CO_RECALL_MIN_WEIGHT = float(os.getenv(
+    "STORYBOOK_GRAPH_CO_RECALL_MIN_WEIGHT", "0.02"
+))
+GRAPH_EDGE_TYPE_FACTORS = {
+    "semantic": 0.85,
+    "temporal": 0.80,
+    "causal": 1.00,
+    "same_environment": 0.90,
+    "parent_child": 0.95,
+    "co_recall": 0.70,
+    "supersedes": 1.00,
+    # v0.1 兼容：新边不再写 sibling，但旧库仍可召回。
+    "sibling": 0.75,
+}
+
 # ── 会话启动主动注入（晨间简报 / 上下文预热）──
 # 见 src/storybook/prime.py。相比普通检索，主动注入用更高相关度门槛，
 # 避免把弱相关记忆塞进每次会话开头的上下文造成噪声。

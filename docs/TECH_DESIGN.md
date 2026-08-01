@@ -123,14 +123,23 @@ CREATE TABLE stories (
 -- 关联边表（带权重的关联网络）
 CREATE TABLE edges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    global_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
     source_id INTEGER NOT NULL,
     target_id INTEGER NOT NULL,
     weight REAL DEFAULT 0.0,       -- 0.0~1.0
-    edge_type TEXT DEFAULT 'semantic', -- 'semantic' / 'parent_child' / 'co_occur'
+    edge_type TEXT DEFAULT 'semantic', -- 7 种标准 Memory Graph relation
+    directed INTEGER NOT NULL DEFAULT 0,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL DEFAULT 1,
+    observations INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    last_reinforced_at TEXT,
+    deleted_at TEXT,               -- 可审计软删除
     FOREIGN KEY (source_id) REFERENCES stories(id),
     FOREIGN KEY (target_id) REFERENCES stories(id),
-    UNIQUE(source_id, target_id)
+    UNIQUE(source_id, target_id, edge_type)
 );
 
 -- 向量表（sqlite-vec 虚拟表，关联到 stories）
@@ -245,10 +254,11 @@ Step 2: 向量检索 Top3
   └── 返回 Top3 story (sim ≥ 0.5)
   │
   ▼
-Step 3: 关联激活
-  ├── 对每个Top3 story:
-  │     ├── 查询 edges 表，按 weight DESC 取关联story
-  │     └── 展示关联story列表 (模拟"下意识联想")
+Step 3: 受预算 Graph RAG
+  ├── 直接命中作为 seed
+  ├── hop/path/fan-out/time/token 约束下扩散多类型边
+  ├── 抑制环、hub、重复路径与 superseded 旧版
+  └── 合并直接/图候选，环境加权、去重并排序
   │
   ▼
 Step 4: 返回结果
@@ -257,13 +267,19 @@ Step 4: 返回结果
       {
         "story": {...},
         "similarity": 0.89,
-        "related": [
-          {"story": {...}, "weight": 0.9},
-          {"story": {...}, "weight": 0.7}
-        ]
+        "retrieval_source": "graph",
+        "seed_story_id": 7,
+        "graph_path": [
+          {"edge_type": "causal", "weight": 0.9,
+           "provenance": {...}, "version": 2}
+        ],
+        "score_components": {...},
+        "related": [...]          -- 单跳兼容视图
       },
       ...
-    ]
+    ],
+    "truncated": false,
+    "graph_trace": {...}
   }
 ```
 

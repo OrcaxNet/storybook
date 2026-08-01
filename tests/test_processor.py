@@ -248,12 +248,13 @@ class TestSplitBranch:
             assert pc[cid]["weight"] == pytest.approx(config.WEIGHT_PARENT_CHILD)
             assert pc[cid]["edge_type"] == "parent_child"
 
-        # 4) 兄弟边 weight=0.5，类型 sibling
+        # 4) 兄弟关系用标准 semantic 边，精确语义留在 provenance
         edges_c1 = store.get_edges(c1)
         sibling = [e for e in edges_c1 if e["related_id"] == c2]
         assert len(sibling) == 1
         assert sibling[0]["weight"] == pytest.approx(0.5)
-        assert sibling[0]["edge_type"] == "sibling"
+        assert sibling[0]["edge_type"] == "semantic"
+        assert sibling[0]["provenance"]["relationship"] == "sibling"
 
         # 5) 子 story 关键词 = 父关键词 + 本会话关键词（去重保序）
         for c in children:

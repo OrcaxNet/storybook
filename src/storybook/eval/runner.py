@@ -680,7 +680,7 @@ def run_split_eval(
                     for e in all_edges:
                         if e["edge_type"] == "parent_child":
                             pc_edges.append(e)
-                        elif e["edge_type"] == "sibling":
+                        elif e["edge_type"] in {"semantic", "sibling"}:
                             sibling_edges.append(e)
                 # 子 story 向量是否在索引中
                 children_in_index = []

@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-01T23:37:01.277553+00:00",
+  "machine": {
+    "os": "Darwin",
+    "os_release": "25.3.0",
+    "arch": "arm64",
+    "cpu": "arm",
+    "cpu_count": 10,
+    "memory_bytes": 17179869184
+  },
+  "quality": {
+    "dataset": {
+      "associated_cases": 8,
+      "negative_cases": 1,
+      "edge_types": [
+        "semantic",
+        "temporal",
+        "causal",
+        "same_environment",
+        "parent_child",
+        "co_recall",
+        "supersedes"
+      ],
+      "includes_one_hop": true,
+      "includes_multi_hop": true
+    },
+    "vector_only": {
+      "recall@5": 0.0,
+      "mrr": 0.0,
+      "overall_recall@3": 1.0
+    },
+    "graph_rag": {
+      "recall@5": 1.0,
+      "mrr": 0.5042,
+      "overall_recall@3": 1.0,
+      "negative_false_positive_rate": 0
+    },
+    "cases": [
+      {
+        "case": "semantic",
+        "edge_types": [
+          "semantic"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 2,
+        "path_length": 1
+      },
+      {
+        "case": "temporal",
+        "edge_types": [
+          "temporal"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 2,
+        "path_length": 1
+      },
+      {
+        "case": "causal",
+        "edge_types": [
+          "causal"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 2,
+        "path_length": 1
+      },
+      {
+        "case": "same_environment",
+        "edge_types": [
+          "same_environment"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 2,
+        "path_length": 1
+      },
+      {
+        "case": "parent_child",
+        "edge_types": [
+          "parent_child"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 2,
+        "path_length": 1
+      },
+      {
+        "case": "co_recall",
+        "edge_types": [
+          "co_recall"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 5,
+        "path_length": 1
+      },
+      {
+        "case": "supersedes",
+        "edge_types": [
+          "supersedes"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 1,
+        "path_length": 1
+      },
+      {
+        "case": "causal_multi_hop",
+        "edge_types": [
+          "causal",
+          "causal"
+        ],
+        "vector_hit@5": false,
+        "graph_hit@5": true,
+        "graph_rank": 3,
+        "path_length": 2
+      }
+    ]
+  },
+  "performance": {
+    "stories": 10000,
+    "repeats": 50,
+    "active_edges": 10063,
+    "database_bytes": 7708672,
+    "graph_ms": {
+      "p50": 1.781,
+      "p95": 1.954,
+      "p99": 2.795,
+      "max": 3.574
+    },
+    "budgets": {
+      "max_hops": 2,
+      "max_paths": 64,
+      "fan_out": 8,
+      "time_ms": 100.0,
+      "tokens": 1600
+    }
+  },
+  "gates": {
+    "associated_recall_at_5_lift_pp": 100.0,
+    "overall_recall_at_3_regression_pp": 0.0,
+    "graph_ms_p95": 1.954,
+    "quality_passed": true,
+    "latency_passed": true
+  },
+  "privacy": {
+    "raw_queries_recorded": false,
+    "story_content_recorded": false,
+    "absolute_paths_recorded": false,
+    "hostname_recorded": false
+  }
+}

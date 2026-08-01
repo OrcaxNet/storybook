@@ -152,7 +152,16 @@ def _handle_create(session, keywords: list[str], story_vec: list[float],
     # 与低匹配 story 建立弱关联边
     for match in low_matches:
         weight = match["similarity"]  # 用相似度作为初始权重
-        store.add_or_update_edge(story_id, match["story_id"], weight, "semantic")
+        store.add_or_update_edge(
+            story_id,
+            match["story_id"],
+            weight,
+            "semantic",
+            provenance={
+                "source": "memory_formation",
+                "method": "embedding_similarity",
+            },
+        )
         logger.info("  建立关联: story#%d ↔ story#%d (weight=%.3f)",
                      story_id, match["story_id"], weight)
 
@@ -396,12 +405,29 @@ def _split_and_store(old_story: dict, session, merged_text: str,
         child_ids.append(child_id)
 
         # 父子边 weight=1.0
-        store.add_or_update_edge(parent_id, child_id, config.WEIGHT_PARENT_CHILD, "parent_child")
+        store.add_or_update_edge(
+            parent_id,
+            child_id,
+            config.WEIGHT_PARENT_CHILD,
+            "parent_child",
+            provenance={"source": "story_split", "method": "lineage"},
+        )
 
-    # 子 story 之间建立语义关联
+    # 子 Story 共享一次 split 来源；用标准 semantic 边并在
+    # provenance 中保留 sibling 语义，不再写 v0.1 的非标准类型。
     for i in range(len(child_ids)):
         for j in range(i + 1, len(child_ids)):
-            store.add_or_update_edge(child_ids[i], child_ids[j], 0.5, "sibling")
+            store.add_or_update_edge(
+                child_ids[i],
+                child_ids[j],
+                0.5,
+                "semantic",
+                provenance={
+                    "source": "story_split",
+                    "method": "shared_parent",
+                    "relationship": "sibling",
+                },
+            )
 
     store.update_story(
         parent_id,
