@@ -29,6 +29,7 @@ import re
 
 from . import config
 from . import search as search_module
+from . import context as context_module
 
 logger = logging.getLogger(__name__)
 
@@ -220,8 +221,15 @@ def _build_briefing(candidates: list[dict], token_budget: int
 #  主动注入核心
 # ═══════════════════════════════════════════════
 
-def prime_context(cwd: str = "", first_prompt: str = "",
-                  top_k: int = None, token_budget: int = None) -> dict:
+def prime_context(
+    cwd: str = "",
+    first_prompt: str = "",
+    top_k: int = None,
+    token_budget: int = None,
+    *,
+    tool_type: str = "other",
+    integration_mode: str = "manual",
+) -> dict:
     """主动召回并生成"晨间简报"。
 
     基于 ``cwd`` + 可选 ``first_prompt`` 构造 query，复用 ``search.search`` 召回 top-N
@@ -253,6 +261,11 @@ def prime_context(cwd: str = "", first_prompt: str = "",
     top_k = top_k or config.PRIME_TOP_K
 
     query = build_query(cwd, first_prompt)
+    current_context = context_module.capture_context(
+        tool_type=tool_type,
+        integration_mode=integration_mode,
+        workspace_path=cwd or None,
+    )
     base = {
         "cwd": cwd,
         "query": query,
@@ -262,6 +275,7 @@ def prime_context(cwd: str = "", first_prompt: str = "",
         "matches": [],
         "truncated": False,
         "note": None,
+        "context": current_context,
     }
 
     if not query:
@@ -269,7 +283,12 @@ def prime_context(cwd: str = "", first_prompt: str = "",
         return base
 
     try:
-        result = search_module.search(query, top_k=top_k)
+        result = search_module.search(
+            query,
+            top_k=top_k,
+            context=current_context,
+            scope="profile",
+        )
     except Exception as e:  # noqa: BLE001  -- schema 未初始化 / DB 锁等：晨间简报须非侵入
         base["note"] = (
             f"召回异常：{e}。可能数据库未初始化，请运行 `storybook init`；"

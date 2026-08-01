@@ -183,6 +183,7 @@ SIM_THRESHOLD_SEARCH = 0.50    # 检索最低相似度
 TOP_K_RETRIEVAL = 5            # 做梦时检索相似story数量
 TOP_K_SEARCH = 3               # 用户搜索返回Top3
 STORY_MAX_CHARS = 400          # Story最大字数
+ENVIRONMENT_SCORE_WEIGHT = 0.08  # 环境仅在同语义分桶内作有界次序调节
 
 # ── 关联权重规则 ──
 WEIGHT_INCREMENT = 0.1         # 共同调用每次提升

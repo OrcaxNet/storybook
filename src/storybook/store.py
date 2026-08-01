@@ -16,6 +16,7 @@ import sqlite_vec
 import numpy as np
 
 from . import config
+from . import context as context_module
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     problem_desc TEXT,
     code_snippets TEXT,
     conclusion TEXT,
+    device_id TEXT,
+    agent_installation_id TEXT,
+    workspace_id TEXT,
+    runtime_json TEXT NOT NULL DEFAULT '{}',
+    external_session_hash TEXT,
+    context_json TEXT NOT NULL DEFAULT '{}',
     status TEXT DEFAULT 'pending',
     created_at TEXT DEFAULT (datetime('now')),
     processed_at TEXT
@@ -50,11 +57,46 @@ CREATE TABLE IF NOT EXISTS stories (
     embedding BLOB,
     parent_id INTEGER,
     source_session_ids TEXT DEFAULT '[]',
+    applicability_json TEXT NOT NULL DEFAULT '{}',
+    environment_summary_json TEXT NOT NULL DEFAULT '[]',
     access_count INTEGER DEFAULT 0,
     version INTEGER DEFAULT 1,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (parent_id) REFERENCES stories(id)
+);
+
+-- ContextEnvelope identity dimensions. Sensitive local details stay in JSON
+-- hashes/aliases; absolute paths, hostnames and repository URLs are never keys.
+CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    os_family TEXT,
+    os_version TEXT,
+    arch TEXT,
+    display_name TEXT,
+    local_metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS agent_installations (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    tool_type TEXT NOT NULL,
+    tool_version TEXT,
+    integration_mode TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (device_id) REFERENCES devices(id)
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL,
+    repo_fingerprint TEXT,
+    label TEXT,
+    local_path_alias TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
 );
 
 -- 关联边表（带权重的关联网络）
@@ -79,6 +121,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_stories_parent ON stories(parent_id);
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
+CREATE INDEX IF NOT EXISTS idx_devices_profile ON devices(profile_id);
+CREATE INDEX IF NOT EXISTS idx_agent_installations_profile ON agent_installations(profile_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_profile ON workspaces(profile_id);
 
 -- 查询缓存只依赖可检索内容版本；访问计数与共同召回反馈不会推进该版本。
 CREATE TABLE IF NOT EXISTS query_state (
@@ -113,12 +158,13 @@ def get_db(
 
 
 def init_db():
-    """初始化数据库 schema，并补齐 v0.2 Profile/同步预留字段。"""
+    """初始化数据库 schema，并幂等补齐 Profile 与 ContextEnvelope 字段。"""
     config.ensure_profile()
     db = get_db()
     try:
         db.executescript(_SCHEMA)
         _ensure_identity_columns(db)
+        _ensure_context_columns(db)
         _ensure_fts_index(db)
         # 创建 sqlite-vec 虚拟表
         db.execute(f"""
@@ -252,6 +298,178 @@ def _ensure_identity_columns(db: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_context_columns(db: sqlite3.Connection) -> None:
+    """Backfill v0.1/v0.2 databases with canonical, explicit ContextEnvelope data."""
+
+    additions = {
+        "sessions": {
+            "device_id": "TEXT",
+            "agent_installation_id": "TEXT",
+            "workspace_id": "TEXT",
+            "runtime_json": "TEXT NOT NULL DEFAULT '{}'",
+            "external_session_hash": "TEXT",
+            "context_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+        "stories": {
+            "applicability_json": "TEXT NOT NULL DEFAULT '{}'",
+            "environment_summary_json": "TEXT NOT NULL DEFAULT '[]'",
+        },
+    }
+    for table, columns_to_add in additions.items():
+        columns = {
+            row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, declaration in columns_to_add.items():
+            if name not in columns:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    db.execute(
+        """CREATE INDEX IF NOT EXISTS idx_sessions_context ON sessions(
+               profile_id, device_id, agent_installation_id, workspace_id
+           )"""
+    )
+
+    sessions = db.execute(
+        """SELECT * FROM sessions
+           WHERE context_json IS NULL OR trim(context_json) IN ('', '{}')
+           ORDER BY id"""
+    ).fetchall()
+    for row in sessions:
+        try:
+            raw_context = json.loads(row["context_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            raw_context = {}
+        if raw_context:
+            envelope = context_module.normalize_envelope(
+                raw_context,
+                profile_id=row["profile_id"],
+                session_id=row["global_id"],
+                source=row["source"],
+                captured_at=row["created_at"],
+            )
+        else:
+            envelope = context_module.unknown_envelope(
+                profile_id=row["profile_id"],
+                session_id=row["global_id"],
+                source=row["source"],
+                captured_at=row["created_at"],
+            )
+        _upsert_context_dimensions(db, envelope)
+        db.execute(
+            """UPDATE sessions
+               SET device_id = ?, agent_installation_id = ?, workspace_id = ?,
+                   runtime_json = ?, external_session_hash = ?, context_json = ?
+               WHERE id = ?""",
+            (
+                envelope["device"]["id"],
+                envelope["tool"]["installation_id"],
+                envelope["workspace"]["id"],
+                json.dumps(envelope["runtime"], ensure_ascii=False, sort_keys=True),
+                envelope["session"]["external_session_hash"],
+                json.dumps(envelope, ensure_ascii=False, sort_keys=True),
+                row["id"],
+            ),
+        )
+
+    stories = db.execute(
+        """SELECT id, source_session_ids, applicability_json, environment_summary_json
+           FROM stories
+           WHERE applicability_json IS NULL OR trim(applicability_json) IN ('', '{}')
+              OR (trim(COALESCE(environment_summary_json, '')) IN ('', '[]')
+                  AND trim(COALESCE(source_session_ids, '')) NOT IN ('', '[]'))"""
+    ).fetchall()
+    for row in stories:
+        applicability = context_module.normalize_applicability(row["applicability_json"])
+        try:
+            source_ids = json.loads(row["source_session_ids"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            source_ids = []
+        environments = _environments_for_sessions(db, source_ids)
+        try:
+            existing = json.loads(row["environment_summary_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            existing = []
+        environments = context_module.merge_environments(existing, environments)
+        db.execute(
+            """UPDATE stories
+               SET applicability_json = ?, environment_summary_json = ?
+               WHERE id = ?""",
+            (
+                json.dumps(applicability, ensure_ascii=False, sort_keys=True),
+                json.dumps(environments, ensure_ascii=False, sort_keys=True),
+                row["id"],
+            ),
+        )
+
+
+def _upsert_context_dimensions(db: sqlite3.Connection, envelope: dict) -> None:
+    device = envelope["device"]
+    if device.get("id"):
+        db.execute(
+            """INSERT INTO devices (
+                   id, profile_id, os_family, os_version, arch, display_name
+               ) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   os_family = COALESCE(excluded.os_family, devices.os_family),
+                   os_version = COALESCE(excluded.os_version, devices.os_version),
+                   arch = COALESCE(excluded.arch, devices.arch),
+                   display_name = COALESCE(excluded.display_name, devices.display_name)""",
+            (
+                device["id"], envelope["profile_id"], device.get("os_family"),
+                device.get("os_version"), device.get("arch"), device.get("display_name"),
+            ),
+        )
+
+    tool = envelope["tool"]
+    if tool.get("installation_id") and device.get("id"):
+        db.execute(
+            """INSERT INTO agent_installations (
+                   id, profile_id, device_id, tool_type, tool_version, integration_mode
+               ) VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   tool_version = COALESCE(excluded.tool_version, agent_installations.tool_version)""",
+            (
+                tool["installation_id"], envelope["profile_id"], device["id"],
+                tool.get("type") or "other", tool.get("version"),
+                tool.get("integration_mode") or "manual",
+            ),
+        )
+
+    workspace = envelope["workspace"]
+    if workspace.get("id"):
+        db.execute(
+            """INSERT INTO workspaces (
+                   id, profile_id, repo_fingerprint, label, local_path_alias
+               ) VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   repo_fingerprint = COALESCE(excluded.repo_fingerprint, workspaces.repo_fingerprint),
+                   label = COALESCE(excluded.label, workspaces.label),
+                   local_path_alias = COALESCE(excluded.local_path_alias, workspaces.local_path_alias)""",
+            (
+                workspace["id"], envelope["profile_id"],
+                workspace.get("repo_fingerprint"), workspace.get("project_label"),
+                workspace.get("cwd_alias"),
+            ),
+        )
+
+
+def _environments_for_sessions(db: sqlite3.Connection, session_ids: list[int]) -> list[dict]:
+    ids = [int(value) for value in session_ids if isinstance(value, int) or str(value).isdigit()]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    rows = db.execute(
+        f"SELECT context_json FROM sessions WHERE id IN ({placeholders}) ORDER BY id",
+        ids,
+    ).fetchall()
+    environments = []
+    for row in rows:
+        try:
+            environments.append(json.loads(row["context_json"]))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return environments
+
+
 # ═══════════════════════════════════════════════
 #  健康检查辅助（供 doctor 使用）
 # ═══════════════════════════════════════════════
@@ -383,18 +601,35 @@ def repair_vector_consistency() -> dict:
 # ═══════════════════════════════════════════════
 
 def add_session(source: str, raw_content: str, problem_desc: str = "",
-                code_snippets: str = "[]", conclusion: str = "") -> int:
-    """插入一条会话日志，返回 session_id"""
+                code_snippets: str = "[]", conclusion: str = "",
+                context: dict | None = None) -> int:
+    """插入一条会话日志；每条新 Session 都持久化完整 ContextEnvelope。"""
     db = get_db()
     try:
+        global_id = _new_global_id()
+        envelope = context_module.normalize_envelope(
+            context,
+            profile_id=config.PROFILE_ID,
+            session_id=global_id,
+            source=source,
+        )
+        _upsert_context_dimensions(db, envelope)
         cur = db.execute(
             """INSERT INTO sessions (
                    global_id, profile_id, sync_state,
-                   source, raw_content, problem_desc, code_snippets, conclusion
-               ) VALUES (?, ?, 'local_only', ?, ?, ?, ?, ?)""",
+                   source, raw_content, problem_desc, code_snippets, conclusion,
+                   device_id, agent_installation_id, workspace_id, runtime_json,
+                   external_session_hash, context_json
+               ) VALUES (?, ?, 'local_only', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                _new_global_id(), config.PROFILE_ID,
+                global_id, config.PROFILE_ID,
                 source, raw_content, problem_desc, code_snippets, conclusion,
+                envelope["device"]["id"],
+                envelope["tool"]["installation_id"],
+                envelope["workspace"]["id"],
+                json.dumps(envelope["runtime"], ensure_ascii=False, sort_keys=True),
+                envelope["session"]["external_session_hash"],
+                json.dumps(envelope, ensure_ascii=False, sort_keys=True),
             )
         )
         db.commit()
@@ -436,6 +671,21 @@ def get_session(session_id: int) -> Optional[sqlite3.Row]:
         db.close()
 
 
+def get_session_context(session_id: int) -> Optional[dict]:
+    """Return a parsed canonical ContextEnvelope for one Session."""
+
+    row = get_session(session_id)
+    if row is None:
+        return None
+    return context_module.normalize_envelope(
+        row["context_json"],
+        profile_id=row["profile_id"],
+        session_id=row["global_id"],
+        source=row["source"],
+        captured_at=row["created_at"],
+    )
+
+
 def count_sessions() -> int:
     db = get_db()
     try:
@@ -450,19 +700,26 @@ def count_sessions() -> int:
 
 def add_story(title: str, content: str, keywords: list[str],
               embedding: list[float], parent_id: int = None,
-              source_session_ids: list[int] = None) -> int:
-    """新建 story，同时写入向量表，返回 story_id"""
+              source_session_ids: list[int] = None,
+              applicability: dict | None = None) -> int:
+    """新建 Story，同时写入向量、适用条件与所有来源环境。"""
     db = get_db()
     try:
         emb_blob = np.array(embedding, dtype=np.float32).tobytes()
+        source_session_ids = list(dict.fromkeys(source_session_ids or []))
+        environments = _environments_for_sessions(db, source_session_ids)
+        applicability = context_module.normalize_applicability(applicability)
         cur = db.execute(
             """INSERT INTO stories (
                    global_id, profile_id, sync_state,
-                   title, content, keywords, embedding, parent_id, source_session_ids
-               ) VALUES (?, ?, 'local_only', ?, ?, ?, ?, ?, ?)""",
+                   title, content, keywords, embedding, parent_id, source_session_ids,
+                   applicability_json, environment_summary_json
+               ) VALUES (?, ?, 'local_only', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (_new_global_id(), config.PROFILE_ID,
              title, content, json.dumps(keywords, ensure_ascii=False),
-             emb_blob, parent_id, json.dumps(source_session_ids or []))
+             emb_blob, parent_id, json.dumps(source_session_ids),
+             json.dumps(applicability, ensure_ascii=False, sort_keys=True),
+             json.dumps(environments, ensure_ascii=False, sort_keys=True))
         )
         story_id = cur.lastrowid
         # 写入向量虚拟表
@@ -479,7 +736,8 @@ def add_story(title: str, content: str, keywords: list[str],
 
 
 def update_story(story_id: int, title: str = None, content: str = None,
-                 keywords: list[str] = None, embedding: list[float] = None):
+                 keywords: list[str] = None, embedding: list[float] = None,
+                 applicability: dict | None = None):
     """更新 story（传 None 的字段不更新），同时更新向量表"""
     db = get_db()
     try:
@@ -498,6 +756,13 @@ def update_story(story_id: int, title: str = None, content: str = None,
             emb_blob = np.array(embedding, dtype=np.float32).tobytes()
             sets.append("embedding = ?")
             params.append(emb_blob)
+        if applicability is not None:
+            sets.append("applicability_json = ?")
+            params.append(json.dumps(
+                context_module.normalize_applicability(applicability),
+                ensure_ascii=False,
+                sort_keys=True,
+            ))
         sets.append("version = version + 1")
         sets.append("updated_at = datetime('now')")
         params.append(story_id)
@@ -563,12 +828,29 @@ def get_all_stories() -> list[dict]:
 
 
 def update_story_raw_sessions(story_id: int, session_ids: list[int]):
-    """更新 story 的 source_session_ids"""
+    """更新来源 Session，并合并环境集合而非覆盖最后一次来源。"""
     db = get_db()
     try:
+        session_ids = list(dict.fromkeys(session_ids))
+        row = db.execute(
+            "SELECT environment_summary_json FROM stories WHERE id = ?", (story_id,)
+        ).fetchone()
+        if row is None:
+            return
+        environments = context_module.merge_environments(
+            row["environment_summary_json"],
+            _environments_for_sessions(db, session_ids),
+        )
         db.execute(
-            "UPDATE stories SET source_session_ids = ?, updated_at = datetime('now') WHERE id = ?",
-            (json.dumps(session_ids), story_id)
+            """UPDATE stories
+               SET source_session_ids = ?, environment_summary_json = ?,
+                   updated_at = datetime('now')
+               WHERE id = ?""",
+            (
+                json.dumps(session_ids),
+                json.dumps(environments, ensure_ascii=False, sort_keys=True),
+                story_id,
+            )
         )
         db.commit()
     finally:
@@ -769,7 +1051,8 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
     try:
         emb_blob = np.array(query_embedding, dtype=np.float32).tobytes()
         rows = db.execute(
-            """SELECT v.story_id, v.distance, s.title, s.content, s.keywords
+            """SELECT v.story_id, v.distance, s.title, s.content, s.keywords,
+                      s.applicability_json, s.environment_summary_json
                FROM story_vectors v
                JOIN stories s ON s.id = v.story_id
                WHERE v.embedding MATCH ? AND k = ?
@@ -787,6 +1070,12 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
                 "title": r["title"],
                 "content": r["content"],
                 "keywords": json.loads(r["keywords"]),
+                "applicability": context_module.normalize_applicability(
+                    r["applicability_json"]
+                ),
+                "environments": context_module.merge_environments(
+                    r["environment_summary_json"], []
+                ),
                 "similarity": round(sim, 4),
                 "distance": r["distance"],
             })
@@ -800,7 +1089,9 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
     db = get_db()
     try:
         rows = db.execute(
-            "SELECT id, title, content, keywords, embedding FROM stories WHERE embedding IS NOT NULL"
+            """SELECT id, title, content, keywords, embedding,
+                      applicability_json, environment_summary_json
+               FROM stories WHERE embedding IS NOT NULL"""
         ).fetchall()
         if not rows:
             return []
@@ -822,6 +1113,12 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
                 "title": r["title"],
                 "content": r["content"],
                 "keywords": json.loads(r["keywords"]),
+                "applicability": context_module.normalize_applicability(
+                    r["applicability_json"]
+                ),
+                "environments": context_module.merge_environments(
+                    r["environment_summary_json"], []
+                ),
                 "similarity": round(sim, 4),
             })
         results.sort(key=lambda x: x["similarity"], reverse=True)
@@ -856,7 +1153,8 @@ def search_by_lexical(
         fts_query = " OR ".join(f'"{term}"' for term in terms)
         try:
             rows = db.execute(
-                """SELECT s.id, s.title, s.content, s.keywords
+                """SELECT s.id, s.title, s.content, s.keywords,
+                          s.applicability_json, s.environment_summary_json
                    FROM story_fts
                    JOIN stories s ON s.id = story_fts.rowid
                    WHERE story_fts MATCH ? AND s.embedding IS NOT NULL
@@ -880,7 +1178,8 @@ def search_by_lexical(
             )
             params.extend((term, term, term))
         rows = db.execute(
-            f"""SELECT s.id, s.title, s.content, s.keywords
+            f"""SELECT s.id, s.title, s.content, s.keywords,
+                       s.applicability_json, s.environment_summary_json
                 FROM stories s
                 WHERE s.embedding IS NOT NULL AND ({' OR '.join(clauses)})
                 LIMIT ?""",
@@ -912,6 +1211,12 @@ def search_by_lexical(
                 "title": row["title"],
                 "content": row["content"],
                 "keywords": json.loads(row["keywords"]),
+                "applicability": context_module.normalize_applicability(
+                    row["applicability_json"]
+                ),
+                "environments": context_module.merge_environments(
+                    row["environment_summary_json"], []
+                ),
                 "similarity": round(min(1.0, score / max_score), 4),
                 "lexical_score": round(score, 4),
             })
@@ -960,6 +1265,14 @@ def _row_to_story(row: sqlite3.Row) -> dict:
         d["keywords"] = json.loads(d["keywords"])
     if d.get("source_session_ids"):
         d["source_session_ids"] = json.loads(d["source_session_ids"])
+    else:
+        d["source_session_ids"] = []
+    d["applicability"] = context_module.normalize_applicability(
+        d.pop("applicability_json", None)
+    )
+    d["environments"] = context_module.merge_environments(
+        d.pop("environment_summary_json", None), []
+    )
     if d.get("embedding"):
         d["embedding"] = np.frombuffer(d["embedding"], dtype=np.float32).tolist()
     else:

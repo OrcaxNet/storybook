@@ -48,6 +48,7 @@ from . import (
 )
 from . import eval as eval_module
 from . import search as search_module
+from . import context as context_module
 from .profiles import ProfileError
 from .setup_manager import SetupError, SetupManager
 
@@ -459,6 +460,7 @@ def prime(cwd, first_prompt, top_k, token_budget, output_format):
         result = prime_module.prime_context(
             cwd=cwd, first_prompt=first_prompt,
             top_k=top_k, token_budget=token_budget,
+            tool_type="claude_code", integration_mode="hook",
         )
     except Exception as e:  # noqa: BLE001  -- 绝不向 hook 上下文抛错
         result = {
@@ -572,6 +574,7 @@ def import_data(path, claude, cursor, sample, n):
                     "problem_desc": s.get("title", msgs[0]["content"][:200] if msgs else ""),
                     "code_snippets": s.get("code_snippets", "[]"),
                     "conclusion": s.get("conclusion", ""),
+                    "context": s.get("context"),
                 })
             else:
                 normalized.append(s)
@@ -672,10 +675,38 @@ def dream(once, interval):
 @cli.command()
 @click.argument("query")
 @click.option("--top", "-t", default=3, help="返回Top N")
-def search(query, top):
+@click.option(
+    "--context",
+    "context_mode",
+    type=click.Choice(["auto", "none"]),
+    default="auto",
+    show_default=True,
+    help="自动采集当前环境用于软加权，或禁用环境上下文",
+)
+@click.option(
+    "--scope",
+    type=click.Choice(["profile", "strict"]),
+    default="profile",
+    show_default=True,
+    help="profile 默认软加权；strict 对环境冲突硬过滤",
+)
+@click.option("--cwd", type=click.Path(path_type=Path), default=None, hidden=True)
+def search(query, top, context_mode, scope, cwd):
     """🔍 搜索记忆"""
     store.init_db()
-    result = search_module.search(query, top_k=top)
+    current_context = None
+    if context_mode == "auto":
+        current_context = context_module.capture_context(
+            tool_type="other",
+            integration_mode="manual",
+            workspace_path=cwd or Path.cwd(),
+        )
+    result = search_module.search(
+        query,
+        top_k=top,
+        context=current_context,
+        scope=scope,
+    )
     output = search_module.format_search_result(result)
     click.echo(output)
 
@@ -782,6 +813,16 @@ def show(story_id):
     click.echo(f"   关键词: {', '.join(story.get('keywords', []))}")
     click.echo(f"   访问: {story.get('access_count', 0)} 次")
     click.echo(f"   来源会话: {story.get('source_session_ids', [])}")
+    applies, excludes = context_module.applicability_labels(
+        story.get("applicability")
+    )
+    click.echo(f"   适用于: {', '.join(applies) if applies else '未声明'}")
+    click.echo(f"   不适用于: {', '.join(excludes) if excludes else '未声明'}")
+    environments = story.get("environments", [])
+    if environments:
+        click.echo(f"   来源环境 ({len(environments)}):")
+        for envelope in environments:
+            click.echo(f"      - {context_module.environment_label(envelope)}")
     if story.get("parent_id"):
         click.echo(f"   父 Story: #{story['parent_id']}")
 

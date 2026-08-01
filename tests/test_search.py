@@ -418,3 +418,33 @@ class TestFormatResult:
         assert "k1" in out
         assert "关联B" in out
         assert "找到 1 条匹配记忆" in out
+
+    def test_format_shows_applicability_and_environment_warning(self):
+        result = {
+            "query": "q",
+            "keywords": [],
+            "top_matches": [{
+                "story_id": 1,
+                "title": "容器经验",
+                "content": "内容",
+                "keywords": [],
+                "similarity": 0.8,
+                "environment": {
+                    "tool": {"type": "cursor"},
+                    "workspace": {"project_label": "payments"},
+                    "runtime": {"kind": "devcontainer"},
+                    "device": {"os_family": "linux", "arch": "arm64"},
+                },
+                "applicability": {
+                    "applies_when": [{"runtime_kind": ["devcontainer"]}],
+                    "excludes_when": ["k8s_coredns"],
+                },
+                "warnings": ["architecture differs: current=x86_64, story=arm64"],
+                "related": [],
+            }],
+        }
+        out = search_module.format_search_result(result)
+        assert "来源环境" in out
+        assert "适用于" in out
+        assert "不适用于" in out
+        assert "当前环境差异" in out

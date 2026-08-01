@@ -249,7 +249,8 @@ storybook process [--session ID]     # 做梦周期：处理所有 pending 会�
 storybook process --watch [--interval N]  # 监听模式：轮询 ~/.claude/projects，有新会话自动采集+加工（长驻）
 storybook dream --once                # 单次完整做梦周期（采集+加工）后退出；launchd/cron 入口
 storybook dream [--interval N]        # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
-storybook search "<query>" [--top 3] # 向量检索 + 关联 Story 激活
+storybook search "<query>" [--top 3] [--context auto|none] [--scope profile|strict]
+                                    # 向量检索 + 环境软加权；strict 才硬过滤
 storybook status --performance       # 最近 100 次查询 p50/p95、cache/fallback 比例
 storybook benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质量基准
 storybook stats                      # 系统统计
@@ -260,6 +261,12 @@ storybook mcp                        # 启动 MCP server（stdio，供 Claude Co
 ```
 
 > 命令是 **`import-data`** 而非 `import`（click 把 `import_data` 函数自动连字符化）。无参数/无 flag 时默认走 `--claude`。`--claude` / `--sample` / `--cursor` / `<path>` 四种来源互斥。
+
+### ContextEnvelope 与环境感知召回
+
+每条新 Session 都保存 `tool/device/session/workspace/runtime/captured_at/provenance`；每个未知叶子字段使用 `null`（`runtime.kind` 使用枚举 `unknown`）并标记 `provenance=unknown`。Claude/Cursor adapter 采集 `detected/reported/inferred/user_confirmed` 来源，原始外部 session ID 使用 Profile 本地 HMAC，绝对路径、hostname、remote host 与 repo URL 只保留哈希或短别名。
+
+Story 合并多个 Session 时会保留全部来源环境，不由最后一次会话覆盖。搜索的语义相似度始终是主信号：默认 `scope=profile` 仅以 workspace/tool/runtime/OS 等环境信号做有界软加权，冲突结果仍可召回并带 `warnings`；只有调用方显式指定 `scope=strict` 才过滤环境冲突。`storybook show` 展示来源环境以及 `applies_when` / `excludes_when`。
 
 ### 快速体验（无真实会话）
 
@@ -368,7 +375,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `recall` | `query`（必填）, `top_k?`（默认 3） | 快路径召回，返回 `{query,count,matches,request_id,mode,result_state,degraded,degraded_reason,fallback_status,cache_hit,index_version,latency_ms}`。只有 `result_state=no_match` 表示正常检索无匹配；降级空结果不会伪装成“无记忆” |
+| `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`） | 快路径召回 + 环境感知关联激活；默认环境软加权，显式 `strict` 才过滤。match 返回环境分数、来源环境、适用条件、warnings 与 retrieval source；顶层返回 `{request_id,mode,result_state,degraded,degraded_reason,fallback_status,cache_hit,index_version,latency_ms}`，降级空结果不会伪装成“无记忆” |
 | `get_story` | `story_id`（必填） | 查看单条记忆详情（含关联记忆），剥离 1024 维 embedding |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
 | `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / Ollama 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
@@ -487,6 +494,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `SIM_THRESHOLD_UPDATE_ONLY` | 0.92 | ≥ 仅补充细节（不合并内容） |
 | `SIM_THRESHOLD_LOW` | 0.75 | ≥ 且 <high 触发弱关联新建 |
 | `SIM_THRESHOLD_SEARCH` | 0.50 | 检索最低相似度 |
+| `ENVIRONMENT_SCORE_WEIGHT` | 0.08 | 环境在同语义分桶内的有界次级权重；不反转语义主排序 |
 | `TOP_K_RETRIEVAL` / `TOP_K_SEARCH` | 5 / 3 | 做梦召回 / 用户搜索返回数 |
 | `STORY_MAX_CHARS` | 400 | Story 最大字数 |
 | `WEIGHT_INCREMENT` / `WEIGHT_MAX` | 0.1 / 1.0 | 共同召回提权 / 权重上限 |
@@ -504,6 +512,7 @@ storybook/
 ├── src/storybook/
 │   ├── cli.py          # CLI 命令入口
 │   ├── config.py       # 路径 / 模型 / 阈值常量
+│   ├── context.py      # ContextEnvelope 采集、隐私归一与环境适配评分
 │   ├── profiles.py     # 用户级 registry、平台目录、local/isolated Profile
 │   ├── collector.py    # 会话采集（Claude Code / Cursor / JSON / 模拟）
 │   ├── store.py        # SQLite + sqlite-vec 存储层

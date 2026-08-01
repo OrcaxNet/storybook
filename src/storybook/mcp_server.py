@@ -89,6 +89,12 @@ def _build_recall_result(result: dict) -> dict:
             "content": m["content"],
             "keywords": m["keywords"],
             "similarity": m["similarity"],
+            "score": m.get("score", m["similarity"]),
+            "environment_score": m.get("environment_score", 0.0),
+            "environment": m.get("environment"),
+            "environments": m.get("environments", []),
+            "applicability": m.get("applicability", {}),
+            "warnings": m.get("warnings", []),
             "retrieval_source": m.get("retrieval_source", "vector"),
             "related": _trim_related(m.get("related", [])),
         })
@@ -105,6 +111,8 @@ def _build_recall_result(result: dict) -> dict:
         "cache_hit": bool(result.get("cache_hit")),
         "index_version": result.get("index_version"),
         "latency_ms": result.get("latency_ms", {}),
+        "scope": result.get("scope", "profile"),
+        "strict_filtered": result.get("strict_filtered", 0),
     }
 
 
@@ -112,7 +120,12 @@ def _build_recall_result(result: dict) -> dict:
 #  工具核心逻辑（模块级，便于不依赖 mcp 直接单测）
 # ═══════════════════════════════════════════════
 
-def recall_memories(query: str, top_k: int = 3) -> dict:
+def recall_memories(
+    query: str,
+    top_k: int = 3,
+    context: dict | None = None,
+    scope: str = "profile",
+) -> dict:
     """召回与查询相关的记忆（向量检索 + 关联激活）。
 
     复用 ``search.search``；access_count 与共同召回边权反馈异步入队，
@@ -126,7 +139,12 @@ def recall_memories(query: str, top_k: int = 3) -> dict:
     if not query or not query.strip():
         raise ValueError("query 不能为空")
 
-    result = search_module.search(query, top_k=top_k)
+    result = search_module.search(
+        query,
+        top_k=top_k,
+        context=context,
+        scope=scope,
+    )
     return _build_recall_result(result)
 
 
@@ -150,6 +168,8 @@ def get_story_detail(story_id: int) -> dict:
         "version": story.get("version", 1),
         "parent_id": story.get("parent_id"),
         "source_session_ids": story.get("source_session_ids", []),
+        "environments": story.get("environments", []),
+        "applicability": story.get("applicability", {}),
         "created_at": story.get("created_at"),
         "updated_at": story.get("updated_at"),
         "related": _trim_related(related),
@@ -186,7 +206,13 @@ def prime_context_memories(cwd: str = "", first_prompt: str = "",
     语义见 ``prime.prime_context``：相关度不足 / 召回为空 / Ollama 不可用时
     ``injected=False``、``briefing=""``，不抛错（晨间简报须非侵入）。
     """
-    return prime_module.prime_context(cwd=cwd, first_prompt=first_prompt, top_k=top_k)
+    return prime_module.prime_context(
+        cwd=cwd,
+        first_prompt=first_prompt,
+        top_k=top_k,
+        tool_type="other",
+        integration_mode="mcp",
+    )
 
 
 # ═══════════════════════════════════════════════
@@ -203,7 +229,12 @@ def create_server():
     mcp = FastMCP("storybook")
 
     @mcp.tool()
-    def recall(query: str, top_k: int = 3) -> dict:
+    def recall(
+        query: str,
+        top_k: int = 3,
+        context: dict | None = None,
+        scope: str = "profile",
+    ) -> dict:
         """召回与当前任务/问题相关的记忆（向量检索 + 关联激活）。
 
         在开始一项新任务前调用，复用过往相似经历。返回 count 表示命中数；
@@ -214,8 +245,10 @@ def create_server():
         Args:
             query: 自然语言查询，描述当前任务或问题。
             top_k: 最多返回的匹配记忆数，默认 3。
+            context: 可选 ContextEnvelope；缺省时仅按 Profile 语义召回。
+            scope: profile（默认软加权）或 strict（环境冲突硬过滤）。
         """
-        return recall_memories(query, top_k=top_k)
+        return recall_memories(query, top_k=top_k, context=context, scope=scope)
 
     @mcp.tool()
     def get_story(story_id: int) -> dict:

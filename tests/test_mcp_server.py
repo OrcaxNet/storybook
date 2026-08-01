@@ -14,6 +14,7 @@ import json
 import pytest
 
 from storybook import store
+from storybook import context as context_module
 from storybook import mcp_server
 from ._helpers import basis, with_cos
 
@@ -119,6 +120,30 @@ class TestRecallMemories:
         out = mcp_server.recall_memories("q", top_k=3)
         assert out["count"] == 3
 
+    def test_optional_context_and_strict_scope_are_exposed(self, fake_embedder):
+        source_context = context_module.capture_context(
+            tool_type="cursor", integration_mode="log_import",
+            runtime_kind="devcontainer",
+        )
+        session_id = store.add_session("cursor", "raw", context=source_context)
+        story_id = store.add_story(
+            "dev only", "c", ["k"], basis(0), source_session_ids=[session_id]
+        )
+        fake_embedder.register("q", basis(0))
+        current = context_module.capture_context(
+            tool_type="codex", integration_mode="mcp", runtime_kind="local"
+        )
+
+        soft = mcp_server.recall_memories("q", context=current)
+        assert soft["matches"][0]["story_id"] == story_id
+        assert soft["matches"][0]["warnings"]
+
+        strict = mcp_server.recall_memories(
+            "q", context=current, scope="strict"
+        )
+        assert strict["matches"] == []
+        assert strict["strict_filtered"] == 1
+
     def test_embedding_failure_returns_degraded_state(self, fake_embedder):
         fake_embedder.register("q", None)   # 模拟向量生成失败（Ollama 不可用等）
         out = mcp_server.recall_memories("q")
@@ -152,6 +177,8 @@ class TestGetStoryDetail:
         assert out["related"] == []
         # 剥离 1024 维 embedding，避免臃肿
         assert "embedding" not in out
+        assert "environments" in out
+        assert "applicability" in out
 
     def test_includes_related_trimmed(self, fake_embedder):
         a = _seed("A", basis(0))
@@ -188,6 +215,22 @@ class TestGetStatsOverview:
 # ═══════════════════════════════════════════════
 
 class TestPrimeContextMemories:
+    def test_marks_unknown_tool_with_mcp_integration(self, monkeypatch):
+        captured = {}
+
+        def fake_prime_context(**kwargs):
+            captured.update(kwargs)
+            return {"injected": False, "briefing": ""}
+
+        monkeypatch.setattr(
+            mcp_server.prime_module, "prime_context", fake_prime_context
+        )
+
+        mcp_server.prime_context_memories(cwd="/x/proj", first_prompt="q")
+
+        assert captured["tool_type"] == "other"
+        assert captured["integration_mode"] == "mcp"
+
     def test_injects_on_match(self, fake_embedder):
         a = _seed("A", basis(0))
         fake_embedder.register("q", basis(0))
@@ -246,6 +289,8 @@ class TestServerWiring:
         props = tools["recall"].inputSchema["properties"]
         assert "query" in props
         assert "top_k" in props
+        assert "context" in props
+        assert "scope" in props
         # query 必填
         assert "query" in tools["recall"].inputSchema.get("required", [])
 

@@ -6,9 +6,11 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 from . import config
 from . import store
+from . import context as context_module
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,24 @@ def _extract_from_vscdb(vscdb_path: Path) -> list[dict]:
                     value = value.decode("utf-8", errors="ignore")
                 data = json.loads(value)
                 # 尝试解析会话结构
-                for conv in _parse_cursor_conversation(data, row["key"]):
+                workspace_path = _cursor_workspace_path(vscdb_path)
+                adapter_context = context_module.normalize_envelope({
+                    "tool": {
+                        "type": "cursor",
+                        "integration_mode": "log_import",
+                    },
+                    "workspace": (
+                        {"path": workspace_path} if workspace_path else {}
+                    ),
+                    "provenance": {
+                        "tool.type": "detected",
+                        "tool.integration_mode": "detected",
+                        "workspace.path": "detected",
+                    },
+                })
+                for conv in _parse_cursor_conversation(
+                    data, row["key"], adapter_context=adapter_context
+                ):
                     sessions.append(conv)
             except (json.JSONDecodeError, TypeError):
                 continue
@@ -75,7 +94,34 @@ def _extract_from_vscdb(vscdb_path: Path) -> list[dict]:
     return sessions
 
 
-def _parse_cursor_conversation(data: dict, source_key: str) -> list[dict]:
+def _cursor_workspace_path(vscdb_path: Path) -> str | None:
+    """Read real workspace evidence without treating the opaque cache key as a path."""
+
+    metadata_path = vscdb_path.with_name("workspace.json")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+
+    raw_uri = metadata.get("folder") or metadata.get("workspace")
+    if not isinstance(raw_uri, str):
+        return None
+    parsed = urlsplit(raw_uri)
+    if parsed.scheme.lower() != "file":
+        return None
+    if parsed.netloc and parsed.netloc.lower() != "localhost":
+        return None
+    path = unquote(parsed.path)
+    if not path or "\0" in path or not Path(path).is_absolute():
+        return None
+    return path
+
+
+def _parse_cursor_conversation(
+    data: dict, source_key: str, *, adapter_context: dict | None = None
+) -> list[dict]:
     """解析 Cursor 对话数据为标准格式"""
     sessions = []
 
@@ -90,6 +136,7 @@ def _parse_cursor_conversation(data: dict, source_key: str) -> list[dict]:
                     "problem_desc": content[:200] if content else "",
                     "code_snippets": "[]",
                     "conclusion": "",
+                    "context": adapter_context,
                 })
     elif isinstance(data, dict):
         # 可能是 {conversations: [...]} 或 {messages: [...]}
@@ -106,21 +153,31 @@ def _parse_cursor_conversation(data: dict, source_key: str) -> list[dict]:
                     "problem_desc": combined[:200],
                     "code_snippets": "[]",
                     "conclusion": "",
+                    "context": adapter_context,
                 })
 
     return sessions
 
 
 def import_sessions(sessions: list[dict]) -> int:
-    """批量导入会话到数据库，返回导入数量"""
+    """批量导入历史会话到数据库，返回导入数量。
+
+    ``None`` 在 ``store.add_session`` 的实时写入契约中表示探测当前机器。
+    历史记录缺少 context 则代表没有环境证据，必须传入显式空 envelope，
+    否则同一份导入文件会随导入机器不同而产生不同的 device/runtime。
+    """
     count = 0
     for s in sessions:
+        historical_context = s.get("context")
+        if historical_context is None:
+            historical_context = {}
         store.add_session(
             source=s.get("source", "manual"),
             raw_content=s.get("raw_content", ""),
             problem_desc=s.get("problem_desc", ""),
             code_snippets=s.get("code_snippets", "[]"),
             conclusion=s.get("conclusion", ""),
+            context=historical_context,
         )
         count += 1
     logger.info("导入了 %d 条会话", count)
@@ -131,7 +188,8 @@ def import_sessions(sessions: list[dict]) -> int:
 #  Claude Code 会话采集
 # ═══════════════════════════════════════════════
 
-CLAUDE_SOURCE_PREFIX = "claude_code:"   # source 字段编码为 claude_code:<sessionId>
+CLAUDE_SOURCE = "claude_code"
+CLAUDE_LEGACY_SOURCE_PREFIX = "claude_code:"
 _RAW_CONTENT_CAP = 6000                 # 与 llm.summarize_session 的截断对齐
 
 
@@ -148,13 +206,14 @@ def collect_claude_sessions(projects_path: Path = None) -> list[dict]:
         logger.warning("Claude Code 项目目录不存在: %s", projects_path)
         return sessions
 
-    existing = _existing_claude_session_ids()
+    existing = _existing_claude_session_keys()
     files = sorted(projects_path.glob("*/*.jsonl"))   # 仅直接子文件，跳过 subagents/
     logger.info("发现 %d 个 Claude 会话文件，已导入 %d 个", len(files), len(existing))
 
     for jsonl in files:
         session_id = jsonl.stem
-        if session_id in existing:
+        session_hash = context_module.external_session_hash(session_id)
+        if session_id in existing or session_hash in existing:
             continue
         try:
             parsed = _parse_claude_jsonl(jsonl, session_id)
@@ -167,15 +226,21 @@ def collect_claude_sessions(projects_path: Path = None) -> list[dict]:
     return sessions
 
 
-def _existing_claude_session_ids() -> set:
-    """查询已导入的 Claude 会话 ID（按 source 前缀去重）。"""
+def _existing_claude_session_keys() -> set:
+    """Return legacy raw IDs plus new local-HMAC IDs for incremental dedup."""
     db = store.get_db()
     try:
         rows = db.execute(
-            "SELECT source FROM sessions WHERE source LIKE ?",
-            (CLAUDE_SOURCE_PREFIX + "%",),
+            """SELECT source, external_session_hash FROM sessions
+               WHERE source = ? OR source LIKE ?""",
+            (CLAUDE_SOURCE, CLAUDE_LEGACY_SOURCE_PREFIX + "%"),
         ).fetchall()
-        return {r["source"][len(CLAUDE_SOURCE_PREFIX):] for r in rows}
+        keys = {r["external_session_hash"] for r in rows if r["external_session_hash"]}
+        keys.update(
+            r["source"][len(CLAUDE_LEGACY_SOURCE_PREFIX):]
+            for r in rows if r["source"].startswith(CLAUDE_LEGACY_SOURCE_PREFIX)
+        )
+        return keys
     finally:
         db.close()
 
@@ -189,6 +254,10 @@ def _parse_claude_jsonl(path: Path, session_id: str) -> Optional[dict]:
     title = None
     user_turns: list[str] = []
     assistant_texts: list[str] = []
+    cwd = None
+    tool_version = None
+    branch = None
+    started_at = None
 
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -199,6 +268,11 @@ def _parse_claude_jsonl(path: Path, session_id: str) -> Optional[dict]:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+
+            cwd = cwd or obj.get("cwd")
+            tool_version = tool_version or obj.get("version")
+            branch = branch or obj.get("gitBranch")
+            started_at = started_at or obj.get("timestamp")
 
             t = obj.get("type")
             if t in ("ai-title", "summary") and not title:
@@ -230,11 +304,32 @@ def _parse_claude_jsonl(path: Path, session_id: str) -> Optional[dict]:
     raw_content = _build_raw_content(user_turns, assistant_texts)
 
     return {
-        "source": CLAUDE_SOURCE_PREFIX + session_id,
+        "source": CLAUDE_SOURCE,
         "raw_content": raw_content,
         "problem_desc": problem_desc,
         "code_snippets": "[]",
         "conclusion": assistant_texts[-1][:300] if assistant_texts else "",
+        "context": context_module.normalize_envelope({
+            "tool": {
+                "type": "claude_code",
+                "version": tool_version,
+                "integration_mode": "log_import",
+            },
+            "session": {
+                "external_session_id": session_id,
+                "started_at": started_at,
+            },
+            "workspace": {"path": cwd, "branch": branch},
+            "provenance": {
+                "tool.type": "detected",
+                "tool.version": "reported",
+                "tool.integration_mode": "detected",
+                "session.external_session_id": "detected",
+                "session.started_at": "reported",
+                "workspace.path": "reported",
+                "workspace.branch": "reported",
+            },
+        }),
     }
 
 
@@ -438,6 +533,9 @@ def generate_sample_sessions(n: int = 100) -> list[dict]:
     ]
 
     sessions = []
+    sample_context = context_module.capture_context(
+        tool_type="claude_code", integration_mode="manual"
+    )
     for i in range(n):
         tmpl = templates[i % len(templates)]
         # 添加变化让每条不完全一样
@@ -454,6 +552,7 @@ def generate_sample_sessions(n: int = 100) -> list[dict]:
             "problem_desc": tmpl["problem"] + variation,
             "code_snippets": json.dumps([tmpl["code"]]),
             "conclusion": tmpl["conclusion"],
+            "context": sample_context,
         })
 
     return sessions

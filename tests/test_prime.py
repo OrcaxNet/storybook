@@ -6,11 +6,13 @@
 """
 from __future__ import annotations
 
+from click.testing import CliRunner
 import pytest
 
 from storybook import config
 from storybook import prime as prime_module
 from storybook import store
+from storybook.cli import cli
 from ._helpers import basis, with_cos
 
 
@@ -72,6 +74,46 @@ class TestBuildQuery:
 # ═══════════════════════════════════════════════
 #  prime_context 核心行为
 # ═══════════════════════════════════════════════
+
+class TestPrimeSources:
+    def test_core_uses_explicit_source(self):
+        out = prime_module.prime_context(
+            cwd="",
+            first_prompt="",
+            tool_type="claude_code",
+            integration_mode="hook",
+        )
+
+        assert out["context"]["tool"]["type"] == "claude_code"
+        assert out["context"]["tool"]["integration_mode"] == "hook"
+
+    def test_cli_prime_marks_claude_session_start_hook(self, monkeypatch):
+        captured = {}
+
+        def fake_prime_context(**kwargs):
+            captured.update(kwargs)
+            return {
+                "cwd": kwargs["cwd"],
+                "query": "",
+                "count": 0,
+                "injected": False,
+                "briefing": "",
+                "matches": [],
+                "truncated": False,
+                "note": None,
+            }
+
+        monkeypatch.setattr(prime_module, "prime_context", fake_prime_context)
+        monkeypatch.setattr(store, "init_db", lambda: None)
+
+        result = CliRunner().invoke(
+            cli, ["prime", "--cwd", "/work/repo", "--format", "json"]
+        )
+
+        assert result.exit_code == 0
+        assert captured["tool_type"] == "claude_code"
+        assert captured["integration_mode"] == "hook"
+
 
 class TestPrimeContextSilence:
     def test_empty_db_silent_no_inject(self, fake_embedder):

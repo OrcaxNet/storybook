@@ -11,6 +11,7 @@ from collections.abc import Callable
 from typing import TypeVar
 
 from . import config, embeddings, feedback, performance, query_cache, store
+from . import context as context_module
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,12 @@ T = TypeVar("T")
 
 
 def search(
-    query: str, top_k: int | None = None, *, record_diagnostics: bool = True
+    query: str,
+    top_k: int | None = None,
+    *,
+    context: dict | None = None,
+    scope: str = "profile",
+    record_diagnostics: bool = True,
 ) -> dict:
     """
     检索记忆：
@@ -29,6 +35,12 @@ def search(
     返回: {query, keywords, top_matches: [{story, similarity, related: [...]}]}
     """
     top_k = max(1, top_k or config.TOP_K_SEARCH)
+    if scope not in ("profile", "strict"):
+        raise ValueError("scope 必须是 profile 或 strict")
+    current_context = (
+        context_module.normalize_envelope(context, profile_id=config.PROFILE_ID)
+        if context is not None else None
+    )
     normalized_query = query.strip()
     request_id = uuid.uuid4().hex
     latency = performance.empty_latency()
@@ -47,6 +59,8 @@ def search(
             "cache_hit": mode == "cache",
             "model_state": model_state,
             "latency_ms": latency,
+            "scope": scope,
+            "context": current_context,
         })
 
         serialize_started = performance.now()
@@ -73,7 +87,14 @@ def search(
     # ── Step 0: index_version 隔离的结果缓存 ──
     cache_started = performance.now()
     identity = query_cache.index_identity(index_version)
-    cached = query_cache.get_result(identity, normalized_query, top_k)
+    # Environment-aware results depend on the supplied envelope and scope. Keep
+    # the existing fast result cache for context-free profile searches only;
+    # the query-vector cache remains safe and shared for every variant.
+    result_cache_enabled = current_context is None and scope == "profile"
+    cached = (
+        query_cache.get_result(identity, normalized_query, top_k)
+        if result_cache_enabled else None
+    )
     latency["cache"] = performance.elapsed_ms(cache_started)
     if cached is not None:
         cached["query"] = query
@@ -124,12 +145,16 @@ def search(
             finish=finish,
             degraded_reason=embed_failure_reason or "embedding_unavailable",
             query_vector_cache_hit=query_vector_cache_hit,
+            current_context=current_context,
+            scope=scope,
         )
 
     # ── Step 2: 向量检索 ──
     vector_started = performance.now()
     try:
-        matches = store.search_by_vector(query_vec, top_k=top_k * 2)  # 多取一些再过滤
+        matches = store.search_by_vector(
+            query_vec, top_k=max(top_k * 4, top_k)
+        )
     except Exception:  # noqa: BLE001 -- vec0 损坏/缺失时必须快速降级
         latency["vector"] = performance.elapsed_ms(vector_started)
         return _lexical_fallback(
@@ -140,13 +165,17 @@ def search(
             finish=finish,
             degraded_reason="vector_index_unavailable",
             query_vector_cache_hit=query_vector_cache_hit,
+            current_context=current_context,
+            scope=scope,
         )
     latency["vector"] = performance.elapsed_ms(vector_started)
 
     # 过滤低于阈值的
     rerank_started = performance.now()
     matches = [m for m in matches if m["similarity"] >= config.SIM_THRESHOLD_SEARCH]
-    matches = matches[:top_k]
+    matches, strict_filtered = _environment_rerank(
+        matches, current_context=current_context, scope=scope, top_k=top_k
+    )
     latency["rerank"] = performance.elapsed_ms(rerank_started)
 
     if not matches:
@@ -157,10 +186,12 @@ def search(
             "result_state": "no_match",
             "query_vector_cache_hit": query_vector_cache_hit,
             "feedback_queued": True,
+            "strict_filtered": strict_filtered,
         }
-        query_cache.set_result(
-            identity, normalized_query, top_k, _cacheable_result(result)
-        )
+        if result_cache_enabled:
+            query_cache.set_result(
+                identity, normalized_query, top_k, _cacheable_result(result)
+            )
         return finish(result, mode="vector")
 
     # ── Step 3: 关联激活 ──
@@ -179,10 +210,12 @@ def search(
         "result_state": "results",
         "query_vector_cache_hit": query_vector_cache_hit,
         "feedback_queued": feedback_queued,
+        "strict_filtered": strict_filtered,
     }
-    query_cache.set_result(
-        identity, normalized_query, top_k, _cacheable_result(result)
-    )
+    if result_cache_enabled:
+        query_cache.set_result(
+            identity, normalized_query, top_k, _cacheable_result(result)
+        )
 
     return finish(result, mode="vector")
 
@@ -196,15 +229,19 @@ def _lexical_fallback(
     finish: Callable[..., dict],
     degraded_reason: str,
     query_vector_cache_hit: bool,
+    current_context: dict | None,
+    scope: str,
 ) -> dict:
     fallback_started = performance.now()
     call_status, fallback_output = _call_with_deadline(
-        lambda: _run_lexical_fallback(normalized_query, top_k),
+        lambda: _run_lexical_fallback(
+            normalized_query, top_k, current_context=current_context, scope=scope
+        ),
         config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
 
     if call_status == "ok":
-        matches, top_matches, fallback_ms, graph_ms = fallback_output
+        matches, top_matches, fallback_ms, graph_ms, strict_filtered = fallback_output
         latency["fallback"] = fallback_ms
         latency["graph"] = graph_ms
         feedback_queued = feedback.enqueue_recall_feedback(
@@ -218,12 +255,14 @@ def _lexical_fallback(
         feedback_queued = True
         result_state = "degraded_unavailable"
         fallback_status = call_status
+        strict_filtered = 0
 
     return finish(
         {
             "query": query,
             "keywords": [],
             "top_matches": top_matches,
+            "strict_filtered": strict_filtered,
             "result_state": result_state,
             "fallback_status": fallback_status,
             "query_vector_cache_hit": query_vector_cache_hit,
@@ -236,21 +275,97 @@ def _lexical_fallback(
 
 
 def _run_lexical_fallback(
-    normalized_query: str, top_k: int
-) -> tuple[list[dict], list[dict], float, float]:
+    normalized_query: str,
+    top_k: int,
+    *,
+    current_context: dict | None,
+    scope: str,
+) -> tuple[list[dict], list[dict], float, float, int]:
     """在同一个 500ms deadline 内完成词法检索与关联读取。"""
 
     fallback_started = time.perf_counter()
     matches = store.search_by_lexical(
         normalized_query,
-        top_k=top_k,
+        top_k=max(top_k * 4, top_k),
         timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
     fallback_ms = round((time.perf_counter() - fallback_started) * 1000, 3)
+    matches, strict_filtered = _environment_rerank(
+        matches, current_context=current_context, scope=scope, top_k=top_k
+    )
     graph_started = time.perf_counter()
     top_matches = _attach_related(matches, retrieval_source="lexical")
     graph_ms = round((time.perf_counter() - graph_started) * 1000, 3)
-    return matches, top_matches, fallback_ms, graph_ms
+    return matches, top_matches, fallback_ms, graph_ms, strict_filtered
+
+
+def _environment_rerank(
+    matches: list[dict],
+    *,
+    current_context: dict | None,
+    scope: str,
+    top_k: int,
+) -> tuple[list[dict], int]:
+    """Apply the same semantic-first environment policy to every search lane.
+
+    Similarities emitted by the vector and lexical stores are rounded to four
+    decimals.  Environment fit therefore only breaks ties inside one semantic
+    bucket; it must never make a less relevant Story outrank a more relevant
+    one.  The public ``score`` mirrors that ordering without adding a positive
+    bonus that can saturate at 1.0 and erase the tie-break signal.
+    """
+
+    reranked = []
+    strict_filtered = 0
+    for match in matches:
+        fit = context_module.evaluate_story_context(
+            current_context,
+            match.get("environments"),
+            match.get("applicability"),
+        )
+        if scope == "strict" and fit["strict_excluded"]:
+            strict_filtered += 1
+            continue
+        match.update(fit)
+        match["score"] = _environment_rank_score(
+            match["similarity"],
+            fit["environment_score"],
+            has_context=current_context is not None,
+        )
+        reranked.append(match)
+    return (
+        sorted(
+            reranked,
+            key=lambda item: (item["similarity"], item["environment_score"]),
+            reverse=True,
+        )[:top_k],
+        strict_filtered,
+    )
+
+
+def _environment_rank_score(
+    similarity: float,
+    environment_score: float,
+    *,
+    has_context: bool,
+) -> float:
+    """Encode the environment tie-break below one similarity score quantum."""
+
+    similarity = max(0.0, min(1.0, float(similarity)))
+    if not has_context:
+        return round(similarity, 4)
+
+    environment_score = max(-1.0, min(1.0, float(environment_score)))
+    normalized_fit = (environment_score + 1.0) / 2.0
+    similarity_quantum = 10 ** -4
+    tie_break_span = (
+        similarity_quantum
+        * max(0.0, min(1.0, config.ENVIRONMENT_SCORE_WEIGHT))
+    )
+    # Penalising relative to the best possible fit keeps the score in [0, 1]
+    # and preserves a visible difference even when similarity is exactly 1.0.
+    penalty = (1.0 - normalized_fit) * tie_break_span
+    return round(max(0.0, similarity - penalty), 8)
 
 
 def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]:
@@ -266,6 +381,12 @@ def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]
             "content": match["content"],
             "keywords": match["keywords"],
             "similarity": match["similarity"],
+            "score": match.get("score", match["similarity"]),
+            "environment_score": match.get("environment_score", 0.0),
+            "environment": match.get("matched_environment"),
+            "environments": match.get("environments", []),
+            "applicability": match.get("applicability", {}),
+            "warnings": match.get("warnings", []),
             "retrieval_source": retrieval_source,
             "related": [
                 {
@@ -349,6 +470,17 @@ def format_search_result(result: dict) -> str:
         lines.append(f"   │ 📌 {m['title']}")
         lines.append(f"   │ {m['content'][:200]}")
         lines.append(f"   │ 关键词: {', '.join(m['keywords'])}")
+        if m.get("environment"):
+            lines.append(
+                f"   │ 来源环境: {context_module.environment_label(m['environment'])}"
+            )
+        applies, excludes = context_module.applicability_labels(m.get("applicability"))
+        if applies:
+            lines.append(f"   │ 适用于: {'; '.join(applies)}")
+        if excludes:
+            lines.append(f"   │ 不适用于: {'; '.join(excludes)}")
+        for warning in m.get("warnings", []):
+            lines.append(f"   │ ⚠ 当前环境差异: {warning}")
 
         if m.get("related"):
             lines.append("   │")

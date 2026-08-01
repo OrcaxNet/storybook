@@ -46,7 +46,7 @@ The pytest suite lives in `tests/` and mocks Ollama by default. `test_logs/*.jso
 
 ## Architecture
 
-Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `storybook doctor` (env + vector double-write consistency self-check, reads via `store`). `setup_manager.py` orchestrates one-click setup/uninstall; `setup_adapters/` owns plugin-registered, node-scoped Claude Code/Cursor/Codex config merges and rollback.
+Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `context.py` owns ContextEnvelope capture, privacy normalization and environment-fit scoring; `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `storybook doctor` (env + vector double-write consistency self-check, reads via `store`). `setup_manager.py` orchestrates one-click setup/uninstall; `setup_adapters/` owns plugin-registered, node-scoped Claude Code/Cursor/Codex config merges and rollback.
 
 ### Storage layer (`store.py`) — SQLite + sqlite-vec
 Each random-UUID user Profile owns `profiles/<profile_id>/db/memory.db` under the platform data directory. `profiles.py` is the sole registry/path resolver used by CLI, collectors, hooks and MCP; repository paths are not memory boundaries. Three tables (`sessions`, `stories`, `edges`) plus the **`story_vectors` vec0 virtual table** carry path-independent `global_id`, `profile_id`, and `sync_state=local_only`. Each `get_db()` call opens a fresh connection (WAL mode, foreign keys on) and loads the sqlite-vec extension.
@@ -75,6 +75,13 @@ Every query returns and locally records a privacy-safe latency breakdown:
 metadata-only schema (never raw query,
 Story content, absolute paths, hostnames, or repository URLs). `storybook benchmark`
 uses an isolated fixed-seed dataset and reports performance together with recall/MRR.
+
+When a caller supplies a ContextEnvelope, semantic similarity remains the primary
+signal and environment fit contributes a bounded secondary score
+(`ENVIRONMENT_SCORE_WEIGHT`). Default `scope="profile"` keeps cross-environment
+results and adds explainable warnings; only explicit `scope="strict"` filters
+environment conflicts. Story environment history is a collection derived from all
+source Sessions, never a last-write-wins field.
 
 ### Edge graph
 `edges` table, `UNIQUE(source_id, target_id)`. Types: `semantic`, `parent_child` (1.0, fixed), `sibling` (0.5). Edges are **undirected**: `add_or_update_edge`/`increment_edge_weight` normalize endpoint order to `(min_id, max_id)` via `_edge_pair`, so call direction doesn't matter and `(A,B)`/`(B,A)` can't create duplicate rows. `add_or_update_edge` takes `max(existing, new)`; `increment_edge_weight` adds a delta capped at `WEIGHT_MAX` (1.0). Queries (`get_related_stories`) match either endpoint.
