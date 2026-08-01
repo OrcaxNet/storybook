@@ -76,6 +76,52 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _setup_state(adapters) -> dict:
+    return {
+        "schema_version": 1,
+        "installed_at": "2026-08-01T00:00:00+00:00",
+        "updated_at": "2026-08-01T00:00:00+00:00",
+        "profile_id": "profile-test",
+        "launcher": {"command": "/opt/storybook/bin/storybook", "args": []},
+        "adapters": adapters,
+    }
+
+
+def _json_adapter_state(name: str) -> dict:
+    state = {
+        "adapter": name,
+        "changed": True,
+        "files": [],
+        "previous": {"present": False, "value": None},
+        "managed": {
+            "command": "/opt/storybook/bin/storybook",
+            "args": ["mcp"],
+            "env": {},
+        },
+    }
+    if name == "claude":
+        state.update(
+            {
+                "managed_hook": {"matcher": "startup", "hooks": []},
+                "hook_added": True,
+            }
+        )
+    return state
+
+
+def _tree_snapshot(root: Path) -> list[tuple[str, str, bytes | None]]:
+    if not root.exists():
+        return []
+    return [
+        (
+            str(path.relative_to(root)),
+            "dir" if path.is_dir() else "file",
+            None if path.is_dir() else path.read_bytes(),
+        )
+        for path in sorted(root.rglob("*"), key=str)
+    ]
+
+
 def test_dry_run_fresh_home_performs_zero_writes(tmp_path):
     storybook_home = tmp_path / "never-created"
     user_home = tmp_path / "user-home"
@@ -676,6 +722,101 @@ def test_invalid_profile_registry_returns_json_error_without_writes(tmp_path):
         str(path.relative_to(storybook_home)) for path in storybook_home.rglob("*")
     )
     assert after_tree == before_tree
+    assert not user_home.exists()
+
+
+@pytest.mark.parametrize(
+    ("adapters", "case"),
+    [
+        (1, "adapters-number"),
+        ("invalid", "adapters-string"),
+        ([], "adapters-list"),
+        ({"cursor": []}, "adapter-record-list"),
+        (
+            {
+                "cursor": {
+                    **_json_adapter_state("cursor"),
+                    "previous": [],
+                }
+            },
+            "json-previous-list",
+        ),
+        (
+            {
+                "claude": {
+                    **_json_adapter_state("claude"),
+                    "hook_added": "yes",
+                }
+            },
+            "claude-hook-added-string",
+        ),
+        (
+            {
+                "codex": {
+                    "adapter": "codex",
+                    "changed": True,
+                    "files": [],
+                    "previous_blocks": "",
+                    "managed_block": 1,
+                }
+            },
+            "codex-managed-block-number",
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["setup", "--yes", "--json", "--skip-models", "--agent", "cursor"],
+        ["uninstall", "--yes", "--json"],
+    ],
+    ids=["setup", "uninstall"],
+)
+def test_invalid_setup_state_returns_json_error_without_writes(
+    tmp_path, adapters, case, command
+):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    state_path = storybook_home / "state" / "setup-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(_setup_state(adapters), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    fixed_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(state_path, ns=(fixed_mtime_ns, fixed_mtime_ns))
+    before = _tree_snapshot(storybook_home)
+    env = os.environ.copy()
+    env.update(
+        {
+            "STORYBOOK_HOME": str(storybook_home),
+            "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "storybook.cli", *command],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1, case
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "SB_SETUP_STATE_INVALID"
+    assert payload["error"]["message"]
+    assert payload["error"]["hint"]
+    assert "Traceback" not in completed.stderr
+    assert "TypeError" not in completed.stderr
+    assert "AttributeError" not in completed.stderr
+    assert _tree_snapshot(storybook_home) == before
+    assert state_path.stat().st_mtime_ns == fixed_mtime_ns
     assert not user_home.exists()
 
 

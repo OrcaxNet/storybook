@@ -293,11 +293,115 @@ class SetupManager:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise SetupError(
-                "SB_SETUP_STATE_INVALID", f"无法读取 {self.state_path}: {exc}"
+                "SB_SETUP_STATE_INVALID",
+                f"无法读取 {self.state_path}: {exc}",
+                hint="从 setup-backups 恢复 setup-state.json 后重试；不要覆盖损坏的 state",
             ) from exc
-        if not isinstance(state, dict) or state.get("schema_version") != STATE_SCHEMA_VERSION:
-            raise SetupError("SB_SETUP_STATE_INVALID", "setup state schema 无效")
+        self._validate_state(state)
         return state
+
+    def _invalid_state(self, detail: str) -> SetupError:
+        return SetupError(
+            "SB_SETUP_STATE_INVALID",
+            f"{self.state_path} 的 setup state 无效: {detail}",
+            hint="从 setup-backups 恢复 setup-state.json 后重试；不要覆盖损坏的 state",
+        )
+
+    def _validate_state(self, state: Any) -> None:
+        if not isinstance(state, dict):
+            raise self._invalid_state("根节点必须是 object")
+        if type(state.get("schema_version")) is not int or state.get(
+            "schema_version"
+        ) != STATE_SCHEMA_VERSION:
+            raise self._invalid_state(
+                f"schema_version 必须是整数 {STATE_SCHEMA_VERSION}"
+            )
+        for field in ("installed_at", "updated_at", "profile_id"):
+            if not isinstance(state.get(field), str) or not state[field]:
+                raise self._invalid_state(f"{field} 必须是非空 string")
+
+        launcher = state.get("launcher")
+        if not isinstance(launcher, dict):
+            raise self._invalid_state("launcher 必须是 object")
+        if not isinstance(launcher.get("command"), str) or not launcher["command"]:
+            raise self._invalid_state("launcher.command 必须是非空 string")
+        args = launcher.get("args")
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise self._invalid_state("launcher.args 必须是 string array")
+
+        adapter_states = state.get("adapters")
+        if not isinstance(adapter_states, dict):
+            raise self._invalid_state("adapters 必须是 object")
+        known = {adapter.name for adapter in self.adapters}
+        for name, adapter_state in adapter_states.items():
+            if name not in known:
+                raise self._invalid_state(f"adapters.{name} 是未知 adapter")
+            self._validate_adapter_state(name, adapter_state)
+
+    def _validate_adapter_state(self, name: str, state: Any) -> None:
+        field = f"adapters.{name}"
+        if not isinstance(state, dict):
+            raise self._invalid_state(f"{field} 必须是 object")
+        if state.get("adapter") != name:
+            raise self._invalid_state(f"{field}.adapter 必须是 {name!r}")
+        if type(state.get("changed")) is not bool:
+            raise self._invalid_state(f"{field}.changed 必须是 boolean")
+        files = state.get("files")
+        if not isinstance(files, list):
+            raise self._invalid_state(f"{field}.files 必须是 array")
+        for index, record in enumerate(files):
+            self._validate_backup_record(f"{field}.files[{index}]", record)
+
+        if name in {"claude", "cursor"}:
+            self._validate_json_adapter_state(field, state)
+        elif name == "codex":
+            if not isinstance(state.get("previous_blocks"), str):
+                raise self._invalid_state(f"{field}.previous_blocks 必须是 string")
+            if not isinstance(state.get("managed_block"), str):
+                raise self._invalid_state(f"{field}.managed_block 必须是 string")
+
+        if name == "claude":
+            if not isinstance(state.get("managed_hook"), dict):
+                raise self._invalid_state(f"{field}.managed_hook 必须是 object")
+            if type(state.get("hook_added")) is not bool:
+                raise self._invalid_state(f"{field}.hook_added 必须是 boolean")
+
+    def _validate_json_adapter_state(
+        self, field: str, state: Mapping[str, Any]
+    ) -> None:
+        previous = state.get("previous")
+        if not isinstance(previous, dict):
+            raise self._invalid_state(f"{field}.previous 必须是 object")
+        if type(previous.get("present")) is not bool:
+            raise self._invalid_state(f"{field}.previous.present 必须是 boolean")
+        managed = state.get("managed")
+        if not isinstance(managed, dict):
+            raise self._invalid_state(f"{field}.managed 必须是 object")
+        if not isinstance(managed.get("command"), str) or not managed["command"]:
+            raise self._invalid_state(f"{field}.managed.command 必须是非空 string")
+        args = managed.get("args")
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise self._invalid_state(f"{field}.managed.args 必须是 string array")
+        environ = managed.get("env")
+        if not isinstance(environ, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environ.items()
+        ):
+            raise self._invalid_state(f"{field}.managed.env 必须是 string object")
+
+    def _validate_backup_record(self, field: str, record: Any) -> None:
+        if not isinstance(record, dict):
+            raise self._invalid_state(f"{field} 必须是 object")
+        if not isinstance(record.get("target"), str) or not record["target"]:
+            raise self._invalid_state(f"{field}.target 必须是非空 string")
+        if type(record.get("existed")) is not bool:
+            raise self._invalid_state(f"{field}.existed 必须是 boolean")
+        for name in ("before_sha256", "backup"):
+            value = record.get(name)
+            if value is not None and not isinstance(value, str):
+                raise self._invalid_state(f"{field}.{name} 必须是 string 或 null")
+        if not isinstance(record.get("after_sha256"), str):
+            raise self._invalid_state(f"{field}.after_sha256 必须是 string")
 
     def _write_state(self, state: Mapping[str, Any]) -> None:
         atomic_write(
@@ -460,6 +564,8 @@ class SetupManager:
         selected = {
             item["adapter"] for item in plan.adapters if item["selected"]
         }
+        # 受管 state 决定升级与卸载恢复行为，必须在任何 Profile/DB 写入前校验。
+        existing_state = self._load_state() or {}
         try:
             config.refresh_profile(create=True)
             store.init_db()
@@ -470,7 +576,6 @@ class SetupManager:
                 hint="检查目录权限与 sqlite-vec 安装后重试",
             ) from exc
 
-        existing_state = self._load_state() or {}
         adapter_states = dict(existing_state.get("adapters", {}))
         backup_dir = self.roots.state / "setup-backups" / (
             datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
