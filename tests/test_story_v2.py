@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 
 import numpy as np
 import pytest
@@ -173,6 +174,94 @@ def test_embedding_backfill_failure_resumes_and_switches_atomically(monkeypatch)
     assert state["active_version"] == "v2-test"
 
 
+@pytest.mark.parametrize("extra_updates", [1, 3])
+def test_embedding_activation_uses_each_story_pre_switch_version(
+    monkeypatch, extra_updates
+):
+    first = store.add_story("first", "c1", [], basis(0))
+    second = store.add_story("second", "c2", [], basis(1))
+    for version in range(2, extra_updates + 2):
+        store.update_story(second, title=f"second-v{version}")
+
+    monkeypatch.setattr(embeddings, "embed", lambda *args, **kwargs: basis(3))
+    result = embeddings.backfill(
+        model="version-aware-model",
+        version="version-aware-v1",
+        batch_size=10,
+    )
+
+    assert result["activation"]["activated"] == 2
+    expected = {
+        first: (1, 2),
+        second: (1 + extra_updates, 2 + extra_updates),
+    }
+    for story_id, (base_version, version) in expected.items():
+        event = store.get_memory_events(story_id)[-1]
+        assert event["operation"] == "update"
+        assert event["payload"]["revision_type"] == "embedding_switch"
+        assert event["base_version"] == base_version
+        assert event["version"] == version
+        assert store.get_story(story_id)["version"] == version
+        assert store.replay_memory_events(
+            store.get_memory_events(story_id)
+        )["conflicts"] == []
+
+
+def test_embedding_activation_event_failure_rolls_back_serving_state(
+    monkeypatch,
+):
+    first = store.add_story("first", "c1", [], basis(0))
+    second = store.add_story("second", "c2", [], basis(1))
+    story_before = {
+        story_id: store.get_story(story_id) for story_id in (first, second)
+    }
+    vectors_before = {
+        story_id: vector_in_index(story_id) for story_id in (first, second)
+    }
+    revisions_before = {
+        story_id: store.get_story_revisions(story_id)
+        for story_id in (first, second)
+    }
+    events_before = {
+        story_id: store.get_memory_events(story_id)
+        for story_id in (first, second)
+    }
+    active_before = store.get_embedding_index_state()
+
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute(
+            """CREATE TRIGGER reject_embedding_switch_event
+               BEFORE INSERT ON memory_events
+               WHEN new.operation = 'update' BEGIN
+                   SELECT RAISE(ABORT, 'embedding event rejected');
+               END"""
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(embeddings, "embed", lambda *args, **kwargs: basis(4))
+    with pytest.raises(sqlite3.DatabaseError, match="embedding event rejected"):
+        embeddings.backfill(
+            model="rollback-model",
+            version="rollback-v1",
+            batch_size=10,
+        )
+
+    active_after = store.get_embedding_index_state()
+    assert active_after["active_model"] == active_before["active_model"]
+    assert active_after["active_version"] == active_before["active_version"]
+    assert active_after["active_representation"] == active_before[
+        "active_representation"
+    ]
+    for story_id in (first, second):
+        assert vector_in_index(story_id) == vectors_before[story_id]
+        assert store.get_story(story_id) == story_before[story_id]
+        assert store.get_story_revisions(story_id) == revisions_before[story_id]
+        assert store.get_memory_events(story_id) == events_before[story_id]
+
+
 def test_story_metadata_hash_is_stable_and_auditable():
     payload = story_v2.normalize_story_payload(_payload("标题", "marker"))
     story_id = store.add_story(
@@ -283,6 +372,13 @@ def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch
     store.init_db()
 
     migrated = store.get_story(1)
+    migration_events = store.get_memory_events(1)
+    assert len(migration_events) == 1
+    assert migration_events[0]["operation"] == "create"
+    assert migration_events[0]["base_version"] == 0
+    assert migration_events[0]["version"] == migrated["version"]
+    assert uuid.UUID(migration_events[0]["event_id"]).version == 7
+    assert uuid.UUID(migrated["global_id"]).version == 7
     initial_state = store.get_embedding_index_state()
     assert migrated["embedding_status"] == "stale"
     assert migrated["embedding_version"] is None
@@ -301,3 +397,6 @@ def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch
     assert switched["embedding_status"] == "active"
     assert switched["embedding_version"] == config.EMBED_VERSION
     assert switched["embedding_content_hash"] == story_v2.content_hash(switched)
+    assert [
+        event["operation"] for event in store.get_memory_events(1)
+    ] == ["create", "update"]
