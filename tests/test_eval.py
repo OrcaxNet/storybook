@@ -145,6 +145,27 @@ class TestRetrievalEval:
         assert "达标" in text
 
 
+class TestEmbeddingAblation:
+    def test_reports_all_modes_groups_latency_and_selection_gate(self, fake_embedder):
+        result = eval_module.run_embedding_ablation()
+        assert set(result["modes"]) == {
+            "legacy", "default", "full", "multi_vector"
+        }
+        assert result["selection_gate"] == "recall@3 >= baseline - 0.02"
+        for mode, row in result["modes"].items():
+            assert set(row["groups"]) == {
+                "exact", "synonym", "cross_tool", "cross_lang"
+            }
+            assert row["query_count"] == 96
+            assert row["latency_ms"]["query_p95"] >= 0
+        assert result["modes"]["multi_vector"]["index_vectors_per_story"] == 3
+
+        report = eval_module.EvalReport(ablation=result)
+        text = eval_module.format_report(report)
+        assert "embedding 表示消融" in text
+        assert "cross_tool" in text
+
+
 # ═══════════════════════════════════════════════
 #  加工分支评测
 # ═══════════════════════════════════════════════

@@ -80,6 +80,8 @@
 
 ## 三、数据模型设计
 
+> Story v2（FLO-89）更新：以下 schema 示例保留核心列用于阅读；运行时 `_SCHEMA` 还包含 Profile/ContextEnvelope 字段。Story 的持久边界不再是 400 字，完整 detail/source 不截断；abstract 是独立预算字段。
+
 ### 3.1 SQLite Schema
 
 ```sql
@@ -100,9 +102,15 @@ CREATE TABLE sessions (
 CREATE TABLE stories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,           -- 简短标题
-    content TEXT NOT NULL,         -- ≤400字的"问题-步骤-结果"
+    abstract TEXT NOT NULL,        -- 有预算的默认 recall 摘要
+    content TEXT NOT NULL,         -- 兼容字段：完整 detail 的可读渲染，不截断
+    detail_json TEXT NOT NULL,     -- problem/actions/outcome/pitfalls/evidence/applicability
+    sources_json TEXT NOT NULL,    -- Session 与证据定位
     keywords TEXT NOT NULL,        -- 关键词(JSON array)
-    embedding TEXT,                -- 语义向量(JSON array, 1024维)
+    embedding BLOB,                -- 当前 serving 语义向量(float32, 1024维)
+    embedding_model TEXT,
+    embedding_version TEXT,
+    embedding_content_hash TEXT,
     parent_id INTEGER,             -- 父story ID（分裂时指向原story）
     source_session_ids TEXT,       -- 来源会话ID(JSON array)
     access_count INTEGER DEFAULT 0,-- 被检索命中次数
@@ -130,6 +138,13 @@ CREATE VIRTUAL TABLE story_vectors USING vec0(
     story_id INTEGER PRIMARY KEY,
     embedding FLOAT[1024]
 );
+
+-- immutable create/update/merge/split snapshots
+CREATE TABLE story_revisions (...);
+
+-- resumable shadow build; serving story_vectors is switched only when complete
+CREATE TABLE story_embedding_backfill (...);
+CREATE TABLE embedding_index_state (...);
 ```
 
 ### 3.2 Story 数据结构
@@ -138,9 +153,21 @@ CREATE VIRTUAL TABLE story_vectors USING vec0(
 {
     "id": 1,
     "title": "React useEffect 无限循环排查",
-    "content": "问题：useEffect触发无限渲染循环。步骤：1.检查依赖数组发现遗漏了setState的回调依赖；2.使用useCallback包裹回调函数；3.将不依赖props的逻辑移出useEffect。结果：渲染次数从无限降为2次。",
+    "abstract": "useEffect 因不稳定依赖无限渲染；稳定回调后恢复。",
+    "detail": {
+        "problem": "完整问题与环境背景",
+        "actions": ["检查依赖数组", "用 useCallback 稳定引用"],
+        "outcome": "渲染次数从无限降为 2 次",
+        "pitfalls": ["不要直接隐藏依赖项"],
+        "evidence": ["Profiler 前后对比"],
+        "applicability": {"applies_when": [], "excludes_when": []}
+    },
+    "sources": [{"session_id": 42, "evidence": ["消息/日志定位"]}],
+    "content": "完整 detail 的向后兼容可读渲染",
     "keywords": ["react", "useEffect", "无限循环", "依赖数组", "useCallback"],
-    "embedding": [0.012, -0.034, ...],  # 1024维
+    "embedding_model": "qwen3-embedding:0.6b",
+    "embedding_version": "story-v2-default-v1",
+    "embedding_content_hash": "sha256...",
     "parent_id": None,
     "access_count": 3,
     "version": 2
@@ -155,10 +182,11 @@ CREATE VIRTUAL TABLE story_vectors USING vec0(
 输入: 一条 pending 状态的 session
   │
   ▼
-Step 1: LLM 提取
+Step 1: LLM 形成 Story v2
   ├── 提取核心技术关键词 (5-10个)
-  ├── 生成语义向量 (embedding model)
-  └── 提取问题摘要 (≤100字)
+  ├── 按独立结论 + applicability 切分（非字符边界）
+  ├── 形成 title / abstract / structured detail / sources
+  └── 默认 embedding(title + abstract + applicability)
   │
   ▼
 Step 2: 记忆检索
@@ -172,8 +200,8 @@ Step 2: 记忆检索
   ▼
 Step 3: 记忆处理 (三种分支)
   │
-  ├── 【新建】将会话浓缩为≤400字story
-  │     ├── LLM生成"问题-步骤-结果"格式摘要
+  ├── 【新建】保存独立且完整的 Story v2
+  │     ├── abstract 有预算，detail/source 无损保存
   │     ├── 存入 stories 表
   │     ├── 向量存入 story_vectors
   │     └── 与Step2找到的弱匹配story建立边(weight=sim)
@@ -181,11 +209,10 @@ Step 3: 记忆处理 (三种分支)
   ├── 【合并】将新内容并入旧story
   │     ├── LLM合并旧story + 新会话内容 → 新story文本
   │     ├── 检查分裂条件:
-  │     │     ├── 合并后 > 400字? → 触发分裂
-  │     │     └── LLM判断包含2+独立子步骤? → 触发分裂
+  │     │     └── 存在 2+ 独立结论或不同适用条件? → 触发分裂
   │     ├── 不需分裂: 更新story内容、关键词、向量、version+1
   │     └── 需要分裂: 
-  │           ├── LLM拆分为多个子story (每个≤400字)
+  │           ├── LLM按复用边界拆分为多个子 Story（不按长度）
   │           ├── 子story parent_id 指向原story
   │           ├── 父子边 weight=1.0
   │           └── 子story间建立语义边
@@ -243,15 +270,9 @@ Step 4: 返回结果
 ### 4.3 分裂触发条件
 
 ```python
-def should_split(merged_text: str, llm_judge: str) -> bool:
-    """判断是否需要分裂"""
-    # 条件1: 合并后文本超过400字
-    if len(merged_text) > 400:
-        return True
-    # 条件2: LLM判断包含2+独立可复用子步骤
-    if "SPLIT:YES" in llm_judge:
-        return True
-    return False
+def should_split(merged_story: dict, llm_judge: str) -> bool:
+    """仅按独立结论与 applicability 边界判断，不读取字符数。"""
+    return "SPLIT:YES" in llm_judge
 ```
 
 ### 4.4 关联权重规则
@@ -311,20 +332,20 @@ coding-memory/
 
 ### 6.1 LLM Prompt 设计
 
-**摘要生成 Prompt：**
+**Story v2 形成 Prompt（摘要）：**
 ```
-你是一个代码记忆管理专家。请将以下AI编程会话浓缩为不超过400字的结构化记忆。
+你是 Agent 经历记忆整理器。按独立可复用结论与适用环境形成 Story。
 
 要求：
-1. 格式："问题：... 步骤：1.... 2.... 结果：..."
-2. 保留核心技术细节和解决方案
-3. 去除寒暄、重复、无效内容
-4. 聚焦单个coding问题的完整解决逻辑
+1. 同一问题的连续排查保持在一个 Story，即使很长
+2. 两个独立结果或适用条件必须拆分，即使会话很短
+3. 输出 title/abstract/detail(problem/actions/outcome/pitfalls/evidence/applicability)/sources
+4. abstract 有预算；detail/source 不硬截断
 
 会话内容：
 {session_content}
 
-请直接输出记忆文本，不要额外说明。
+只输出 JSON 数组。
 ```
 
 **关键词提取 Prompt：**

@@ -6,7 +6,7 @@
 
 ## 这是什么 / What it is
 
-Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JSON 文件或内置模拟器），对每条会话跑一遍 **做梦周期（dream cycle）**：用 LLM 抽取关键词、做摘要，把它沉淀成一条 ≤400 字的结构化 *Story*（问题 / 步骤 / 结果），并与已有记忆按相似度**合并 / 更新 / 新建**，同时在 Story 之间建立带权重的关联边。
+Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JSON 文件或内置模拟器），对每条会话跑一遍 **做梦周期（dream cycle）**：按“独立可复用结论 + 环境适用性”形成一个或多个 Story v2。每条 Story 保存 `title + abstract + structured detail + sources`；detail 与证据不硬截断，只有用于检索/展示的 abstract 有预算，并与已有记忆按相似度**合并 / 更新 / 新建**。
 
 检索时，先做向量相似度召回，再沿关联边激活相关 Story，共同被召回的 Story 之间的边权重会被强化——像人脑在反复回忆中加深记忆路径。
 
@@ -14,9 +14,9 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 
 ## ✨ 特性
 
-- 🧠 **做梦式记忆整理**：每条会话被压缩成一条 Story，相似记忆自动合并/分裂/更新，避免记忆膨胀
+- 🧠 **语义边界记忆整理**：长而不可拆的经历保持完整；短会话中的多个独立结论拆成多条 Story，并共享来源 Session
 - 🔗 **带权关联图**：Story 间有 `semantic` / `parent_child` / `sibling` 三类无向边，检索时沿边激活
-- 📐 **双索引存储**：SQLite + sqlite-vec（vec0 向量表），向量同时存于 `stories.embedding` 与 `story_vectors`，L2 归一化后用余弦相似度
+- 📐 **可演进双索引**：当前 `story_vectors` 持续服务，模型/版本切换先增量写 shadow，完整后原子切换；失败可续跑
 - 🔍 **低时延联想检索**：MCP 启动预热 + Ollama keep-alive；按 `index_version` 失效的查询向量/结果双缓存；向量不可用或超时时在独立 500ms 预算内切到 FTS/关键词 fallback
 - 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
 - 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 同时守护检索质量
@@ -37,17 +37,17 @@ collector → store → processor (用 llm + embeddings) → search
 
 ### 做梦周期（`processor.process_session`）
 
-对每条 pending 会话：LLM 抽取关键词 → 对 `关键词 + 问题简述` 做 embedding（聚焦而非用全文）→ 向量检索 top-K 已有 Story → 按最佳相似度分支：
+对每条 pending 会话：LLM 按独立结论形成 Story v2 → 默认对 `title + abstract + applicability` 做 embedding → 每个候选分别检索 top-K 已有 Story → 按最佳相似度分支：
 
 | 分支 | 触发条件 | 动作 |
 |------|----------|------|
-| **create** | best sim < 0.85 | LLM 摘要成 ≤400 字 Story；与 0.75–0.85 的弱匹配 Story 建边，`weight = sim` |
-| **merge** | 0.85 ≤ sim < 0.92 | LLM 合并新旧内容；若结果 >400 字或 LLM 判定 `SPLIT:YES`，则分裂为子 Story（`parent_id`，父子边 1.0，兄弟边 0.5）。分裂后父 Story 的向量从索引删除（不再参与检索），但行保留用于溯源 |
+| **create** | best sim < 0.85 | 完整保存 structured detail/source；与 0.75–0.85 的弱匹配 Story 建边，`weight = sim` |
+| **merge** | 0.85 ≤ sim < 0.92 | 合并新旧结构化证据；只有存在多个独立结论/适用条件才分裂，不以字符数触发。父行和 revision 链保留用于溯源 |
 | **update** | sim ≥ 0.92 | 仅合并关键词、重新 embedding、强化已有边权重（+0.1，上限 1.0） |
 
 ### 检索（`search.search`）
 
-embed 查询（关键词 + 查询文本）→ vec0 top-K（取 `top_k*2`，按 `SIM_THRESHOLD_SEARCH=0.50` 过滤）→ 对每个命中，沿 `edges` 表（权重降序）浮现相关 Story，并对共同召回的 Story 之间加边权重；命中 Story 的 `access_count` 自增。
+直接 embed 查询文本 → vec0 top-K（扩大候选后按 `SIM_THRESHOLD_SEARCH=0.50` 过滤）→ 对每个命中，沿 `edges` 表（权重降序）浮现相关 Story，并对共同召回的 Story 之间加边权重；命中 Story 的 `access_count` 自增。
 
 查询响应包含 `request_id`、`mode`、`degraded` 与 `latency_ms.{cache,embed,vector,graph,rerank,serialize,total}`。同一份阶段数据会写入本地 `logs/query_performance.jsonl`，但落盘接口只接受固定白名单字段：不保存原始 query、Story 内容、绝对路径、hostname 或仓库 URL。文件权限为 `0600`，超过大小上限后只保留最近记录。
 
@@ -57,7 +57,13 @@ embed 查询（关键词 + 查询文本）→ vec0 top-K（取 `top_k*2`，按 `
 
 ### 存储层（`store.py`）
 
-每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。三张表 `sessions` / `stories` / `edges` 外加 `story_vectors` vec0 虚表；持久对象带与路径无关的 `global_id`、`profile_id` 和 `sync_state=local_only`。**embedding 存两处且必须同步**：`stories.embedding`（float32 BLOB）与 `story_vectors` 一行。`search_by_vector` 用 L2 距离查询并换算为余弦相似度 `1 - dist²/2`（对 L2 归一化向量精确）。
+每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录 create/update/merge/split 快照。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
+
+```bash
+# 每次最多重建 100 条；重复运行自动跳过 content_hash 未变化的 ready 项
+storybook embedding-backfill --model qwen3-embedding:0.6b \
+  --version story-v2-default-v2 --batch-size 100
+```
 
 ## 🔧 环境要求
 
@@ -168,6 +174,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
   切换、跨 cwd 一致性、损坏 registry 拒绝覆盖和最小权限。
 - **processor**：create / merge / update 三分支 + split 路径，mock `llm`/`embeddings` 返回固定值，
   验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
+- **Story v2**：千 token 原子 Story 无损保存、短会话双结论共享 Session、summary/detail 分层、revision 链，以及 embedding backfill 失败续跑与原子切换。
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
 - **performance**：阶段时钟故障注入、最近窗口百分位、cache/fallback 比例、诊断隐私白名单，以及 warm/cold、并发 1/5 benchmark 编排（测试用小数据集与 mock embedding）。
 - **prime**：query 构造（cwd / first_prompt）、主动注入门槛（高于检索）、token 预算裁剪、静默不注入（空库 / 低于门槛 / embedding 失败 / schema 缺失均不抛错）。
@@ -181,13 +188,13 @@ PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段�
 作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染用户 Profile 数据库。
 
 ```bash
-storybook eval all                              # 跑全部三轮评测（默认）
+storybook eval all                              # 跑全部四轮评测（默认）
 storybook eval retrieval                        # 仅检索评测
 storybook eval all --report data/eval_reports/baseline.json   # 落盘 JSON 报告，便于阈值调整前后对比
 python scripts/eval.py retrieval                # 等价独立脚本（未做 editable 安装时用）
 ```
 
-三轮评测：
+四轮评测：
 
 1. **retrieval** — 用 `data/retrieval_benchmark.json`（24 topic × 3 查询变体 = 72 对，含精确术语 / 同义改写 / 跨语言 EN↔ZH + 负例），
    真实 embedding 索引人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、负例特异性，并判定是否达 recall@3≥70%。
@@ -195,6 +202,9 @@ python scripts/eval.py retrieval                # 等价独立脚本（未做 ed
 2. **processing** — 真实 embedding + 确定性 LLM 桩（人工关键词/摘要），度量 merge/update 分支是否选对
    （duplicate 应并入、distinct 应新建），输出 `SIM_THRESHOLD_HIGH` 阈值敏感性曲线。隔离度量 0.85/0.92 阈值，排除 LLM 关键词质量波动。
 3. **split** — 真实 embedding + 确定性 LLM 桩，度量分裂路径结构正确性（父向量移除、父子边 1.0、子向量入索引、子 story 可检索）。
+4. **ablation** — 比较 legacy、默认 `title+abstract+applicability`、全文单向量、title/abstract/applicability 分字段多向量；按 exact/synonym/cross-tool/cross-language 报告 recall@3/MRR 与索引/查询时延。
+
+Story v2 固定报告（2026-08-02，`data/eval_reports/story-v2-ablation-2026-08-02.json`）：四种表示在 24 topic × 4 分组上 recall@3/MRR 均为 100%；默认表示相对 legacy 为 `0.00pp`，通过“下降不超过 2pp”门槛。默认单向量索引均值 84.4ms/story，明显低于全文 205.2ms 与多向量 223.7ms；多向量检索 p95 0.94ms，高于默认 0.34ms，因此选择默认表示。
 
 当前基线（2026-07-19，`data/eval_reports/baseline-2026-07-19.json`）：recall@3 = 100% ✅ 达标；
 合并正确率 85.7%（`dup-docker-dns` sim 0.83 落在 0.85 阈值下方被误判为 create，阈值敏感性显示 0.82 可达 100%）；
@@ -375,8 +385,8 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`） | 快路径召回 + 环境感知关联激活；默认环境软加权，显式 `strict` 才过滤。match 返回环境分数、来源环境、适用条件、warnings 与 retrieval source；顶层返回 `{request_id,mode,result_state,degraded,degraded_reason,fallback_status,cache_hit,index_version,latency_ms}`，降级空结果不会伪装成“无记忆” |
-| `get_story` | `story_id`（必填） | 查看单条记忆详情（含关联记忆），剥离 1024 维 embedding |
+| `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`） | 默认返回 `abstract` 摘要；兼容 `content` 字段仍存在并承载同一摘要，`truncated=true` 表示完整 detail 需按需展开 |
+| `get_story` | `story_id`（必填） | 查看完整 `detail/sources/revisions` 与兼容 `title/content/version`，剥离 1024 维 embedding |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
 | `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / Ollama 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
 
@@ -478,6 +488,9 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama 服务地址 |
 | `STORYBOOK_LLM_MODEL` | `qwythos-hermes:latest` | 做梦加工用的 LLM |
 | `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
+| `STORYBOOK_EMBED_VERSION` | `story-v2-default-v1` | 活跃表示的不可变版本标识 |
+| `STORYBOOK_EMBED_REPRESENTATION` | `default` | 默认 `title + abstract + applicability` |
+| `STORYBOOK_ABSTRACT_MAX_CHARS` | `600` | abstract 预算；不影响 detail/source 持久化 |
 | `STORYBOOK_EMBED_KEEP_ALIVE` | `10m` | 每次 embedding 请求续期的 Ollama 模型驻留时间 |
 | `STORYBOOK_QUERY_WARM_TIMEOUT_SECONDS` | `2` | warm embedding 硬超时，超时即降级 |
 | `STORYBOOK_QUERY_COLD_TIMEOUT_SECONDS` | `5` | cold embedding 硬超时，超时即降级 |
@@ -496,7 +509,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `SIM_THRESHOLD_SEARCH` | 0.50 | 检索最低相似度 |
 | `ENVIRONMENT_SCORE_WEIGHT` | 0.08 | 环境在同语义分桶内的有界次级权重；不反转语义主排序 |
 | `TOP_K_RETRIEVAL` / `TOP_K_SEARCH` | 5 / 3 | 做梦召回 / 用户搜索返回数 |
-| `STORY_MAX_CHARS` | 400 | Story 最大字数 |
+| `STORY_ABSTRACT_MAX_CHARS` | 600 | abstract 预算；不截断 detail/source |
 | `WEIGHT_INCREMENT` / `WEIGHT_MAX` | 0.1 / 1.0 | 共同召回提权 / 权重上限 |
 | `PRIME_MIN_SIMILARITY` | 0.60 | 晨间简报主动注入最低相似度（高于检索 0.50，避免噪声） |
 | `PRIME_TOP_K` | 5 | 晨间简报最多考虑的候选数（再按 token 预算裁剪） |

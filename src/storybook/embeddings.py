@@ -29,7 +29,13 @@ def embed(
     - 维度不匹配 / 零向量时返回 None（上层据此标记 failed 或报错，不再传入坏向量）。
     - 归一化保证 store.search_by_vector 中 ``1 - dist²/2`` 等于 cosine 相似度（精确）。
     """
-    model = model or config.EMBED_MODEL
+    if model is None:
+        try:
+            from . import store
+            state = store.get_embedding_index_state()
+            model = state.get("active_model") or config.EMBED_MODEL
+        except Exception:  # schema may not exist during setup health probes
+            model = config.EMBED_MODEL
     timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
     keep_alive = config.EMBED_KEEP_ALIVE if keep_alive is None else keep_alive
     try:
@@ -89,3 +95,81 @@ def prewarm() -> bool:
         timeout_seconds=config.QUERY_COLD_TIMEOUT_SECONDS,
         keep_alive=config.EMBED_KEEP_ALIVE,
     ))
+
+
+def backfill(
+    *,
+    model: str,
+    version: str,
+    representation: str = "default",
+    batch_size: int = 100,
+    activate: bool = True,
+) -> dict:
+    """Incrementally build a shadow embedding index and optionally activate it.
+
+    Ready rows are content-hash checked and skipped on retries.  A failed vector
+    remains in the shadow table with an attempt counter; the current serving
+    vec0 index is untouched until every live Story is ready and activation can
+    commit atomically.
+    """
+
+    # Local imports avoid a store -> embeddings -> store import cycle.
+    from . import store
+    from . import story_v2
+
+    store.begin_embedding_backfill(model, version, representation)
+    pending = store.stories_pending_embedding_backfill(
+        version,
+        representation,
+        limit=max(1, batch_size),
+    )
+    attempted = succeeded = failed = 0
+    for story in pending:
+        attempted += 1
+        vector = embed(
+            story_v2.embedding_input(story, representation),
+            model=model,
+        )
+        if vector:
+            succeeded += 1
+            store.stage_embedding_backfill(
+                story["id"],
+                model=model,
+                version=version,
+                representation=representation,
+                content_hash=story["target_content_hash"],
+                embedding=vector,
+            )
+        else:
+            failed += 1
+            store.stage_embedding_backfill(
+                story["id"],
+                model=model,
+                version=version,
+                representation=representation,
+                content_hash=story["target_content_hash"],
+                embedding=None,
+                error="embedding unavailable or dimension mismatch",
+            )
+
+    progress = store.embedding_backfill_progress(version, representation)
+    activation = None
+    if activate and progress["pending"] == 0:
+        activation = store.activate_embedding_backfill(
+            model=model,
+            version=version,
+            representation=representation,
+        )
+    elif progress["pending"] == 0:
+        store.mark_embedding_backfill_ready()
+    return {
+        "model": model,
+        "version": version,
+        "representation": representation,
+        "attempted": attempted,
+        "succeeded": succeeded,
+        "failed": failed,
+        "progress": progress,
+        "activation": activation,
+        "serving_index_unchanged": activation is None,
+    }

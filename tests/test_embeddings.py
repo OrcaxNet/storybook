@@ -50,3 +50,22 @@ def test_prewarm_uses_cold_budget_and_configured_keep_alive(monkeypatch):
     assert captured["text"] == "storybook embedding warmup"
     assert captured["timeout_seconds"] == config.QUERY_COLD_TIMEOUT_SECONDS
     assert captured["keep_alive"] == config.EMBED_KEEP_ALIVE
+
+
+def test_default_embed_uses_active_serving_model_during_config_switch(monkeypatch):
+    """Changing target config must not mix query vectors into the old index."""
+
+    from storybook import store
+
+    active_model = store.get_embedding_index_state()["active_model"]
+    captured = {}
+
+    def fake_post(url, *, json, timeout):
+        captured.update(json)
+        return _Response()
+
+    monkeypatch.setattr(embeddings.requests, "post", fake_post)
+    monkeypatch.setattr(config, "EMBED_MODEL", "future-target-model")
+
+    assert embeddings.embed("query") == basis(0)
+    assert captured["model"] == active_model

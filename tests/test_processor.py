@@ -72,7 +72,7 @@ class TestCreateBranch:
 
         # 4) 会话已标记 processed；用了 summarize，没用 merge/split
         assert store.get_session(sid)["status"] == "processed"
-        assert fake_llm.calls.get("summarize_session") == 1
+        assert fake_llm.calls.get("form_stories") == 1
         assert fake_llm.calls.get("merge_stories", 0) == 0
         assert fake_llm.calls.get("split_story", 0) == 0
 
@@ -131,7 +131,7 @@ class TestUpdateBranch:
 
         # 没走 merge/split/summarize；只走了 extract_keywords
         assert fake_llm.calls.get("extract_keywords") == 1
-        assert fake_llm.calls.get("summarize_session", 0) == 0
+        assert fake_llm.calls.get("form_stories") == 1
         assert fake_llm.calls.get("merge_stories", 0) == 0
         assert fake_llm.calls.get("judge_split", 0) == 0
         assert store.get_session(sid)["status"] == "processed"
@@ -181,7 +181,7 @@ class TestMergeBranch:
         assert store.get_edges(old)[0]["weight"] == pytest.approx(0.4, abs=1e-6)
 
         # 调用了 summarize + merge + judge_split，没 split
-        assert fake_llm.calls.get("summarize_session") == 1
+        assert fake_llm.calls.get("form_stories") == 1
         assert fake_llm.calls.get("merge_stories") == 1
         assert fake_llm.calls.get("judge_split") == 1
         assert fake_llm.calls.get("split_story", 0) == 0
@@ -263,7 +263,7 @@ class TestSplitBranch:
         assert all(r["story_id"] != parent for r in store.search_by_vector(basis(0), top_k=10))
 
         # 7) LLM 调用符合预期
-        assert fake_llm.calls.get("summarize_session") == 1
+        assert fake_llm.calls.get("form_stories") == 1
         assert fake_llm.calls.get("merge_stories") == 1
         assert fake_llm.calls.get("judge_split") == 1
         assert fake_llm.calls.get("split_story") == 1

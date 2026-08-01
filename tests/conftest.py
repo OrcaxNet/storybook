@@ -42,6 +42,7 @@ def fake_llm(monkeypatch):
     fl = FakeLLM()
     monkeypatch.setattr(llm_mod, "extract_keywords", fl.extract_keywords)
     monkeypatch.setattr(llm_mod, "summarize_session", fl.summarize_session)
+    monkeypatch.setattr(llm_mod, "form_stories", fl.form_stories)
     monkeypatch.setattr(llm_mod, "merge_stories", fl.merge_stories)
     monkeypatch.setattr(llm_mod, "judge_split", fl.judge_split)
     monkeypatch.setattr(llm_mod, "split_story", fl.split_story)

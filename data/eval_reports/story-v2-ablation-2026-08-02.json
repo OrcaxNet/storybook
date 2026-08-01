@@ -1,0 +1,185 @@
+{
+  "meta": {
+    "parts": [
+      "ablation"
+    ],
+    "embed_mode": "ollama",
+    "part": "ablation"
+  },
+  "retrieval": null,
+  "processing": null,
+  "split": null,
+  "ablation": {
+    "benchmark_version": 1,
+    "embedding_model": "qwen3-embedding:0.6b",
+    "embedding_dimension": 1024,
+    "similarity_threshold": 0.5,
+    "topic_count": 24,
+    "query_count": 96,
+    "baseline_mode": "legacy",
+    "selected_mode": "default",
+    "selection_gate": "recall@3 >= baseline - 0.02",
+    "default_delta_recall_at_3": 0.0,
+    "passes_two_point_non_regression": true,
+    "modes": {
+      "legacy": {
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "query_count": 96,
+        "story_count": 24,
+        "index_vectors_per_story": 1,
+        "embed_failures": 0,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          }
+        },
+        "latency_ms": {
+          "index_mean_per_vector": 120.057,
+          "index_mean_per_story": 120.057,
+          "query_p50": 73.223,
+          "query_p95": 77.011,
+          "retrieval_p50": 0.315,
+          "retrieval_p95": 0.337
+        }
+      },
+      "default": {
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "query_count": 96,
+        "story_count": 24,
+        "index_vectors_per_story": 1,
+        "embed_failures": 0,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          }
+        },
+        "latency_ms": {
+          "index_mean_per_vector": 84.372,
+          "index_mean_per_story": 84.372,
+          "query_p50": 73.243,
+          "query_p95": 76.402,
+          "retrieval_p50": 0.321,
+          "retrieval_p95": 0.337
+        }
+      },
+      "full": {
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "query_count": 96,
+        "story_count": 24,
+        "index_vectors_per_story": 1,
+        "embed_failures": 0,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          }
+        },
+        "latency_ms": {
+          "index_mean_per_vector": 205.24,
+          "index_mean_per_story": 205.24,
+          "query_p50": 74.403,
+          "query_p95": 77.501,
+          "retrieval_p50": 0.32,
+          "retrieval_p95": 0.34
+        }
+      },
+      "multi_vector": {
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "query_count": 96,
+        "story_count": 24,
+        "index_vectors_per_story": 3,
+        "embed_failures": 0,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          }
+        },
+        "latency_ms": {
+          "index_mean_per_vector": 74.576,
+          "index_mean_per_story": 223.728,
+          "query_p50": 74.621,
+          "query_p95": 77.369,
+          "retrieval_p50": 0.901,
+          "retrieval_p95": 0.944
+        }
+      }
+    },
+    "notes": [
+      "default = title + abstract + applicability",
+      "full = title + abstract + structured detail + applicability",
+      "multi_vector = max(title, abstract, applicability) field similarity",
+      "cross_tool is a deterministic paraphrase of each human synonym label"
+    ]
+  }
+}

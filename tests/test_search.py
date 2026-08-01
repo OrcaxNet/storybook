@@ -276,6 +276,20 @@ class TestFastPathCache:
 # ═══════════════════════════════════════════════
 
 class TestLexicalFallback:
+    def test_abstract_is_indexed_for_embedding_degradation(self, fake_embedder):
+        story_id = store.add_story(
+            "unrelated title", "unrelated detail", [], basis(0),
+            abstract="unique abstract recovery phrase",
+        )
+        fake_embedder.register("unique abstract recovery phrase", None)
+
+        result = search_module.search("unique abstract recovery phrase")
+
+        assert result["top_matches"][0]["story_id"] == story_id
+        assert result["top_matches"][0]["content"] == (
+            "unique abstract recovery phrase"
+        )
+
     def test_embedding_unavailable_returns_fts_keyword_results(self, fake_embedder):
         story_id = store.add_story(
             "SQLite 锁冲突排查",

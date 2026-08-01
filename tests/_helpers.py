@@ -112,6 +112,7 @@ class FakeLLM:
             {"title": "子记忆1", "content": "子内容1"},
             {"title": "子记忆2", "content": "子内容2"},
         ]
+        self.stories: list[dict] | None = None
         self.calls: dict[str, int] = {}
 
     def _tick(self, name: str) -> None:
@@ -124,6 +125,12 @@ class FakeLLM:
     def summarize_session(self, content):
         self._tick("summarize_session")
         return dict(self.summary)
+
+    def form_stories(self, content):
+        self._tick("form_stories")
+        if self.stories is not None:
+            return [dict(story) for story in self.stories]
+        return [dict(self.summary)]
 
     def merge_stories(self, old, new):
         self._tick("merge_stories")
