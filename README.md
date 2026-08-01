@@ -57,7 +57,9 @@ collector → store → processor (用 llm + embeddings) → search
 
 ### 存储层（`store.py`）
 
-每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录 create/update/merge/split 快照。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
+每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。新 Profile、Session、Story、edge 使用可按时间排序的 UUIDv7 全局 ID。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录无损本地快照，`memory_events` 以 `event_id/entity_id/base_version/version/device_id/operation/created_at` 记录 create/update/merge/split/delete 的可移植审计链。事件明文 payload 只含固定元数据、关系 UUID 与修订 SHA-256，不复制正文、原始外部 session ID、路径或证据文本，并预留加密 payload 字段。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
+
+删除 Story 时不物理删行：同一事务清除 serving 向量、追加 delete event 并写入不可变 `memory_tombstones`。查询默认排除 tombstone；本地事件重放采用 delete-wins，即使旧 create/update 事件晚到也不会复活对象。v0.2 的 `storybook sync status` 是纯本地状态查询，不登录、不联网，也没有上传/下载入口。
 
 从 v0.1 升级时，无法审计模型、输入表示与 hash 的旧向量会保留为 `story-v1-unversioned/legacy` 服务窗口，Story 标记为 `stale` 且不冒充 v2 元数据；必须完成可续跑的 shadow backfill 后，才会原子切换为 v2 active 状态。重复初始化不会覆盖 `stale`、`failed` 或 `archived` 等真实状态。
 
@@ -201,6 +203,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **processor**：create / merge / update 三分支 + split 路径，mock `llm`/`embeddings` 返回固定值，
   验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
 - **Story v2**：千 token 原子 Story 无损保存、短会话双结论共享 Session、summary/detail 分层、revision 链，以及 embedding backfill 失败续跑与原子切换。
+- **MemoryEvent**：UUIDv7 单调性、create/update/merge/split/delete 版本链、事件/tombstone 不可变、删除重放不复活、payload 隐私白名单，以及 `sync status` 零网络请求。
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
 - **performance**：阶段时钟故障注入、最近窗口百分位、cache/fallback 比例、诊断隐私白名单，以及 warm/cold、并发 1/5 benchmark 编排（测试用小数据集与 mock embedding）。
 - **prime**：query 构造（cwd / first_prompt）、主动注入门槛（高于检索）、token 预算裁剪、静默不注入（空库 / 低于门槛 / embedding 失败 / schema 缺失均不抛错）。

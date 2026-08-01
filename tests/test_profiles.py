@@ -95,6 +95,7 @@ class TestProfileRegistry:
         )
         profile = registry.active_profile()
         uuid.UUID(profile.id)
+        assert uuid.UUID(profile.id).version == 7
         assert profile.display_name == "default"
         assert profile.mode == "local"
         assert profile.sync_state == DEFAULT_SYNC_STATE

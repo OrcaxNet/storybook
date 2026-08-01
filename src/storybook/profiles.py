@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Iterator, Mapping
 
+from .identifiers import new_uuid7
+
 try:  # Unix/macOS
     import fcntl
 except ImportError:  # pragma: no cover - Windows
@@ -221,7 +223,7 @@ class ProfileRegistry:
                 f"不支持的 Profile mode: {mode!r}；可选 {sorted(PROFILE_MODES)}"
             )
         return Profile(
-            id=str(uuid.uuid4()),
+            id=new_uuid7(),
             display_name=name,
             mode=mode,
             sync_state=DEFAULT_SYNC_STATE,
