@@ -17,8 +17,9 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🧠 **做梦式记忆整理**：每条会话被压缩成一条 Story，相似记忆自动合并/分裂/更新，避免记忆膨胀
 - 🔗 **带权关联图**：Story 间有 `semantic` / `parent_child` / `sibling` 三类无向边，检索时沿边激活
 - 📐 **双索引存储**：SQLite + sqlite-vec（vec0 向量表），向量同时存于 `stories.embedding` 与 `story_vectors`，L2 归一化后用余弦相似度
-- 🔍 **联想检索**：向量召回 + 边图扩散，共同召回会反向增强边权重
-- 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 同时守护检索质量
+- 🔍 **低时延联想检索**：MCP 启动预热 + Ollama keep-alive；按 `index_version` 失效的查询向量/结果双缓存；向量不可用或超时时在独立 500ms 预算内切到 FTS/关键词 fallback
+- 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
+- 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 同时守护检索质量
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
 - 🏠 **完全离线**：只需本地 Ollama，零云端依赖
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
@@ -196,7 +197,12 @@ storybook benchmark --model-state cold --report data/perf-cold.json
 storybook benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 ```
 
-连续运行时应比较报告中的 machine、embedding model/dim、model_state、dataset seed/size、repeats 与 concurrency；这些字段不同足以解释大多数基线漂移。缓存和 lexical fallback 属于后续快路径优化：当前实现会按统一 schema 报告其比例为 0，后续接入时无需改变口径。
+连续运行时应比较报告中的 machine、embedding model/dim、model_state、dataset seed/size、repeats 与 concurrency；这些字段不同足以解释大多数基线漂移。报告同时按 `cache` / `vector` / `lexical_fallback` lane 给出 p50/p95/p99，分别核验 cache hit ≤80ms、warm ≤1s、cold ≤5s。cold 场景每批先卸载模型并清空进程内缓存，避免把 cache hit 误算为冷启动。
+
+查询快路径不调用生成式 LLM。MCP 启动时 best-effort 预热 embedding，后续每次请求用 `keep_alive` 续期；warm 2s、cold 5s 到达硬超时后立即尝试 FTS5 + 参数化关键词 fallback，fallback 自身最多 500ms。响应中的 `result_state` 明确区分：
+
+- `results` / `no_match`：正常向量或缓存路径；`no_match` 才表示已完成正常检索但没有相关记忆。
+- `degraded_results` / `degraded_empty` / `degraded_unavailable`：降级命中、降级空结果、降级自身不可用；这些状态不应被解释为已确认“没有相关记忆”。
 
 ## 🚀 使用
 
@@ -335,7 +341,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `recall` | `query`（必填）, `top_k?`（默认 3） | 向量检索 + 关联激活，返回 `{query,count,matches,request_id,mode,degraded,degraded_reason,latency_ms}`。`count=0` 表示无匹配（记忆库为空或无相关记忆），此时 `matches` 为空，不返回噪声 |
+| `recall` | `query`（必填）, `top_k?`（默认 3） | 快路径召回，返回 `{query,count,matches,request_id,mode,result_state,degraded,degraded_reason,fallback_status,cache_hit,index_version,latency_ms}`。只有 `result_state=no_match` 表示正常检索无匹配；降级空结果不会伪装成“无记忆” |
 | `get_story` | `story_id`（必填） | 查看单条记忆详情（含关联记忆），剥离 1024 维 embedding |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
 | `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / Ollama 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
@@ -343,8 +349,8 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 ### 说明
 
 - server、CLI、Claude/Cursor collector 和 Codex 等 MCP 客户端都经 Profile registry 共享同一数据目录（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
-- `recall` 复用 CLI `search` 的全部语义，**包括副作用**：命中记忆的 `access_count` 自增、共同召回的关联边权重提权（"反复回忆加深记忆路径"）。
-- `recall` 需要本地 Ollama 生成查询向量；Ollama 不可用时返回可操作错误（提示 `storybook doctor`）。`get_story` / `stats` 不依赖 Ollama。
+- `recall` 复用 CLI `search` 的全部语义；命中记忆的 `access_count` 自增、共同召回边权提权会进入后台反馈队列，不阻塞查询响应。
+- `recall` 优先使用本地 Ollama 生成查询向量；Ollama 不可用或超时时返回显式 degraded 状态和 FTS/关键词可用结果，不抛出伪装成“无匹配”的环境错误。`get_story` / `stats` 不依赖 Ollama。
 - `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**--Ollama 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
 - server 启动时自动 `init_db`：全新环境下 `recall` 返回空、`stats` 返回 0、`get_story` 报不存在、`prime_context` 返回 `injected=false`。
 
@@ -438,6 +444,10 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama 服务地址 |
 | `STORYBOOK_LLM_MODEL` | `qwythos-hermes:latest` | 做梦加工用的 LLM |
 | `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
+| `STORYBOOK_EMBED_KEEP_ALIVE` | `10m` | 每次 embedding 请求续期的 Ollama 模型驻留时间 |
+| `STORYBOOK_QUERY_WARM_TIMEOUT_SECONDS` | `2` | warm embedding 硬超时，超时即降级 |
+| `STORYBOOK_QUERY_COLD_TIMEOUT_SECONDS` | `5` | cold embedding 硬超时，超时即降级 |
+| `STORYBOOK_QUERY_FALLBACK_TIMEOUT_SECONDS` | `0.5` | FTS/关键词 fallback 独立硬超时 |
 | `STORYBOOK_LLM_THINK` | `0` | Qwen3 思考模式：`0`=关（提取类任务约 9× 加速），`1`=开（检索准确率不足时再开） |
 | `STORYBOOK_DREAM_INTERVAL` | `14400` | `dream` 守护进程 / launchd 定时间隔（秒），默认 4 小时 |
 | `STORYBOOK_WATCH_POLL_INTERVAL` | `60` | `process --watch` 轮询 `~/.claude/projects` 的间隔（秒） |
@@ -473,7 +483,9 @@ storybook/
 │   ├── processor.py    # 做梦周期（dream cycle）
 │   ├── llm.py          # Ollama LLM 调用
 │   ├── embeddings.py   # Ollama embedding 调用
-│   ├── search.py       # 向量检索 + 关联激活
+│   ├── search.py       # 版本化缓存 + 向量/词法降级 + 关联激活
+│   ├── query_cache.py  # index_version 隔离的向量/结果 LRU+TTL 缓存
+│   ├── feedback.py     # access_count/边权异步反馈队列
 │   ├── performance.py  # 隐私安全的查询诊断 JSONL + 最近窗口汇总
 │   ├── perf_benchmark.py # 固定数据集 warm/cold 性能与质量基准
 │   ├── dreamd.py       # 做梦周期自动化（锁 / 监听 / 定时守护 / 日志）
