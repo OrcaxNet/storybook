@@ -121,7 +121,24 @@ def switch_profile(profile_ref: str):
     return profile
 
 
-refresh_profile(create=False)
+try:
+    refresh_profile(create=False)
+except profiles_module.ProfileError:
+    # 损坏的 registry 不应让 CLI 在参数解析前因模块导入直接崩溃。保持只读的
+    # bootstrap 路径，交由具体命令在可输出稳定错误格式的边界重新读取并报告。
+    ACTIVE_PROFILE = _BOOTSTRAP_PROFILE
+    PROFILE_PATHS = PROFILE_REGISTRY.paths_for(_BOOTSTRAP_PROFILE)
+    PROFILE_ID = _BOOTSTRAP_PROFILE.id
+    PROFILE_MODE = _BOOTSTRAP_PROFILE.mode
+    SYNC_STATE = _BOOTSTRAP_PROFILE.sync_state
+    DATA_DIR = PROFILE_PATHS.root
+    DB_DIR = PROFILE_PATHS.database_dir
+    DB_PATH = PROFILE_PATHS.database
+    INDEX_DIR = PROFILE_PATHS.index_dir
+    CACHE_DIR = PROFILE_PATHS.cache_dir
+    LOG_DIR = PROFILE_PATHS.log_dir
+    PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
+    _PROFILE_PERSISTED = False
 
 # ── Ollama ──
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")

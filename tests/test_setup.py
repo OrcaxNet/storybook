@@ -357,6 +357,107 @@ def test_wrong_shape_agent_config_returns_json_error_without_traceback(
     assert not storybook_home.exists()
 
 
+def test_explicit_agent_skips_invalid_unselected_adapter_config(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    claude_settings = user_home / ".claude" / "settings.json"
+    claude_settings.parent.mkdir(parents=True)
+    claude_settings.write_text('{"hooks": []}\n', encoding="utf-8")
+    before = claude_settings.read_bytes()
+    env = os.environ.copy()
+    env.update(
+        {
+            "STORYBOOK_HOME": str(storybook_home),
+            "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "storybook.cli",
+            "setup",
+            "--dry-run",
+            "--json",
+            "--agent",
+            "cursor",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "dry_run"
+    assert payload["writes_performed"] == 0
+    selected = [
+        item["adapter"] for item in payload["plan"]["adapters"] if item["selected"]
+    ]
+    assert selected == ["cursor"]
+    assert claude_settings.read_bytes() == before
+    assert not storybook_home.exists()
+
+
+def test_invalid_profile_registry_returns_json_error_without_writes(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    registry = storybook_home / "config" / "profiles.json"
+    registry.parent.mkdir(parents=True)
+    registry.write_text("{broken", encoding="utf-8")
+    before = registry.read_bytes()
+    before_tree = sorted(
+        str(path.relative_to(storybook_home)) for path in storybook_home.rglob("*")
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "STORYBOOK_HOME": str(storybook_home),
+            "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "storybook.cli",
+            "setup",
+            "--dry-run",
+            "--json",
+            "--agent",
+            "cursor",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "SB_SETUP_PROFILE_INVALID"
+    assert payload["error"]["message"]
+    assert payload["error"]["hint"]
+    assert "Traceback" not in completed.stderr
+    assert "ProfileError" not in completed.stderr
+    assert registry.read_bytes() == before
+    after_tree = sorted(
+        str(path.relative_to(storybook_home)) for path in storybook_home.rglob("*")
+    )
+    assert after_tree == before_tree
+    assert not user_home.exists()
+
+
 def test_model_unavailable_returns_degraded_not_failed(isolated_setup, monkeypatch):
     manager, _ = isolated_setup
     monkeypatch.setattr(

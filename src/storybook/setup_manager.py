@@ -15,7 +15,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import requests
 
 from . import config, embeddings, search, store
-from .profiles import PlatformRoots
+from .profiles import PlatformRoots, ProfileError
 from .setup_adapters import (
     AdapterContext,
     AdapterError,
@@ -23,7 +23,7 @@ from .setup_adapters import (
     Launcher,
     get_adapters,
 )
-from .setup_adapters.base import atomic_write
+from .setup_adapters.base import AdapterPlan, atomic_write
 
 
 STATE_SCHEMA_VERSION = 1
@@ -191,14 +191,32 @@ class SetupManager:
         adapter_plans: list[dict[str, Any]] = []
         try:
             for adapter in self.adapters:
+                if adapter.name not in selected:
+                    adapter_plans.append(
+                        AdapterPlan(
+                            adapter=adapter.name,
+                            display_name=adapter.display_name,
+                            detected=adapter.detected(self.context),
+                            selected=False,
+                            changed=False,
+                            targets=(),
+                            summary="not selected",
+                        ).as_dict()
+                    )
+                    continue
                 adapter_plans.append(
-                    adapter.plan(
-                        self.context, selected=adapter.name in selected
-                    ).as_dict()
+                    adapter.plan(self.context, selected=True).as_dict()
                 )
         except AdapterError as exc:
             raise SetupError(exc.code, str(exc), hint="修复配置语法后重试") from exc
-        profile = config.PROFILE_REGISTRY.peek_active_profile()
+        try:
+            profile = config.PROFILE_REGISTRY.peek_active_profile()
+        except ProfileError as exc:
+            raise SetupError(
+                "SB_SETUP_PROFILE_INVALID",
+                str(exc),
+                hint="修复或从备份恢复 Profile registry 后重试",
+            ) from exc
         profile_plan = {
             "action": "reuse" if profile else "create",
             "id": profile.id if profile else None,
