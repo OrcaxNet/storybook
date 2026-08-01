@@ -10,7 +10,7 @@ Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
 
 ## Environment & running
 
-- Python **3.11+** (venv at `.venv/`). Dependencies: `click`, `requests`, `numpy`, `sqlite-vec`.
+- Python **3.11+** (venv at `.venv/`). Dependencies: `click`, `requests`, `numpy`, `sqlite-vec`, `mcp`.
 - **Ollama must be running** at `http://localhost:11434` (override with `OLLAMA_HOST`) with two models pulled:
   - LLM: `qwythos-hermes:latest` (override `STORYBOOK_LLM_MODEL`)
   - Embedding: `qwen3-embedding:0.6b`, **1024-dim** (override `STORYBOOK_EMBED_MODEL`). `EMBED_DIM` in config must match.
@@ -21,6 +21,8 @@ Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
 
 ```
 storybook init                          # create SQLite schema + vec0 virtual table (also auto-run by other commands)
+storybook setup [--yes|--dry-run|--json]  # user Profile + detected Claude/Cursor/Codex adapters + smoke tests
+storybook uninstall [--purge-data]      # restore managed config nodes; keep memory by default
 storybook profile show|list             # inspect the user-level Profile registry
 storybook profile create NAME           # create an isolated Profile
 storybook profile switch ID_OR_NAME     # switch the active Profile
@@ -44,7 +46,7 @@ The pytest suite lives in `tests/` and mocks Ollama by default. `test_logs/*.jso
 
 ## Architecture
 
-Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `context.py` owns ContextEnvelope capture, privacy normalization and environment-fit scoring; `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `storybook doctor` (env + vector double-write consistency self-check, reads via `store`).
+Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `context.py` owns ContextEnvelope capture, privacy normalization and environment-fit scoring; `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `storybook doctor` (env + vector double-write consistency self-check, reads via `store`). `setup_manager.py` orchestrates one-click setup/uninstall; `setup_adapters/` owns plugin-registered, node-scoped Claude Code/Cursor/Codex config merges and rollback.
 
 ### Storage layer (`store.py`) — SQLite + sqlite-vec
 Each random-UUID user Profile owns `profiles/<profile_id>/db/memory.db` under the platform data directory. `profiles.py` is the sole registry/path resolver used by CLI, collectors, hooks and MCP; repository paths are not memory boundaries. Three tables (`sessions`, `stories`, `edges`) plus the **`story_vectors` vec0 virtual table** carry path-independent `global_id`, `profile_id`, and `sync_state=local_only`. Each `get_db()` call opens a fresh connection (WAL mode, foreign keys on) and loads the sqlite-vec extension.

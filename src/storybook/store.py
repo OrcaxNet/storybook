@@ -159,6 +159,7 @@ def get_db(
 
 def init_db():
     """初始化数据库 schema，并幂等补齐 Profile 与 ContextEnvelope 字段。"""
+    config.ensure_profile()
     db = get_db()
     try:
         db.executescript(_SCHEMA)

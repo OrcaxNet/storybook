@@ -1,5 +1,7 @@
 """配置管理 — Profile 路径、模型名、阈值常量集中管理。"""
 import os
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ── 安装根与 .env ──
@@ -49,19 +51,41 @@ from . import profiles as profiles_module  # noqa: E402  -- .env 须先加载
 
 PROFILE_REGISTRY = profiles_module.default_registry()
 
+# registry 尚未创建时使用纯内存占位 Profile，让模块导入保持只读。真正需要存储
+# 的命令会调用 ``ensure_profile()`` 创建随机 UUID Profile 并刷新全部路径。
+_BOOTSTRAP_PROFILE = profiles_module.Profile(
+    id=str(uuid.UUID(int=0)),
+    display_name="default",
+    mode="local",
+    sync_state=profiles_module.DEFAULT_SYNC_STATE,
+    created_at=datetime.fromtimestamp(0, timezone.utc).isoformat(),
+)
+_PROFILE_PERSISTED = False
 
-def refresh_profile(profile_ref: str | None = None):
+
+def refresh_profile(profile_ref: str | None = None, *, create: bool = True):
     """重新解析当前 Profile，并原子刷新所有兼容路径常量。"""
 
     global ACTIVE_PROFILE, PROFILE_PATHS, PROFILE_ID, PROFILE_MODE, SYNC_STATE
     global DATA_DIR, DB_DIR, DB_PATH, INDEX_DIR, CACHE_DIR, LOG_DIR
     global PERFORMANCE_LOG_PATH
 
+    global _PROFILE_PERSISTED
+
     if profile_ref:
         profile = PROFILE_REGISTRY.resolve(profile_ref)
-    else:
+        _PROFILE_PERSISTED = True
+    elif create:
         profile = PROFILE_REGISTRY.active_profile()
-    paths = PROFILE_REGISTRY.ensure_profile_directories(profile)
+        _PROFILE_PERSISTED = True
+    else:
+        profile = PROFILE_REGISTRY.peek_active_profile() or _BOOTSTRAP_PROFILE
+        _PROFILE_PERSISTED = profile is not _BOOTSTRAP_PROFILE
+    paths = (
+        PROFILE_REGISTRY.ensure_profile_directories(profile)
+        if create
+        else PROFILE_REGISTRY.paths_for(profile)
+    )
 
     ACTIVE_PROFILE = profile
     PROFILE_PATHS = paths
@@ -78,6 +102,17 @@ def refresh_profile(profile_ref: str | None = None):
     return profile
 
 
+def ensure_profile() -> object:
+    """在首次真实写操作前创建 Profile；测试重定向 DB 时保持隔离。"""
+
+    if _PROFILE_PERSISTED:
+        return ACTIVE_PROFILE
+    # 测试/benchmark 会显式重定向 DB_PATH；这种情况下不得把路径刷新回用户目录。
+    if DB_PATH != PROFILE_PATHS.database:
+        return ACTIVE_PROFILE
+    return refresh_profile(create=True)
+
+
 def switch_profile(profile_ref: str):
     """切换 registry 的 active Profile，并刷新当前进程配置。"""
 
@@ -86,7 +121,24 @@ def switch_profile(profile_ref: str):
     return profile
 
 
-refresh_profile()
+try:
+    refresh_profile(create=False)
+except profiles_module.ProfileError:
+    # 损坏的 registry 不应让 CLI 在参数解析前因模块导入直接崩溃。保持只读的
+    # bootstrap 路径，交由具体命令在可输出稳定错误格式的边界重新读取并报告。
+    ACTIVE_PROFILE = _BOOTSTRAP_PROFILE
+    PROFILE_PATHS = PROFILE_REGISTRY.paths_for(_BOOTSTRAP_PROFILE)
+    PROFILE_ID = _BOOTSTRAP_PROFILE.id
+    PROFILE_MODE = _BOOTSTRAP_PROFILE.mode
+    SYNC_STATE = _BOOTSTRAP_PROFILE.sync_state
+    DATA_DIR = PROFILE_PATHS.root
+    DB_DIR = PROFILE_PATHS.database_dir
+    DB_PATH = PROFILE_PATHS.database
+    INDEX_DIR = PROFILE_PATHS.index_dir
+    CACHE_DIR = PROFILE_PATHS.cache_dir
+    LOG_DIR = PROFILE_PATHS.log_dir
+    PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
+    _PROFILE_PERSISTED = False
 
 # ── Ollama ──
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")

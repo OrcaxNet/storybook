@@ -3,8 +3,8 @@
 分两层：
   - 工具核心逻辑（recall_memories / get_story_detail / get_stats_overview 及裁剪函数）：
     直接调用模块级函数，**不依赖 mcp SDK**，复用 conftest 的隔离 DB + mock embedder。
-  - FastMCP 装配（create_server）：需 mcp SDK，用 ``pytest.importorskip`` 守护，
-    未安装 [mcp] extra 时整体跳过（base ``pytest`` 仍全绿）。
+  - FastMCP 装配（create_server）：需基础安装自带的 mcp SDK；
+    ``pytest.importorskip`` 让核心逻辑测试在裁剪依赖环境中仍可运行。
 """
 from __future__ import annotations
 

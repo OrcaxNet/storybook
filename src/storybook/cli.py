@@ -3,6 +3,8 @@ CLI 入口 — storybook 命令
 
 用法:
   storybook init                    初始化数据库
+  storybook setup                   一键检测环境、接入 Agent 并运行 smoke test
+  storybook uninstall               恢复 setup 写入的配置（默认保留记忆）
   storybook profile show|list       查看用户级 Profile
   storybook profile create|switch   创建隔离 Profile / 切换当前 Profile
   storybook sync status             查看本地同步状态（v0.2 为 local-only）
@@ -48,6 +50,7 @@ from . import eval as eval_module
 from . import search as search_module
 from . import context as context_module
 from .profiles import ProfileError
+from .setup_manager import SetupError, SetupManager
 
 
 def setup_logging(verbose: bool = False):
@@ -64,6 +67,183 @@ def setup_logging(verbose: bool = False):
 def cli(verbose):
     """🧠 Storybook - 离线 Coding 记忆系统"""
     setup_logging(verbose)
+
+
+def _emit_setup_error(exc: SetupError, *, as_json: bool) -> None:
+    if as_json:
+        click.echo(
+            json.dumps(
+                {"status": "failed", "error": exc.as_dict()},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        raise click.exceptions.Exit(1)
+    hint = f"\n修复建议: {exc.hint}" if exc.hint else ""
+    raise click.ClickException(f"[{exc.code}] {exc}{hint}") from exc
+
+
+def _print_setup_plan(plan: dict) -> None:
+    profile = plan["profile"]
+    click.echo("Storybook setup plan")
+    click.echo(
+        f"  Profile   {profile['action']} {profile['display_name']} "
+        f"({profile['sync_state']})"
+    )
+    for adapter in plan["adapters"]:
+        marker = "configure" if adapter["selected"] and adapter["changed"] else (
+            "ready" if adapter["selected"] else "skip"
+        )
+        click.echo(f"  Agent     {adapter['display_name']}: {marker}")
+        for target in adapter["targets"]:
+            click.echo(f"            {target}")
+    click.echo(f"  Models    {', '.join(plan['models'])}")
+    if plan["legacy_databases"]:
+        click.echo("  Legacy    found; migration is not automatic:")
+        for path in plan["legacy_databases"]:
+            click.echo(f"            {path}")
+
+
+@cli.command(name="setup")
+@click.option("--yes", "assume_yes", is_flag=True, help="接受计划并非交互执行")
+@click.option("--dry-run", is_flag=True, help="只输出计划；零文件、数据库和网络写入")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
+@click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    type=click.Choice(["claude", "cursor", "codex"]),
+    help="只配置指定 Agent；可重复。默认自动检测",
+)
+@click.option("--skip-models", is_flag=True, help="不下载缺失模型并进入 degraded")
+def setup_command(assume_yes, dry_run, as_json, agents, skip_models):
+    """一键建立用户级存储、Agent 接入并执行端到端自检。"""
+
+    manager = SetupManager()
+    try:
+        plan = manager.plan(agents or None).as_dict()
+    except SetupError as exc:
+        _emit_setup_error(exc, as_json=as_json)
+        return
+
+    if dry_run:
+        payload = {"status": "dry_run", "plan": plan, "writes_performed": 0}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            _print_setup_plan(plan)
+            click.echo("\nDry-run complete: no writes performed.")
+        return
+
+    if not as_json:
+        _print_setup_plan(plan)
+    if not assume_yes and not as_json:
+        click.confirm("Apply this plan?", abort=True)
+
+    def progress(event: dict) -> None:
+        if as_json:
+            return
+        model = event.get("model", "")
+        status = event.get("status", "")
+        suffix = ""
+        if event.get("percent") is not None:
+            suffix = f" {event['percent']:.1f}%"
+        if event.get("size"):
+            suffix += f" / {event['size']}"
+        click.echo(f"  Model     {model}: {status}{suffix}")
+
+    try:
+        result = manager.execute(
+            requested_agents=agents or None,
+            download_models=not skip_models,
+            progress=progress,
+        )
+    except SetupError as exc:
+        _emit_setup_error(exc, as_json=as_json)
+        return
+
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"\nSetup status: {result['status']}")
+    click.echo(f"  Profile   {result['profile']['id']}")
+    click.echo(f"  Database  {result['profile']['database']}")
+    for smoke in result["smoke_tests"]:
+        click.echo(
+            f"  {'PASS' if smoke['ok'] else 'FAIL'}      {smoke['name']}: {smoke['detail']}"
+        )
+    for reason in result["degraded_reasons"]:
+        click.echo(f"  DEGRADED  {reason}")
+
+
+@cli.command(name="uninstall")
+@click.option("--yes", "assume_yes", is_flag=True, help="非交互确认卸载")
+@click.option("--dry-run", is_flag=True, help="只展示卸载计划")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
+@click.option("--purge-data", is_flag=True, help="同时删除所有 Storybook Profile 与记忆")
+@click.option(
+    "--confirm-purge",
+    is_flag=True,
+    help="非交互 purge 的第二重显式确认；必须与 --purge-data 同用",
+)
+def uninstall_command(assume_yes, dry_run, as_json, purge_data, confirm_purge):
+    """恢复 setup 管理的配置；默认 keep-data。"""
+
+    manager = SetupManager()
+    plan = {
+        "restore_agent_config": True,
+        "data": "purge" if purge_data else "keep",
+        "state_file": str(manager.state_path),
+    }
+    if dry_run:
+        payload = {"status": "dry_run", "plan": plan, "writes_performed": 0}
+        if as_json:
+            click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            click.echo("Storybook uninstall plan")
+            click.echo("  Agent config  restore managed nodes")
+            click.echo(f"  Memory data   {'PURGE' if purge_data else 'KEEP'}")
+            click.echo("\nDry-run complete: no writes performed.")
+        return
+
+    if confirm_purge and not purge_data:
+        _emit_setup_error(
+            SetupError(
+                "SB_UNINSTALL_CONFIRM_INVALID",
+                "--confirm-purge 只能与 --purge-data 同用",
+            ),
+            as_json=as_json,
+        )
+        return
+    if purge_data and (assume_yes or as_json) and not confirm_purge:
+        _emit_setup_error(
+            SetupError(
+                "SB_UNINSTALL_PURGE_CONFIRM_REQUIRED",
+                "非交互 purge 需要同时传 --purge-data --confirm-purge",
+                hint="不传 --purge-data 会默认保留全部记忆",
+            ),
+            as_json=as_json,
+        )
+        return
+    if not assume_yes and not as_json:
+        click.confirm("Remove Storybook Agent integrations? Memory is kept by default.", abort=True)
+        if purge_data:
+            phrase = click.prompt("Type PURGE to permanently delete all memory")
+            if phrase != "PURGE":
+                raise click.ClickException("purge confirmation did not match")
+
+    try:
+        result = manager.uninstall(purge_data=purge_data)
+    except SetupError as exc:
+        _emit_setup_error(exc, as_json=as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"Uninstall status: {result['status']}")
+    click.echo(f"Memory data: {result['data']}")
+    for item in result["adapters"]:
+        click.echo(f"  {item['adapter']}: {item['status']}")
 
 
 def _profile_payload(profile, *, active: bool) -> dict:
@@ -228,8 +408,8 @@ def mcp():
     agent 可在运行时调用 recall / get_story / stats 召回过往记忆，
     实现"跨 session 经验复用"。server 为独立进程，不依赖 CLI 运行态。
 
-    需先安装 MCP 依赖：uv pip install -e ".[mcp]"。
-    Claude Code 接入配置见 README「MCP 接入」一节。
+    MCP runtime 已包含在基础安装中；Claude Code/Cursor/Codex 可由
+    ``storybook setup`` 自动接入。
     """
     from . import mcp_server
     mcp_server.main()

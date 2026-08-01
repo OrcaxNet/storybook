@@ -8,6 +8,8 @@ dependencies = [
     "requests>=2.28",
     "numpy>=1.24",
     "sqlite-vec>=0.1",
+    # setup 会自动接入 MCP-aware agents，因此 server runtime 属于基础安装。
+    "mcp>=1.2,<2",
 ]
 
 [project.optional-dependencies]
@@ -16,10 +18,8 @@ test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
-# MCP server 依赖：把记忆检索暴露给 MCP-aware agent（如 Claude Code）。
-# `uv pip install -e ".[mcp]"` 安装；之后 `storybook mcp` 启动 server。
+# 兼容旧安装命令 ``.[mcp]``；MCP runtime 自 v0.2 起已包含在基础依赖中。
 mcp = [
-    # mcp 2.x removed ``mcp.server.fastmcp`` used by the current adapter.
     "mcp>=1.2,<2",
 ]
 
