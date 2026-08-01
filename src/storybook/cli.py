@@ -8,6 +8,9 @@ CLI 入口 — storybook 命令
   storybook profile show|list       查看用户级 Profile
   storybook profile create|switch   创建隔离 Profile / 切换当前 Profile
   storybook sync status             查看本地同步状态（v0.2 为 local-only）
+  storybook migration discover      发现旧项目级 v1 数据库
+  storybook migration run PATH      安全迁移到用户级 Story v2
+  storybook migration rollback ID   原子回滚到保留的 v1 数据库副本
   storybook doctor [--fix]          环境与健康自检（--fix 修复向量双写不一致）
   storybook import <path>           导入会话日志(JSON)
   storybook import                  从 Claude Code 采集（默认数据源）
@@ -43,6 +46,7 @@ from . import (
     dreamd,
     embeddings,
     health,
+    migration as migration_module,
     perf_benchmark,
     performance,
     processor,
@@ -52,6 +56,7 @@ from . import eval as eval_module
 from . import search as search_module
 from . import context as context_module
 from .profiles import ProfileError
+from .migration import MigrationError
 from .setup_manager import SetupError, SetupManager
 
 
@@ -104,6 +109,7 @@ def _print_setup_plan(plan: dict) -> None:
         click.echo("  Legacy    found; migration is not automatic:")
         for path in plan["legacy_databases"]:
             click.echo(f"            {path}")
+        click.echo("            run: storybook migration run <path> --dry-run")
 
 
 @cli.command(name="setup")
@@ -257,6 +263,7 @@ def _profile_payload(profile, *, active: bool) -> dict:
         "sync_state": profile.sync_state,
         "active": active,
         "data_dir": str(paths.root),
+        "database_ref": profile.database_ref,
         "database": str(paths.database),
         "index_dir": str(paths.index_dir),
         "cache_dir": str(paths.cache_dir),
@@ -382,6 +389,156 @@ def sync_status(as_json):
     click.echo(f"Sync           {payload['sync_state']}")
     click.echo("Cross-device   disabled (v0.2)")
     click.echo("Storage        local user profile")
+
+
+def _emit_migration_error(exc: MigrationError, *, as_json: bool) -> None:
+    if as_json:
+        click.echo(json.dumps(
+            {"status": "failed", "error": exc.as_dict()},
+            ensure_ascii=False,
+            indent=2,
+        ))
+        raise click.exceptions.Exit(1)
+    hint = f"\n修复建议: {exc.hint}" if exc.hint else ""
+    raise click.ClickException(f"[{exc.code}] {exc}{hint}") from exc
+
+
+@cli.group(name="migration")
+def migration_group():
+    """🧳 发现、迁移和回滚旧项目级数据库。"""
+
+
+@migration_group.command(name="discover")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+def migration_discover(as_json):
+    """只读发现当前项目中的 Storybook v1 数据库。"""
+
+    found = migration_module.discover_legacy_databases()
+    payload = {"legacy_databases": [str(path) for path in found]}
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    if not found:
+        click.echo("未发现旧项目级 Storybook v1 数据库")
+        return
+    click.echo("发现以下旧数据库：")
+    for path in found:
+        click.echo(f"  {path}")
+
+
+@migration_group.command(name="run")
+@click.argument(
+    "source",
+    required=False,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option("--dry-run", is_flag=True, help="只读检查并输出计划；零写入")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON")
+def migration_run(source, dry_run, as_json):
+    """将一个 v1 数据库安全迁移到当前用户级 Profile。"""
+
+    manager = migration_module.MigrationManager()
+    if source is None:
+        found = migration_module.discover_legacy_databases()
+        if len(found) != 1:
+            exc = MigrationError(
+                "SB_MIGRATION_SOURCE_REQUIRED",
+                f"自动发现 {len(found)} 个候选库，无法唯一选择",
+                hint="显式传入 storybook migration run <memory.db>",
+            )
+            _emit_migration_error(exc, as_json=as_json)
+            return
+        source = found[0]
+    try:
+        result = manager.plan(source) if dry_run else manager.run(source)
+    except (MigrationError, ProfileError) as exc:
+        if isinstance(exc, ProfileError):
+            exc = MigrationError("SB_MIGRATION_PROFILE_INVALID", str(exc))
+        _emit_migration_error(exc, as_json=as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if dry_run:
+        click.echo(
+            f"Dry-run OK: {result['counts']['sessions']} Session / "
+            f"{result['counts']['stories']} Story / {result['counts']['edges']} edge"
+        )
+        click.echo(f"Migration ID: {result['migration_id']}")
+        click.echo("未写入任何文件；移除 --dry-run 执行切换")
+        return
+    click.echo(f"Migration {result['status']}: {result['migration_id']}")
+    click.echo(f"Profile database_ref: {result['generation_ref']}")
+    if result.get("retain_until"):
+        click.echo(f"v1 backup retained until at least: {result['retain_until']}")
+
+
+@migration_group.command(name="rollback")
+@click.argument("migration_id")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON")
+def migration_rollback(migration_id, as_json):
+    """原子切回迁移保留的 v1 数据库副本。"""
+
+    try:
+        result = migration_module.MigrationManager().rollback(migration_id)
+    except (MigrationError, ProfileError) as exc:
+        if isinstance(exc, ProfileError):
+            exc = MigrationError("SB_MIGRATION_PROFILE_INVALID", str(exc))
+        _emit_migration_error(exc, as_json=as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"Rollback {result['status']}: {migration_id}")
+    click.echo(f"Profile database_ref: {result['database_ref']}")
+
+
+@migration_group.command(name="status")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON")
+def migration_status(as_json):
+    """查看当前 Profile 的迁移与备份状态。"""
+
+    try:
+        result = migration_module.MigrationManager().status()
+    except (MigrationError, ProfileError) as exc:
+        if isinstance(exc, ProfileError):
+            exc = MigrationError("SB_MIGRATION_PROFILE_INVALID", str(exc))
+        _emit_migration_error(exc, as_json=as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"Profile database_ref: {result['database_ref']}")
+    if not result["migrations"]:
+        click.echo("尚无迁移记录")
+        return
+    for item in result["migrations"]:
+        click.echo(
+            f"  {item['migration_id']}  {item['status']}  "
+            f"retain_until={item['retain_until']}"
+        )
+
+
+@migration_group.command(name="delete-backup")
+@click.argument("migration_id")
+@click.option("--yes", "assume_yes", is_flag=True, help="确认永久删除保留备份")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON")
+def migration_delete_backup(migration_id, assume_yes, as_json):
+    """用户主动永久删除一个迁移的 v1 保留备份。"""
+
+    if not assume_yes and not click.confirm("永久删除 v1 备份？此操作不可撤销"):
+        raise click.Abort()
+    try:
+        result = migration_module.MigrationManager().delete_backup(migration_id)
+    except (MigrationError, ProfileError) as exc:
+        if isinstance(exc, ProfileError):
+            exc = MigrationError("SB_MIGRATION_PROFILE_INVALID", str(exc))
+        _emit_migration_error(exc, as_json=as_json)
+        return
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"Backup {result['status']}: {migration_id}")
 
 
 @cli.command()

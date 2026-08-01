@@ -113,6 +113,26 @@ def ensure_profile() -> object:
     return refresh_profile(create=True)
 
 
+def refresh_database_pointer() -> object:
+    """Follow an atomic registry generation switch in long-running processes.
+
+    Tests and isolated benchmarks deliberately override ``DB_PATH``; preserve
+    that boundary instead of refreshing it back to the user Profile.
+    """
+
+    if not _PROFILE_PERSISTED or DB_PATH != PROFILE_PATHS.database:
+        return ACTIVE_PROFILE
+    profile = PROFILE_REGISTRY.peek_active_profile()
+    if profile is None:
+        return ACTIVE_PROFILE
+    if (
+        profile.id != ACTIVE_PROFILE.id
+        or profile.database_ref != ACTIVE_PROFILE.database_ref
+    ):
+        return refresh_profile(profile.id)
+    return ACTIVE_PROFILE
+
+
 def switch_profile(profile_ref: str):
     """切换 registry 的 active Profile，并刷新当前进程配置。"""
 

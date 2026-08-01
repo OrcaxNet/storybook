@@ -137,7 +137,7 @@ storybook uninstall --yes --purge-data --confirm-purge  # 非交互双重显式�
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/storybook/profiles/{profile_id}/` |
 | Windows | `%LOCALAPPDATA%\Storybook\profiles\{profile_id}\` |
 
-数据库/索引位于 Profile 数据根，缓存与日志走各平台的 cache/state 目录；目录权限在 POSIX 上为 `0700`，registry 与数据库为 `0600`。registry 只持久化随机 UUID、显示名、模式和同步状态，不把用户名、hostname 或绝对路径当作主键。
+数据库/索引位于 Profile 数据根，缓存与日志走各平台的 cache/state 目录；目录权限在 POSIX 上为 `0700`，registry 与数据库为 `0600`。registry 只持久化随机 UUID、显示名、模式、同步状态和 Profile 内的相对数据库世代指针，不把用户名、hostname 或绝对路径当作主键。
 
 ```bash
 storybook profile show                    # 当前 Profile、数据目录与 local-only 状态
@@ -148,6 +148,27 @@ storybook sync status                     # v0.2 明确显示 local_only、跨�
 ```
 
 可用 `STORYBOOK_PROFILE=<UUID|NAME>` 为单个进程选择 Profile 而不修改 registry；`STORYBOOK_HOME=/private/path` 可显式收拢/隔离 registry、数据库、缓存和日志。旧仓库 `data/memory.db` 不会被删除或覆盖；安全迁移由独立的 migration 流程负责。
+
+### v1 → v2 安全迁移与回滚
+
+迁移始终只读打开旧项目库，先做一致性备份，再在隔离的数据库世代内转换和校验。
+Session、Story、edge 及关系必须逐项等量；已有 embedding 会进入 sqlite-vec serving
+索引并执行真实查询 smoke test。v1 `content` 原样保存在 `legacy_raw`，Story v2 detail/source
+同步生成，`abstract_status=pending` 留给后续异步补全。所有检查通过后，才以一次原子
+registry 写入切换 `database_ref`，因此失败不会改变旧库权威，也不会发生新旧双写。
+
+```bash
+storybook migration discover --json
+storybook migration run ./data/memory.db --dry-run --json  # 严格零写入
+storybook migration run ./data/memory.db --json            # 备份、转换、校验、切换
+storybook migration status --json
+storybook migration rollback <migration_id> --json         # 原子切回独立 v1 副本
+storybook migration delete-backup <migration_id> --yes      # 用户显式永久删除
+```
+
+`migration_id` 由目标 Profile 与源库逻辑 SHA-256 确定；重复运行同一源库直接复用已验证
+世代，不插入重复对象。当前 Profile 已有 Session/Story/edge 时迁移会拒绝覆盖，应先创建
+一个新的空 Profile。原始源库永不修改；受管 v1 备份至少保留 30 天，且不会自动提前删除。
 
 ## 🧪 测试
 
@@ -251,6 +272,9 @@ storybook profile show|list          # 查看用户级 Profile 与数据目录
 storybook profile create NAME        # 创建 isolated Profile（可加 --switch）
 storybook profile switch ID_OR_NAME  # 切换当前 Profile
 storybook sync status                # v0.2 显示 local_only
+storybook migration discover         # 只读发现旧项目级 v1 数据库
+storybook migration run PATH         # 安全备份、转换、校验并原子切换
+storybook migration rollback ID      # 原子切回保留的 v1 副本
 storybook import-data                # 默认：从 ~/.claude/projects 采集 Claude Code 会话（增量、按 sessionId 去重）
 storybook import-data --claude       # 同上（显式写法）
 storybook import-data --sample [--n 100]   # 生成并导入模拟会话（无需真实会话即可体验）

@@ -10,9 +10,9 @@ import os
 import sys
 import uuid
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterator, Mapping
 
 try:  # Unix/macOS
@@ -32,6 +32,7 @@ SYNC_STATES = frozenset(
     {"local_only", "synced", "pending", "conflict", "paused", "error"}
 )
 DEFAULT_SYNC_STATE = "local_only"
+DEFAULT_DATABASE_REF = "db/memory.db"
 
 
 class ProfileError(RuntimeError):
@@ -58,6 +59,10 @@ class Profile:
     mode: str
     sync_state: str
     created_at: str
+    # Profile-local relative pointer.  Migrations switch this value atomically
+    # instead of replacing an SQLite file which another process may still have
+    # open.  Absolute paths never enter the portable registry.
+    database_ref: str = DEFAULT_DATABASE_REF
 
 
 @dataclass(frozen=True)
@@ -221,7 +226,25 @@ class ProfileRegistry:
             mode=mode,
             sync_state=DEFAULT_SYNC_STATE,
             created_at=datetime.now(timezone.utc).isoformat(),
+            database_ref=DEFAULT_DATABASE_REF,
         )
+
+    @staticmethod
+    def _validate_database_ref(value: object) -> str:
+        ref = str(value or DEFAULT_DATABASE_REF).replace("\\", "/")
+        path = PurePosixPath(ref)
+        if (
+            not ref
+            or path.is_absolute()
+            or ref.startswith("//")
+            or (path.parts and path.parts[0].endswith(":"))
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path.suffix != ".db"
+        ):
+            raise ProfileError(
+                "Profile database_ref 必须是 Profile 内的安全相对 .db 路径"
+            )
+        return path.as_posix()
 
     @staticmethod
     def _validate_profile(raw: object) -> Profile:
@@ -234,6 +257,9 @@ class ProfileRegistry:
                 mode=str(raw["mode"]),
                 sync_state=str(raw["sync_state"]),
                 created_at=str(raw["created_at"]),
+                database_ref=ProfileRegistry._validate_database_ref(
+                    raw.get("database_ref", DEFAULT_DATABASE_REF)
+                ),
             )
             uuid.UUID(profile.id)
         except (KeyError, TypeError, ValueError) as exc:
@@ -294,6 +320,14 @@ class ProfileRegistry:
                 os.fsync(handle.fileno())
             os.replace(tmp, self.path)
             _private_file(self.path)
+            if hasattr(os, "O_DIRECTORY"):
+                directory_fd = os.open(
+                    self.path.parent, os.O_RDONLY | os.O_DIRECTORY
+                )
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         finally:
             if tmp.exists():
                 tmp.unlink()
@@ -400,12 +434,31 @@ class ProfileRegistry:
         self.ensure_profile_directories(profile)
         return profile
 
+    def set_profile_database(self, ref: str, database_ref: str) -> Profile:
+        """Atomically point one Profile at a managed database generation."""
+
+        validated = self._validate_database_ref(database_ref)
+        with self._locked():
+            state = self._read_unlocked()
+            if state is None:
+                raise ProfileError("Profile registry 尚未初始化")
+            selected = self.resolve(ref, state)
+            updated = replace(selected, database_ref=validated)
+            state["profiles"] = [
+                updated if profile.id == selected.id else profile
+                for profile in state["profiles"]
+            ]
+            self._write_unlocked(state)
+        self.ensure_profile_directories(updated)
+        return updated
+
     def paths_for(self, profile: Profile) -> ProfilePaths:
         root = self.roots.data / "profiles" / profile.id
+        database = root.joinpath(*PurePosixPath(profile.database_ref).parts)
         return ProfilePaths(
             root=root,
-            database_dir=root / "db",
-            database=root / "db" / "memory.db",
+            database_dir=database.parent,
+            database=database,
             index_dir=root / "indexes",
             cache_dir=self.roots.cache / "profiles" / profile.id,
             log_dir=self.roots.logs / "profiles" / profile.id,
