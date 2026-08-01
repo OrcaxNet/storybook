@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -224,6 +225,84 @@ def test_failure_before_cutover_keeps_registry_and_source_authoritative(
         db.close()
 
 
+def test_wal_commit_after_backup_aborts_before_cutover(
+    tmp_path, migration_profile, monkeypatch
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    original_ref = migration_profile.active_profile().database_ref
+    original_copy = migration._copy_read_only_database
+    committed = False
+
+    def copy_then_commit(source_path, destination):
+        nonlocal committed
+        original_copy(source_path, destination)
+        if Path(source_path).resolve() != source.resolve() or committed:
+            return
+        writer = sqlite3.connect(source)
+        try:
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute(
+                """INSERT INTO sessions (source, raw_content, problem_desc)
+                   VALUES ('late-writer', 'raw-3', 'problem-3')"""
+            )
+            writer.commit()
+            committed = True
+        finally:
+            writer.close()
+
+    monkeypatch.setattr(
+        migration, "_copy_read_only_database", copy_then_commit
+    )
+
+    with pytest.raises(migration.MigrationError) as exc_info:
+        migration.MigrationManager().run(source)
+
+    assert exc_info.value.code == "SB_MIGRATION_SOURCE_CHANGED"
+    assert migration_profile.active_profile().database_ref == original_ref
+    source_db = sqlite3.connect(source)
+    try:
+        assert source_db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
+    finally:
+        source_db.close()
+
+
+def test_active_source_writer_blocks_cutover_without_switching(
+    tmp_path, migration_profile
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    original_ref = migration_profile.active_profile().database_ref
+    writer = sqlite3.connect(source)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        """INSERT INTO sessions (source, raw_content, problem_desc)
+           VALUES ('uncommitted-writer', 'raw-3', 'problem-3')"""
+    )
+    try:
+        with pytest.raises(migration.MigrationError) as exc_info:
+            migration.MigrationManager().run(source)
+    finally:
+        writer.rollback()
+        writer.close()
+
+    assert exc_info.value.code == "SB_MIGRATION_SOURCE_BUSY"
+    assert migration_profile.active_profile().database_ref == original_ref
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX read-only permission bits")
+def test_read_only_source_uses_hash_cas_without_mutation(
+    tmp_path, migration_profile
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    source_before = source.read_bytes()
+    source.chmod(0o400)
+
+    result = migration.MigrationManager().run(source)
+
+    assert result["status"] == "applied"
+    assert source.read_bytes() == source_before
+
+
 def test_rollback_atomically_points_to_independent_v1_copy(
     tmp_path, migration_profile
 ):
@@ -250,6 +329,52 @@ def test_rollback_atomically_points_to_independent_v1_copy(
     assert manager.rollback(applied["migration_id"])["status"] == (
         "already_rolled_back"
     )
+
+
+def test_reapply_rejects_changes_written_after_rollback(
+    tmp_path, migration_profile
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    manager.rollback(applied["migration_id"])
+    rollback_ref = migration_profile.active_profile().database_ref
+
+    authoritative = sqlite3.connect(config.DB_PATH)
+    try:
+        authoritative.execute(
+            """INSERT INTO sessions (source, raw_content, problem_desc)
+               VALUES ('rollback-writer', 'raw-3', 'problem-3')"""
+        )
+        authoritative.commit()
+    finally:
+        authoritative.close()
+
+    with pytest.raises(migration.MigrationError) as exc_info:
+        manager.run(source)
+
+    assert exc_info.value.code == "SB_MIGRATION_AUTHORITY_CHANGED"
+    assert migration_profile.active_profile().database_ref == rollback_ref
+    current = sqlite3.connect(config.DB_PATH)
+    try:
+        assert current.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
+    finally:
+        current.close()
+
+
+def test_reapply_allows_unchanged_rollback_authority(
+    tmp_path, migration_profile
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    manager.rollback(applied["migration_id"])
+
+    reapplied = manager.run(source)
+
+    assert reapplied["status"] == "reapplied"
+    assert migration_profile.active_profile().database_ref == applied["generation_ref"]
+    assert store.count_sessions() == 2
 
 
 def test_cli_dry_run_and_status_json(tmp_path, migration_profile):

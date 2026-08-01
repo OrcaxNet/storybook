@@ -1,9 +1,10 @@
 """Safe v1 project database migration into a Profile-owned v2 generation.
 
-The source database is always opened read-only.  Conversion happens in an
-isolated generation and the only cut-over is an atomic Profile registry write.
-This avoids replacing a WAL database underneath another process and gives
-rollback a single, auditable pointer change.
+Inspection, backup and conversion never mutate the source.  At cut-over a
+write-free SQLite ``BEGIN IMMEDIATE`` guard briefly excludes source commits so
+the final logical-hash CAS and atomic Profile registry update have no gap.
+Read-only source files use a read transaction because no new writer can open
+them.  Conversion always happens in an isolated generation.
 """
 from __future__ import annotations
 
@@ -115,6 +116,69 @@ def _read_only(path: Path) -> sqlite3.Connection:
     db.execute("PRAGMA query_only=ON")
     db.execute("PRAGMA busy_timeout=5000")
     return db
+
+
+def _is_readonly_error(exc: BaseException) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None and (int(code) & 0xFF) == sqlite3.SQLITE_READONLY:
+        return True
+    message = str(exc).casefold()
+    return "readonly" in message or "read-only" in message or "permission" in message
+
+
+@contextmanager
+def _cutover_guard(
+    path: Path,
+    *,
+    busy_code: str,
+    label: str,
+) -> Iterator[sqlite3.Connection]:
+    """Hold a stable snapshot and exclude commits until registry cut-over.
+
+    ``BEGIN IMMEDIATE`` changes no user data but takes SQLite's single-writer
+    slot.  A genuinely read-only file falls back to a read transaction; its OS
+    permissions already prevent a new writer from opening it.
+    """
+
+    resolved = path.expanduser().resolve(strict=True)
+    db: sqlite3.Connection | None = None
+    try:
+        try:
+            db = sqlite3.connect(
+                f"{resolved.as_uri()}?mode=rw", uri=True, timeout=0
+            )
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA busy_timeout=0")
+            db.execute("BEGIN IMMEDIATE")
+        except (OSError, sqlite3.OperationalError) as exc:
+            if db is not None:
+                db.close()
+                db = None
+            if not _is_readonly_error(exc):
+                raise MigrationError(
+                    busy_code,
+                    f"{label}仍有活动写事务，无法建立无遗漏切换边界",
+                    hint="停止旧写入进程后重试；registry 尚未切换",
+                ) from exc
+            db = _read_only(resolved)
+            db.execute("BEGIN")
+        yield db
+    finally:
+        if db is not None:
+            if db.in_transaction:
+                db.rollback()
+            db.close()
+
+
+def _hash_database(path: Path) -> str:
+    db = _read_only(path)
+    try:
+        db.execute("BEGIN")
+        return _logical_hash(db)
+    finally:
+        if db.in_transaction:
+            db.rollback()
+        db.close()
 
 
 def _columns(db: sqlite3.Connection, table: str) -> list[str]:
@@ -281,6 +345,55 @@ def _existing_counts(path: Path) -> dict[str, int]:
         }
     finally:
         db.close()
+
+
+def _core_counts_open(db: sqlite3.Connection) -> dict[str, int]:
+    tables = {
+        str(row[0])
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    return {
+        table: (
+            int(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            if table in tables else 0
+        )
+        for table in CORE_TABLES
+    }
+
+
+def _assert_reapply_authority(
+    db: sqlite3.Connection,
+    *,
+    profile: Profile,
+    manifest: dict,
+) -> None:
+    """Reject reuse when the currently authoritative generation has drifted."""
+
+    if profile.database_ref == manifest.get("rollback_ref"):
+        expected = manifest.get("rollback_baseline_hash") or manifest["source_hash"]
+        if _logical_hash(db) != expected:
+            raise MigrationError(
+                "SB_MIGRATION_AUTHORITY_CHANGED",
+                "rollback 后的当前权威数据库已有新写入，不能复用陈旧 v2 世代",
+                hint="保留当前 database_ref；以该权威库规划新的迁移",
+            )
+        return
+    if profile.database_ref == manifest.get("previous_database_ref"):
+        counts = _core_counts_open(db)
+        if any(counts.values()):
+            raise MigrationError(
+                "SB_MIGRATION_AUTHORITY_CHANGED",
+                f"切换前的当前权威数据库已有新数据: {counts}",
+                hint="迁移到新的空 Profile，或先合并权威数据",
+            )
+        return
+    raise MigrationError(
+        "SB_MIGRATION_ACTIVE_GENERATION_CHANGED",
+        "当前 Profile 已指向其他数据库世代，不能复用该迁移产物",
+        hint="查看 storybook migration status 后重新规划",
+    )
 
 
 def discover_legacy_databases(
@@ -526,10 +639,13 @@ class MigrationManager:
         try:
             source_db = _read_only(source_path)
             try:
+                source_db.execute("BEGIN")
                 _validate_v1_schema(source_db)
                 source_hash = _logical_hash(source_db)
                 counts = _counts(source_db)
             finally:
+                if source_db.in_transaction:
+                    source_db.rollback()
                 source_db.close()
         except sqlite3.Error as exc:
             raise MigrationError(
@@ -600,16 +716,53 @@ class MigrationManager:
                 validation = _validate_transformed(
                     backup, destination, profile.id
                 )
-                self.registry.set_profile_database(
-                    profile.id, plan["generation_ref"]
-                )
-                if self.registry is config.PROFILE_REGISTRY:
-                    config.refresh_profile(profile.id)
-                existing.update({
-                    "status": "activated",
-                    "activated_at": _timestamp(_utc_now()),
-                })
-                _atomic_json(manifest_path, existing)
+                authority_path = self.registry.paths_for(profile).database
+
+                def activate_existing() -> None:
+                    with _cutover_guard(
+                        Path(plan["source"]),
+                        busy_code="SB_MIGRATION_SOURCE_BUSY",
+                        label="旧源库",
+                    ) as live_source:
+                        _validate_v1_schema(live_source)
+                        if _logical_hash(live_source) != plan["source_hash"]:
+                            raise MigrationError(
+                                "SB_MIGRATION_SOURCE_CHANGED",
+                                "旧源库在切换前发生变化",
+                                hint="registry 未切换；重新规划迁移",
+                            )
+                        self.registry.set_profile_database(
+                            profile.id,
+                            plan["generation_ref"],
+                            expected_database_ref=profile.database_ref,
+                        )
+                        if self.registry is config.PROFILE_REGISTRY:
+                            config.refresh_profile(profile.id)
+                        existing.update({
+                            "status": "activated",
+                            "activated_at": _timestamp(_utc_now()),
+                        })
+                        _atomic_json(manifest_path, existing)
+
+                if authority_path.is_file():
+                    with _cutover_guard(
+                        authority_path,
+                        busy_code="SB_MIGRATION_AUTHORITY_BUSY",
+                        label="当前权威库",
+                    ) as authority_db:
+                        _assert_reapply_authority(
+                            authority_db,
+                            profile=profile,
+                            manifest=existing,
+                        )
+                        activate_existing()
+                elif profile.database_ref == existing.get("previous_database_ref"):
+                    activate_existing()
+                else:
+                    raise MigrationError(
+                        "SB_MIGRATION_ACTIVE_GENERATION_CHANGED",
+                        "当前权威数据库不存在或已切换，不能复用迁移产物",
+                    )
                 return {
                     **plan, "dry_run": False, "status": "reapplied",
                     "validation": validation,
@@ -666,8 +819,6 @@ class MigrationManager:
                     history_db.close()
                 validation = _validate_transformed(backup, stage, profile.id)
                 _seal_sqlite(stage)
-                os.replace(stage, destination)
-                _private_file(destination)
                 now = _timestamp(_utc_now())
                 manifest = {
                     "migration_id": migration_id,
@@ -685,14 +836,53 @@ class MigrationManager:
                     "status": "validated",
                     "created_at": now,
                 }
-                _atomic_json(manifest_path, manifest)
-                self.registry.set_profile_database(
-                    profile.id, plan["generation_ref"]
-                )
-                if self.registry is config.PROFILE_REGISTRY:
-                    config.refresh_profile(profile.id)
-                manifest.update({"status": "activated", "activated_at": now})
-                _atomic_json(manifest_path, manifest)
+
+                def cutover() -> None:
+                    with _cutover_guard(
+                        source_path,
+                        busy_code="SB_MIGRATION_SOURCE_BUSY",
+                        label="旧源库",
+                    ) as live_source:
+                        _validate_v1_schema(live_source)
+                        if _logical_hash(live_source) != plan["source_hash"]:
+                            raise MigrationError(
+                                "SB_MIGRATION_SOURCE_CHANGED",
+                                "旧数据库在 backup 后、切换前发生变化",
+                                hint="registry 未切换；重新运行 dry-run 后重试",
+                            )
+                        os.replace(stage, destination)
+                        _private_file(destination)
+                        _atomic_json(manifest_path, manifest)
+                        self.registry.set_profile_database(
+                            profile.id,
+                            plan["generation_ref"],
+                            expected_database_ref=profile.database_ref,
+                        )
+                        if self.registry is config.PROFILE_REGISTRY:
+                            config.refresh_profile(profile.id)
+                        manifest.update({
+                            "status": "activated",
+                            "activated_at": now,
+                        })
+                        _atomic_json(manifest_path, manifest)
+
+                authority_path = self.registry.paths_for(profile).database
+                if authority_path.is_file():
+                    with _cutover_guard(
+                        authority_path,
+                        busy_code="SB_MIGRATION_AUTHORITY_BUSY",
+                        label="当前 Profile 权威库",
+                    ) as authority_db:
+                        counts = _core_counts_open(authority_db)
+                        if any(counts.values()):
+                            raise MigrationError(
+                                "SB_MIGRATION_AUTHORITY_CHANGED",
+                                f"当前 Profile 在迁移期间新增数据: {counts}",
+                                hint="registry 未切换；迁移到新的空 Profile",
+                            )
+                        cutover()
+                else:
+                    cutover()
                 return {
                     **plan,
                     "dry_run": False,
@@ -753,12 +943,18 @@ class MigrationManager:
                 _private_file(rollback_db)
             finally:
                 rollback_tmp.unlink(missing_ok=True)
-            self.registry.set_profile_database(profile.id, rollback_ref)
+            rollback_baseline_hash = _hash_database(rollback_db)
+            self.registry.set_profile_database(
+                profile.id,
+                rollback_ref,
+                expected_database_ref=str(manifest["generation_ref"]),
+            )
             if self.registry is config.PROFILE_REGISTRY:
                 config.refresh_profile(profile.id)
             manifest.update({
                 "status": "rolled_back",
                 "rolled_back_at": _timestamp(_utc_now()),
+                "rollback_baseline_hash": rollback_baseline_hash,
             })
             _atomic_json(manifest_path, manifest)
             return {

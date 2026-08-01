@@ -434,8 +434,18 @@ class ProfileRegistry:
         self.ensure_profile_directories(profile)
         return profile
 
-    def set_profile_database(self, ref: str, database_ref: str) -> Profile:
-        """Atomically point one Profile at a managed database generation."""
+    def set_profile_database(
+        self,
+        ref: str,
+        database_ref: str,
+        *,
+        expected_database_ref: str | None = None,
+    ) -> Profile:
+        """Atomically point one Profile at a managed database generation.
+
+        ``expected_database_ref`` adds compare-and-swap semantics for migration
+        cut-over, preventing a concurrent Profile change from being overwritten.
+        """
 
         validated = self._validate_database_ref(database_ref)
         with self._locked():
@@ -443,6 +453,13 @@ class ProfileRegistry:
             if state is None:
                 raise ProfileError("Profile registry 尚未初始化")
             selected = self.resolve(ref, state)
+            if (
+                expected_database_ref is not None
+                and selected.database_ref != expected_database_ref
+            ):
+                raise ProfileError(
+                    "Profile database_ref 已变化；拒绝覆盖并发切换"
+                )
             updated = replace(selected, database_ref=validated)
             state["profiles"] = [
                 updated if profile.id == selected.id else profile

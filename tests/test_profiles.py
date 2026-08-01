@@ -158,6 +158,24 @@ class TestProfileRegistry:
         payload = json.loads(registry.path.read_text(encoding="utf-8"))
         assert str(tmp_path) not in json.dumps(payload)
 
+    def test_database_generation_pointer_compare_and_swap_rejects_drift(
+        self, tmp_path
+    ):
+        registry = ProfileRegistry(
+            tmp_path / "config" / "profiles.json", roots=_roots(tmp_path)
+        )
+        profile = registry.active_profile()
+        registry.set_profile_database(profile.id, "migrations/a/v2.db")
+
+        with pytest.raises(ProfileError, match="已变化"):
+            registry.set_profile_database(
+                profile.id,
+                "migrations/b/v2.db",
+                expected_database_ref="db/memory.db",
+            )
+
+        assert registry.active_profile().database_ref == "migrations/a/v2.db"
+
     @pytest.mark.parametrize(
         "database_ref",
         ["/tmp/memory.db", "C:/temp/memory.db", "../memory.db", "db/not-sqlite"],

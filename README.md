@@ -155,7 +155,10 @@ storybook sync status                     # v0.2 明确显示 local_only、跨�
 Session、Story、edge 及关系必须逐项等量；已有 embedding 会进入 sqlite-vec serving
 索引并执行真实查询 smoke test。v1 `content` 原样保存在 `legacy_raw`，Story v2 detail/source
 同步生成，`abstract_status=pending` 留给后续异步补全。所有检查通过后，才以一次原子
-registry 写入切换 `database_ref`，因此失败不会改变旧库权威，也不会发生新旧双写。
+registry CAS 切换 `database_ref`。切换前会在 SQLite 单写者边界内再次核对源库逻辑
+hash；backup 后的提交会使迁移明确失败，活动写事务也会阻止切换。只读源库使用稳定
+读事务做同一 CAS。rollback 副本另存基线 hash，若回滚后产生新写入，重复迁移会拒绝
+复用陈旧 v2 世代。因此失败不会改变旧库权威，也不会静默覆盖回滚后的权威数据。
 
 ```bash
 storybook migration discover --json
