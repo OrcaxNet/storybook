@@ -83,7 +83,29 @@ def expand(
     cycles_suppressed = 0
     path_policy_suppressed = 0
 
-    if not seeds or not max_hops or not max_paths or not fan_out:
+    if not seeds:
+        return _result(
+            candidates, seed_ids, started, reasons,
+            path_count=0, token_used=0, cycles_suppressed=0,
+            path_policy_suppressed=0, budgets={
+                "max_hops": max_hops,
+                "max_paths": max_paths,
+                "fan_out": fan_out,
+                "time_ms": time_budget_ms,
+                "tokens": token_budget,
+            },
+        )
+    zero_budget_reasons = {
+        reason
+        for value, reason in (
+            (max_hops, "hop_budget"),
+            (max_paths, "path_budget"),
+            (fan_out, "fan_out"),
+        )
+        if value == 0
+    }
+    if zero_budget_reasons:
+        reasons.update(zero_budget_reasons)
         return _result(
             candidates, seed_ids, started, reasons,
             path_count=0, token_used=0, cycles_suppressed=0,
@@ -101,18 +123,34 @@ def expand(
         if time.perf_counter() >= deadline:
             reasons.add("time_budget")
             break
-        adjacency = store.get_graph_neighbors_batch(
-            [state.node_id for state in frontier], fan_out=fan_out
-        )
-        if any(len(items) >= fan_out for items in adjacency.values()):
-            reasons.add("fan_out")
+        policy_groups: dict[frozenset[str], list[int]] = {}
+        state_policy: dict[int, frozenset[str]] = {}
+        for state in frontier:
+            previous_type = state.path[-1]["edge_type"] if state.path else None
+            allowed_types = frozenset(
+                _allowed_edge_types(previous_type, hop)
+            )
+            state_policy[id(state)] = allowed_types
+            policy_groups.setdefault(allowed_types, []).append(state.node_id)
+        adjacency_by_policy = {
+            allowed_types: store.get_graph_neighbors_batch(
+                node_ids,
+                fan_out=fan_out,
+                allowed_edge_types=allowed_types,
+            )
+            for allowed_types, node_ids in policy_groups.items()
+        }
         if time.perf_counter() >= deadline:
             reasons.add("time_budget")
             break
         next_frontier: list[_State] = []
         for state in frontier:
             previous_type = state.path[-1]["edge_type"] if state.path else None
-            for neighbor in adjacency.get(state.node_id, []):
+            snapshot = adjacency_by_policy[state_policy[id(state)]][state.node_id]
+            path_policy_suppressed += snapshot["policy_suppressed"]
+            if snapshot["fan_out_truncated"]:
+                reasons.add("fan_out")
+            for neighbor in snapshot["items"]:
                 if time.perf_counter() >= deadline:
                     reasons.add("time_budget")
                     stop = True
@@ -314,6 +352,21 @@ def _allowed_transition(
     if previous_type == edge_type == "supersedes":
         return False
     return True
+
+
+def _allowed_edge_types(previous_type: str | None, hop: int) -> set[str]:
+    """Return path-policy types before storage applies the fan-out LIMIT."""
+
+    allowed = set(config.GRAPH_EDGE_TYPE_FACTORS)
+    if previous_type in {"co_recall", "sibling"}:
+        return set()
+    if hop > 1:
+        allowed.difference_update({"co_recall", "sibling"})
+    if previous_type == "same_environment":
+        allowed.discard("same_environment")
+    if previous_type == "supersedes":
+        allowed.discard("supersedes")
+    return allowed
 
 
 def _direction_factor(edge: dict) -> float:

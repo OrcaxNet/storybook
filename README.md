@@ -208,10 +208,10 @@ python scripts/eval.py retrieval                # 等价独立脚本（未做 ed
 
 Story v2 固定报告（2026-08-02，`data/eval_reports/story-v2-ablation-2026-08-02.json`）：四种表示在 24 topic × 4 分组上 recall@3/MRR 均为 100%；默认表示相对 legacy 为 `0.00pp`，通过“下降不超过 2pp”门槛。默认单向量索引均值 84.4ms/story，明显低于全文 205.2ms 与多向量 223.7ms；多向量检索 p95 0.94ms，高于默认 0.34ms，因此选择默认表示。
 
-Memory Graph 固定报告（2026-08-02，`data/eval_reports/memory-graph-2026-08-02.json`）覆盖七类边、单/多跳和负例：人工关联子集中 vector-only → Graph RAG 的 recall@5 为 `0% → 100%`，overall recall@3 为 `100% → 100%`；10k active Story、10,063 条边、50 次扩散的 `graph_ms p95=1.954ms`。可用以下命令复现（无需 Ollama）：
+Memory Graph 固定报告（2026-08-02，`data/eval_reports/memory-graph-2026-08-02.json`）覆盖七类边、单/多跳和负例：人工关联子集中 vector-only → Graph RAG 的 recall@5 为 `0% → 100%`，overall recall@3 为 `100% → 100%`；10k active Story、10,063 条边、100 次扩散的 `graph_ms p95=2.387ms`。可用以下命令复现（无需 Ollama）：
 
 ```bash
-python -m storybook.graph_eval --stories 10000 --repeats 50 \
+python -m storybook.graph_eval --stories 10000 --repeats 100 \
   --output data/eval_reports/memory-graph.json
 ```
 

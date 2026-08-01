@@ -2187,24 +2187,76 @@ def get_related_stories_batch(
 
 
 def get_graph_neighbors_batch(
-    story_ids: list[int], *, fan_out: int
-) -> dict[int, list[dict]]:
-    """为一层图扩散读取有界邻接快照。
+    story_ids: list[int],
+    *,
+    fan_out: int,
+    allowed_edge_types: set[str] | frozenset[str] | None = None,
+) -> dict[int, dict]:
+    """为一层图扩散读取已通过方向/路径策略的有界邻接快照。
 
-    一次调用只打开一个连接，每个节点最多返回 ``fan_out`` 条
-    活跃边。返回的 provenance/version/direction 可直接进入召回路径。
+    fan-out 必须在方向和路径类型过滤之后执行：否则不可遍历的
+    高权入边会占满 LIMIT，使合法出边饥饿。返回值为
+    ``{story_id: {items, policy_suppressed, fan_out_truncated}}``。
     """
 
     unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
-    output = {story_id: [] for story_id in unique_ids}
+    output = {
+        story_id: {
+            "items": [],
+            "policy_suppressed": 0,
+            "fan_out_truncated": False,
+        }
+        for story_id in unique_ids
+    }
     fan_out = max(0, int(fan_out))
     if not unique_ids or fan_out == 0:
         return output
+    allowed = sorted(
+        set(config.GRAPH_EDGE_TYPE_FACTORS)
+        if allowed_edge_types is None else set(allowed_edge_types)
+    )
     db = get_db(load_vector_extension=False)
     try:
         for story_id in unique_ids:
+            type_clause = (
+                f"e.edge_type IN ({','.join('?' for _ in allowed)})"
+                if allowed else "0"
+            )
+            direction_clause = """(
+                e.directed = 0
+                OR e.edge_type = 'parent_child'
+                OR (e.edge_type = 'supersedes' AND e.target_id = ?)
+                OR (
+                    e.directed = 1
+                    AND e.edge_type NOT IN ('parent_child', 'supersedes')
+                    AND e.source_id = ?
+                )
+            )"""
+            counts = db.execute(
+                f"""SELECT COUNT(*) AS total,
+                           COALESCE(SUM(CASE
+                               WHEN {direction_clause} AND {type_clause}
+                               THEN 1 ELSE 0 END), 0) AS eligible
+                    FROM edges e
+                    JOIN stories s ON s.id = CASE
+                        WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
+                    WHERE (e.source_id = ? OR e.target_id = ?)
+                      AND e.deleted_at IS NULL
+                      AND s.embedding_status != 'archived'""",
+                (
+                    story_id, story_id, *allowed,
+                    story_id, story_id, story_id,
+                ),
+            ).fetchone()
+            eligible_count = int(counts["eligible"] or 0)
+            output[story_id]["policy_suppressed"] = max(
+                0, int(counts["total"] or 0) - eligible_count
+            )
+            output[story_id]["fan_out_truncated"] = eligible_count > fan_out
+            if eligible_count == 0:
+                continue
             rows = db.execute(
-                """SELECT e.*, s.id AS story_id, s.title, s.abstract, s.content,
+                f"""SELECT e.*, s.id AS story_id, s.title, s.abstract, s.content,
                           s.keywords, s.applicability_json,
                           s.environment_summary_json,
                           (SELECT COUNT(*) FROM edges degree
@@ -2217,9 +2269,16 @@ def get_graph_neighbors_batch(
                    WHERE (e.source_id = ? OR e.target_id = ?)
                      AND e.deleted_at IS NULL
                      AND s.embedding_status != 'archived'
+                     AND {direction_clause}
+                     AND {type_clause}
                    ORDER BY e.weight DESC, e.id
                    LIMIT ?""",
-                (story_id, story_id, story_id, fan_out),
+                (
+                    story_id, story_id, story_id,
+                    story_id, story_id,
+                    *allowed,
+                    fan_out,
+                ),
             ).fetchall()
             items = []
             for row in rows:
@@ -2258,7 +2317,7 @@ def get_graph_neighbors_batch(
                         "updated_at": row["updated_at"],
                     },
                 })
-            output[story_id] = items
+            output[story_id]["items"] = items
         return output
     finally:
         db.close()
