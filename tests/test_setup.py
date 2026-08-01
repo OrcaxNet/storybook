@@ -107,6 +107,135 @@ def test_dry_run_fresh_home_performs_zero_writes(tmp_path):
     assert list(user_home.iterdir()) == []
 
 
+def test_auto_detection_empty_home_and_path_selects_no_agents(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "STORYBOOK_HOME": str(storybook_home),
+            "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
+            "PATH": "",
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "storybook.cli", "setup", "--dry-run", "--json"],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    adapters = payload["plan"]["adapters"]
+    assert all(not item["detected"] for item in adapters)
+    assert all(not item["selected"] for item in adapters)
+    assert payload["plan"]["writes"] == []
+    assert payload["writes_performed"] == 0
+    assert not storybook_home.exists()
+    assert list(user_home.iterdir()) == []
+
+
+@pytest.mark.parametrize("signal", ["config", "directory", "executable"])
+def test_auto_detection_selects_claude_for_each_install_signal(tmp_path, signal):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    executable_dir = tmp_path / "bin"
+    path_value = ""
+    if signal == "config":
+        (user_home / ".claude.json").write_text("{}\n", encoding="utf-8")
+    elif signal == "directory":
+        (user_home / ".claude").mkdir()
+    else:
+        executable_dir.mkdir()
+        executable = executable_dir / "claude"
+        executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        executable.chmod(0o755)
+        path_value = str(executable_dir)
+    env = os.environ.copy()
+    env.update(
+        {
+            "STORYBOOK_HOME": str(storybook_home),
+            "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
+            "PATH": path_value,
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "storybook.cli", "setup", "--dry-run", "--json"],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    claude = next(
+        item for item in payload["plan"]["adapters"] if item["adapter"] == "claude"
+    )
+    assert claude["detected"] is True
+    assert claude["selected"] is True
+    assert payload["writes_performed"] == 0
+    assert not storybook_home.exists()
+
+
+def test_explicit_claude_selection_overrides_missing_detection_signals(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    env = os.environ.copy()
+    env.update(
+        {
+            "STORYBOOK_HOME": str(storybook_home),
+            "HOME": str(user_home),
+            "CODEX_HOME": str(user_home / ".codex"),
+            "PATH": "",
+            "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+        }
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "storybook.cli",
+            "setup",
+            "--dry-run",
+            "--json",
+            "--agent",
+            "claude",
+        ],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    claude = next(
+        item for item in payload["plan"]["adapters"] if item["adapter"] == "claude"
+    )
+    assert claude["detected"] is False
+    assert claude["selected"] is True
+    assert payload["plan"]["writes"] == claude["targets"]
+    assert payload["writes_performed"] == 0
+    assert not storybook_home.exists()
+    assert list(user_home.iterdir()) == []
+
+
 def test_setup_merges_all_agents_is_idempotent_and_uninstall_keeps_data(
     isolated_setup,
 ):

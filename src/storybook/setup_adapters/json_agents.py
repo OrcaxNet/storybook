@@ -142,6 +142,15 @@ class ClaudeCodeAdapter(JsonMCPAdapter):
     def settings_path(self, context: AdapterContext) -> Path:
         return context.home / ".claude" / "settings.json"
 
+    def detected(self, context: AdapterContext) -> bool:
+        config_exists = self.config_path(context).is_file()
+        claude_home_exists = self.settings_path(context).parent.is_dir()
+        search_path = context.environ.get("PATH", "")
+        executable_exists = bool(search_path) and shutil.which(
+            "claude", path=search_path
+        ) is not None
+        return config_exists or claude_home_exists or executable_exists
+
     def managed_hook(self, context: AdapterContext) -> dict[str, Any]:
         parts = [context.launcher.command, *context.launcher.args, "prime"]
         prefix = subprocess.list2cmdline(parts) if os.name == "nt" else shlex.join(parts)
