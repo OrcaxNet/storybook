@@ -80,7 +80,7 @@
 
 ## 三、数据模型设计
 
-> Story v2（FLO-89）更新：以下 schema 示例保留核心列用于阅读；运行时 `_SCHEMA` 还包含 Profile/ContextEnvelope 字段。Story 的持久边界不再是 400 字，完整 detail/source 不截断；abstract 是独立预算字段。
+> Story v2（FLO-89）与 local-only 事件模型（FLO-91）更新：以下 schema 示例保留核心列用于阅读；运行时 `_SCHEMA` 还包含 Profile/ContextEnvelope 字段。Story 的持久边界不再是 400 字，完整 detail/source 不截断；abstract 是独立预算字段。新实体与事件使用 UUIDv7 全局 ID。
 
 ### 3.1 SQLite Schema
 
@@ -115,6 +115,8 @@ CREATE TABLE stories (
     source_session_ids TEXT,       -- 来源会话ID(JSON array)
     access_count INTEGER DEFAULT 0,-- 被检索命中次数
     version INTEGER DEFAULT 1,     -- 版本号，每次更新+1
+    deleted_at TEXT,               -- 非空即 tombstone，默认检索不可见
+    tombstone_event_id TEXT,       -- 对应 terminal delete event
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (parent_id) REFERENCES stories(id)
@@ -141,6 +143,35 @@ CREATE VIRTUAL TABLE story_vectors USING vec0(
 
 -- immutable create/update/merge/split snapshots
 CREATE TABLE story_revisions (...);
+
+-- append-only portable metadata envelope; no Story text or raw source locator
+CREATE TABLE memory_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,       -- UUIDv7
+    profile_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL,           -- v0.2: story
+    entity_id TEXT NOT NULL,             -- Story UUIDv7 global_id
+    base_version INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    device_id TEXT NOT NULL,
+    operation TEXT NOT NULL,             -- create/update/merge/split/delete
+    payload_json TEXT NOT NULL,           -- hashes + relationship UUIDs only
+    payload_ciphertext BLOB,              -- future encrypted revision payload
+    encryption_key_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(entity_type, entity_id, version)
+);
+
+-- terminal delete projection; replay is delete-wins
+CREATE TABLE memory_tombstones (
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    deleted_event_id TEXT NOT NULL UNIQUE,
+    deleted_version INTEGER NOT NULL,
+    device_id TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    PRIMARY KEY(entity_type, entity_id)
+);
 
 -- resumable shadow build; serving story_vectors is switched only when complete
 CREATE TABLE story_embedding_backfill (...);

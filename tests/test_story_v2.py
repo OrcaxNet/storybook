@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 
 import numpy as np
 import pytest
@@ -283,6 +284,13 @@ def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch
     store.init_db()
 
     migrated = store.get_story(1)
+    migration_events = store.get_memory_events(1)
+    assert len(migration_events) == 1
+    assert migration_events[0]["operation"] == "create"
+    assert migration_events[0]["base_version"] == 0
+    assert migration_events[0]["version"] == migrated["version"]
+    assert uuid.UUID(migration_events[0]["event_id"]).version == 7
+    assert uuid.UUID(migrated["global_id"]).version == 7
     initial_state = store.get_embedding_index_state()
     assert migrated["embedding_status"] == "stale"
     assert migrated["embedding_version"] is None
@@ -301,3 +309,6 @@ def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch
     assert switched["embedding_status"] == "active"
     assert switched["embedding_version"] == config.EMBED_VERSION
     assert switched["embedding_content_hash"] == story_v2.content_hash(switched)
+    assert [
+        event["operation"] for event in store.get_memory_events(1)
+    ] == ["create", "update"]

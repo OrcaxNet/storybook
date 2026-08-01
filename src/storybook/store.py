@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import time
-import uuid
+import hashlib
 from itertools import combinations
 from pathlib import Path
 from typing import Optional
@@ -18,6 +18,8 @@ import numpy as np
 from . import config
 from . import context as context_module
 from . import story_v2
+from .identifiers import new_uuid7
+from . import memory_events
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,8 @@ CREATE TABLE IF NOT EXISTS stories (
     environment_summary_json TEXT NOT NULL DEFAULT '[]',
     access_count INTEGER DEFAULT 0,
     version INTEGER DEFAULT 1,
+    deleted_at TEXT,
+    tombstone_event_id TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (parent_id) REFERENCES stories(id)
@@ -154,6 +158,62 @@ CREATE TABLE IF NOT EXISTS story_revisions (
 CREATE INDEX IF NOT EXISTS idx_story_revisions_story
     ON story_revisions(story_id, story_version);
 
+-- Portable, append-only event envelope.  Clear-text payload_json contains only
+-- privacy-safe metadata/hashes; a future transport can attach encrypted Story
+-- material without serializing SQLite pages.
+CREATE TABLE IF NOT EXISTS memory_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('story')),
+    entity_id TEXT NOT NULL,
+    base_version INTEGER NOT NULL CHECK(base_version >= 0),
+    version INTEGER NOT NULL CHECK(version > base_version),
+    device_id TEXT NOT NULL,
+    operation TEXT NOT NULL
+        CHECK(operation IN ('create', 'update', 'merge', 'split', 'delete')),
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    payload_ciphertext BLOB,
+    encryption_key_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(entity_type, entity_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_memory_events_entity
+    ON memory_events(entity_type, entity_id, version);
+CREATE INDEX IF NOT EXISTS idx_memory_events_created
+    ON memory_events(created_at, event_id);
+
+-- Deletion is an explicit terminal projection, independent from the mutable
+-- stories row.  Keeping it separate makes delete-wins replay cheap and clear.
+CREATE TABLE IF NOT EXISTS memory_tombstones (
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('story')),
+    entity_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    deleted_event_id TEXT NOT NULL UNIQUE,
+    deleted_version INTEGER NOT NULL CHECK(deleted_version > 0),
+    device_id TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    PRIMARY KEY(entity_type, entity_id),
+    FOREIGN KEY(deleted_event_id) REFERENCES memory_events(event_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS memory_events_no_update
+BEFORE UPDATE ON memory_events BEGIN
+    SELECT RAISE(ABORT, 'memory_events are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS memory_events_no_delete
+BEFORE DELETE ON memory_events BEGIN
+    SELECT RAISE(ABORT, 'memory_events are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS memory_tombstones_no_update
+BEFORE UPDATE ON memory_tombstones BEGIN
+    SELECT RAISE(ABORT, 'memory_tombstones are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS memory_tombstones_no_delete
+BEFORE DELETE ON memory_tombstones BEGIN
+    SELECT RAISE(ABORT, 'memory_tombstones are immutable');
+END;
+
 -- ``story_vectors`` is the active serving index.  A new model/version is built
 -- here first; activation copies a complete shadow set into the active index in
 -- one transaction, so failed or partial backfills never disturb recall.
@@ -226,6 +286,7 @@ def init_db():
         _ensure_identity_columns(db)
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
+        _ensure_memory_event_backfill(db)
         _ensure_fts_index(db)
         # 创建 sqlite-vec 虚拟表
         db.execute(f"""
@@ -343,7 +404,7 @@ def _bump_index_version(db: sqlite3.Connection) -> int:
 def _new_global_id() -> str:
     """生成不依赖路径、hostname 或数据库自增键的全局对象 ID。"""
 
-    return str(uuid.uuid4())
+    return new_uuid7()
 
 
 def _ensure_identity_columns(db: sqlite3.Connection) -> None:
@@ -513,6 +574,8 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
         "embedding_version": "TEXT",
         "embedding_content_hash": "TEXT",
         "embedding_status": "TEXT NOT NULL DEFAULT 'active'",
+        "deleted_at": "TEXT",
+        "tombstone_event_id": "TEXT",
     }
     original_columns = {
         row["name"] for row in db.execute("PRAGMA table_info(stories)").fetchall()
@@ -643,6 +706,9 @@ def _revision_snapshot(row: sqlite3.Row | dict) -> dict:
         "embedding_content_hash": data.get("embedding_content_hash"),
         "embedding_status": data.get("embedding_status"),
         "parent_id": data.get("parent_id"),
+        "version": data.get("version"),
+        "deleted_at": data.get("deleted_at"),
+        "tombstone_event_id": data.get("tombstone_event_id"),
     }
 
 
@@ -667,6 +733,150 @@ def _record_revision(
             row["source_session_ids"] or "[]",
         ),
     )
+
+
+_EVENT_CHANGED_FIELDS = frozenset({
+    "abstract", "applicability", "content", "deleted_at", "detail",
+    "embedding", "embedding_content_hash", "embedding_model",
+    "embedding_status", "embedding_version", "keywords", "parent",
+    "sources", "title", "tombstone",
+})
+
+
+def _memory_event_payload(
+    db: sqlite3.Connection,
+    row: sqlite3.Row,
+    event_type: str,
+    changed_fields: list[str] | tuple[str, ...] | None,
+) -> dict:
+    """Build a metadata-only payload without copying user-controlled text."""
+
+    snapshot = _revision_snapshot(row)
+    revision_bytes = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    source_ids = _json_load(row["source_session_ids"], [])
+    source_entity_ids: list[str] = []
+    if source_ids:
+        normalized_ids = [
+            int(value) for value in source_ids
+            if isinstance(value, int) or str(value).isdigit()
+        ]
+        if normalized_ids:
+            placeholders = ",".join("?" for _ in normalized_ids)
+            source_entity_ids = [
+                source["global_id"]
+                for source in db.execute(
+                    f"SELECT global_id FROM sessions "
+                    f"WHERE id IN ({placeholders}) ORDER BY id",
+                    normalized_ids,
+                ).fetchall()
+                if source["global_id"]
+            ]
+    parent_entity_id = None
+    if row["parent_id"] is not None:
+        parent = db.execute(
+            "SELECT global_id FROM stories WHERE id = ?", (row["parent_id"],)
+        ).fetchone()
+        if parent is not None:
+            parent_entity_id = parent["global_id"]
+
+    safe_fields = sorted({
+        field for field in (changed_fields or ())
+        if field in _EVENT_CHANGED_FIELDS
+    })
+    return {
+        "schema_version": memory_events.SCHEMA_VERSION,
+        "revision_type": (
+            event_type
+            if event_type in {
+                "create", "update", "merge", "split_child", "split_source",
+                "split_parent", "source_update", "embedding_switch", "delete",
+                "migrate",
+            }
+            else "update"
+        ),
+        "changed_fields": safe_fields,
+        "revision_sha256": hashlib.sha256(revision_bytes).hexdigest(),
+        "relationships": {
+            "parent_entity_id": parent_entity_id,
+            "source_entity_ids": source_entity_ids,
+        },
+        "tombstone": row["deleted_at"] is not None,
+    }
+
+
+def _record_memory_event(
+    db: sqlite3.Connection,
+    story_id: int,
+    event_type: str,
+    *,
+    base_version: int,
+    changed_fields: list[str] | tuple[str, ...] | None = None,
+    event_id: str | None = None,
+    created_at: str | None = None,
+) -> str | None:
+    row = db.execute("SELECT * FROM stories WHERE id = ?", (story_id,)).fetchone()
+    if row is None:
+        return None
+    event_id = event_id or new_uuid7()
+    created_at = created_at or context_module.utc_now()
+    device_id = context_module.local_device_id()
+    operation = memory_events.operation_for_event_type(event_type)
+    payload = _memory_event_payload(db, row, event_type, changed_fields)
+    db.execute(
+        """INSERT INTO memory_events (
+               event_id, profile_id, entity_type, entity_id,
+               base_version, version, device_id, operation,
+               payload_json, created_at
+           ) VALUES (?, ?, 'story', ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            event_id, row["profile_id"], row["global_id"], base_version,
+            row["version"], device_id, operation,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True), created_at,
+        ),
+    )
+    return event_id
+
+
+def _ensure_memory_event_backfill(db: sqlite3.Connection) -> None:
+    """Create one portable baseline event for pre-event-model Story rows."""
+
+    rows = db.execute(
+        """SELECT s.* FROM stories s
+           WHERE NOT EXISTS (
+               SELECT 1 FROM memory_events e
+               WHERE e.entity_type = 'story' AND e.entity_id = s.global_id
+           )
+           ORDER BY s.id"""
+    ).fetchall()
+    for row in rows:
+        deleted = row["deleted_at"] is not None
+        event_type = "delete" if deleted else "migrate"
+        base_version = max(0, row["version"] - 1) if deleted else 0
+        event_id = _record_memory_event(
+            db,
+            row["id"],
+            event_type,
+            base_version=base_version,
+            changed_fields=("tombstone", "deleted_at") if deleted else (),
+            event_id=row["tombstone_event_id"] if deleted else None,
+            created_at=row["deleted_at"] if deleted else None,
+        )
+        if deleted and event_id:
+            event = db.execute(
+                "SELECT * FROM memory_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            db.execute(
+                """INSERT OR IGNORE INTO memory_tombstones (
+                       entity_type, entity_id, profile_id, deleted_event_id,
+                       deleted_version, device_id, deleted_at
+                   ) VALUES ('story', ?, ?, ?, ?, ?, ?)""",
+                (
+                    row["global_id"], row["profile_id"], event_id,
+                    row["version"], event["device_id"], event["created_at"],
+                ),
+            )
 
 
 def _upsert_context_dimensions(db: sqlite3.Connection, envelope: dict) -> None:
@@ -951,7 +1161,7 @@ def stories_pending_embedding_backfill(
     try:
         rows = db.execute(
             """SELECT s.* FROM stories s
-               WHERE s.embedding_status != 'archived'
+               WHERE s.embedding_status != 'archived' AND s.deleted_at IS NULL
                ORDER BY s.id"""
         ).fetchall()
         pending = []
@@ -1033,7 +1243,8 @@ def embedding_backfill_progress(version: str, representation: str) -> dict:
     try:
         stories = db.execute(
             """SELECT * FROM stories
-               WHERE embedding_status != 'archived' ORDER BY id"""
+               WHERE embedding_status != 'archived' AND deleted_at IS NULL
+               ORDER BY id"""
         ).fetchall()
         ready = failed = 0
         stale_ids = []
@@ -1082,7 +1293,8 @@ def activate_embedding_backfill(
         db.execute("BEGIN IMMEDIATE")
         stories = db.execute(
             """SELECT * FROM stories
-               WHERE embedding_status != 'archived' ORDER BY id"""
+               WHERE embedding_status != 'archived' AND deleted_at IS NULL
+               ORDER BY id"""
         ).fetchall()
         rows = []
         for story_row in stories:
@@ -1126,6 +1338,16 @@ def activate_embedding_backfill(
                 ),
             )
             _record_revision(db, row["id"], "embedding_switch")
+            _record_memory_event(
+                db,
+                row["id"],
+                "embedding_switch",
+                base_version=int(story["version"]),
+                changed_fields=(
+                    "embedding", "embedding_model", "embedding_version",
+                    "embedding_content_hash", "embedding_status",
+                ),
+            )
         db.execute(
             """UPDATE embedding_index_state
                SET active_model = ?, active_version = ?,
@@ -1330,6 +1552,18 @@ def add_story(title: str, content: str, keywords: list[str],
             (story_id, emb_blob)
         )
         _record_revision(db, story_id, event_type)
+        _record_memory_event(
+            db,
+            story_id,
+            event_type,
+            base_version=0,
+            changed_fields=(
+                "title", "abstract", "content", "detail", "sources",
+                "keywords", "embedding", "embedding_model",
+                "embedding_version", "embedding_content_hash",
+                "embedding_status", "parent", "applicability",
+            ),
+        )
         _bump_index_version(db)
         db.commit()
         logger.info("新建 story #%d: %s", story_id, title)
@@ -1352,21 +1586,26 @@ def update_story(story_id: int, title: str = None, content: str = None,
     """Update a Story and append an immutable version event."""
     db = get_db()
     try:
+        db.execute("BEGIN IMMEDIATE")
         current = db.execute(
             "SELECT * FROM stories WHERE id = ?", (story_id,)
         ).fetchone()
-        if current is None:
-            return
+        if current is None or current["deleted_at"] is not None:
+            return False
+        base_version = int(current["version"])
         sets = []
         params = []
+        changed_fields: list[str] = []
 
         if title is not None:
             sets.append("title = ?")
             params.append(title)
+            changed_fields.append("title")
         if abstract is not None:
             bounded, _ = story_v2.bound_abstract(abstract)
             sets.append("abstract = ?")
             params.append(bounded)
+            changed_fields.append("abstract")
 
         current_applicability = context_module.normalize_applicability(
             current["applicability_json"]
@@ -1406,9 +1645,11 @@ def update_story(story_id: int, title: str = None, content: str = None,
                     effective_applicability, ensure_ascii=False, sort_keys=True
                 ),
             ))
+            changed_fields.extend(("detail", "content", "applicability"))
         elif content is not None:
             sets.append("content = ?")
             params.append(content)
+            changed_fields.append("content")
 
         if sources is not None or source_session_ids is not None:
             effective_ids = list(dict.fromkeys(
@@ -1433,13 +1674,19 @@ def update_story(story_id: int, title: str = None, content: str = None,
             params.append(json.dumps(
                 environments, ensure_ascii=False, sort_keys=True
             ))
+            changed_fields.append("sources")
         if keywords is not None:
             sets.append("keywords = ?")
             params.append(json.dumps(keywords, ensure_ascii=False))
+            changed_fields.append("keywords")
         if embedding is not None:
             emb_blob = np.array(embedding, dtype=np.float32).tobytes()
             sets.append("embedding = ?")
             params.append(emb_blob)
+            changed_fields.extend((
+                "embedding", "embedding_model", "embedding_version",
+                "embedding_content_hash", "embedding_status",
+            ))
 
         sets.append("version = version + 1")
         sets.append("updated_at = datetime('now')")
@@ -1482,6 +1729,7 @@ def update_story(story_id: int, title: str = None, content: str = None,
                 "UPDATE stories SET embedding_status = 'stale' WHERE id = ?",
                 (story_id,),
             )
+            changed_fields.append("embedding_status")
 
         # 如果向量更新了，同步到虚拟表
         if embedding is not None:
@@ -1493,6 +1741,13 @@ def update_story(story_id: int, title: str = None, content: str = None,
                 (story_id, emb_blob)
             )
         _record_revision(db, story_id, event_type)
+        _record_memory_event(
+            db,
+            story_id,
+            event_type,
+            base_version=base_version,
+            changed_fields=changed_fields,
+        )
         if any(value is not None for value in (
             title, content, keywords, embedding, applicability, abstract,
             detail, sources, source_session_ids,
@@ -1500,6 +1755,7 @@ def update_story(story_id: int, title: str = None, content: str = None,
             _bump_index_version(db)
         db.commit()
         logger.info("更新 story #%d", story_id)
+        return True
     finally:
         db.close()
 
@@ -1512,6 +1768,16 @@ def delete_story_vector(story_id: int):
     """
     db = get_db()
     try:
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute(
+            "SELECT * FROM stories WHERE id = ?", (story_id,)
+        ).fetchone()
+        if (
+            current is None or current["deleted_at"] is not None
+            or current["embedding"] is None
+        ):
+            return False
+        base_version = int(current["version"])
         cur = db.execute("DELETE FROM story_vectors WHERE story_id = ?", (story_id,))
         updated = db.execute(
             """UPDATE stories
@@ -1522,17 +1788,94 @@ def delete_story_vector(story_id: int):
         )
         if cur.rowcount or updated.rowcount:
             _record_revision(db, story_id, "split_parent")
+            _record_memory_event(
+                db,
+                story_id,
+                "split_parent",
+                base_version=base_version,
+                changed_fields=("embedding", "embedding_status"),
+            )
             _bump_index_version(db)
         db.commit()
         logger.info("已从检索索引移除 story #%d 的向量", story_id)
+        return bool(cur.rowcount or updated.rowcount)
     finally:
         db.close()
 
 
-def get_story(story_id: int) -> Optional[dict]:
+def delete_story(story_id: int) -> str | None:
+    """Tombstone a Story atomically and return the terminal event id.
+
+    The Story row and revisions remain local audit evidence, but every active
+    retrieval path excludes it.  Repeated deletion is idempotent.
+    """
+
     db = get_db()
     try:
-        row = db.execute("SELECT * FROM stories WHERE id = ?", (story_id,)).fetchone()
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute(
+            "SELECT * FROM stories WHERE id = ?", (story_id,)
+        ).fetchone()
+        if current is None:
+            return None
+        if current["deleted_at"] is not None:
+            return current["tombstone_event_id"]
+
+        base_version = int(current["version"])
+        event_id = new_uuid7()
+        deleted_at = context_module.utc_now()
+        db.execute("DELETE FROM story_vectors WHERE story_id = ?", (story_id,))
+        db.execute(
+            """UPDATE stories
+               SET embedding = NULL, embedding_status = 'archived',
+                   version = version + 1, deleted_at = ?,
+                   tombstone_event_id = ?, updated_at = ?
+               WHERE id = ? AND deleted_at IS NULL""",
+            (deleted_at, event_id, deleted_at, story_id),
+        )
+        _record_revision(db, story_id, "delete")
+        _record_memory_event(
+            db,
+            story_id,
+            "delete",
+            base_version=base_version,
+            changed_fields=(
+                "deleted_at", "tombstone", "embedding", "embedding_status"
+            ),
+            event_id=event_id,
+            created_at=deleted_at,
+        )
+        event = db.execute(
+            "SELECT * FROM memory_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        db.execute(
+            """INSERT INTO memory_tombstones (
+                   entity_type, entity_id, profile_id, deleted_event_id,
+                   deleted_version, device_id, deleted_at
+               ) VALUES ('story', ?, ?, ?, ?, ?, ?)""",
+            (
+                current["global_id"], current["profile_id"], event_id,
+                base_version + 1, event["device_id"], deleted_at,
+            ),
+        )
+        _bump_index_version(db)
+        db.commit()
+        logger.info("已 tombstone story #%d", story_id)
+        return event_id
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def get_story(story_id: int, *, include_deleted: bool = False) -> Optional[dict]:
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT * FROM stories WHERE id = ? AND (? OR deleted_at IS NULL)",
+            (story_id, include_deleted),
+        ).fetchone()
         if row:
             story = _row_to_story(row)
             hydrated_sources = []
@@ -1559,10 +1902,13 @@ def get_story(story_id: int) -> Optional[dict]:
         db.close()
 
 
-def get_all_stories() -> list[dict]:
+def get_all_stories(*, include_deleted: bool = False) -> list[dict]:
     db = get_db()
     try:
-        rows = db.execute("SELECT * FROM stories ORDER BY id").fetchall()
+        rows = db.execute(
+            "SELECT * FROM stories WHERE (? OR deleted_at IS NULL) ORDER BY id",
+            (include_deleted,),
+        ).fetchall()
         return [_row_to_story(r) for r in rows]
     finally:
         db.close()
@@ -1594,14 +1940,79 @@ def get_story_revisions(story_id: int) -> list[dict]:
         db.close()
 
 
+def get_memory_events(
+    story_id: int | None = None, *, entity_id: str | None = None
+) -> list[dict]:
+    """Return the append-only portable event chain in local sequence order."""
+
+    db = get_db(load_vector_extension=False)
+    try:
+        if story_id is not None:
+            story = db.execute(
+                "SELECT global_id FROM stories WHERE id = ?", (story_id,)
+            ).fetchone()
+            if story is None:
+                return []
+            entity_id = story["global_id"]
+        if entity_id is None:
+            rows = db.execute(
+                "SELECT * FROM memory_events ORDER BY sequence"
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT * FROM memory_events
+                   WHERE entity_type = 'story' AND entity_id = ?
+                   ORDER BY sequence""",
+                (entity_id,),
+            ).fetchall()
+        return [memory_events.parse_event(dict(row)) for row in rows]
+    finally:
+        db.close()
+
+
+def get_memory_tombstone(
+    story_id: int | None = None, *, entity_id: str | None = None
+) -> dict | None:
+    """Return terminal deletion metadata for a Story, if present."""
+
+    db = get_db(load_vector_extension=False)
+    try:
+        if story_id is not None:
+            story = db.execute(
+                "SELECT global_id FROM stories WHERE id = ?", (story_id,)
+            ).fetchone()
+            if story is None:
+                return None
+            entity_id = story["global_id"]
+        if entity_id is None:
+            return None
+        row = db.execute(
+            """SELECT * FROM memory_tombstones
+               WHERE entity_type = 'story' AND entity_id = ?""",
+            (entity_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        db.close()
+
+
+def replay_memory_events(events: list[dict] | None = None) -> dict:
+    """Replay local or supplied MemoryEvents into a non-content projection."""
+
+    return memory_events.replay(
+        get_memory_events() if events is None else events
+    )
+
+
 def update_story_raw_sessions(story_id: int, session_ids: list[int]):
     """更新来源 Session，并合并环境集合而非覆盖最后一次来源。"""
     db = get_db()
     try:
+        db.execute("BEGIN IMMEDIATE")
         session_ids = list(dict.fromkeys(session_ids))
         row = db.execute(
-            """SELECT environment_summary_json, sources_json
-               FROM stories WHERE id = ?""", (story_id,)
+            """SELECT environment_summary_json, sources_json, version
+               FROM stories WHERE id = ? AND deleted_at IS NULL""", (story_id,)
         ).fetchone()
         if row is None:
             return
@@ -1629,6 +2040,13 @@ def update_story_raw_sessions(story_id: int, session_ids: list[int]):
             )
         )
         _record_revision(db, story_id, "source_update")
+        _record_memory_event(
+            db,
+            story_id,
+            "source_update",
+            base_version=int(row["version"]),
+            changed_fields=("sources",),
+        )
         _bump_index_version(db)
         db.commit()
     finally:
@@ -1639,7 +2057,11 @@ def increment_access_count(story_id: int):
     """检索命中时调用"""
     db = get_db()
     try:
-        db.execute("UPDATE stories SET access_count = access_count + 1 WHERE id = ?", (story_id,))
+        db.execute(
+            """UPDATE stories SET access_count = access_count + 1
+               WHERE id = ? AND deleted_at IS NULL""",
+            (story_id,),
+        )
         db.commit()
     finally:
         db.close()
@@ -1660,7 +2082,8 @@ def apply_recall_feedback(
     db = get_db(db_path, load_vector_extension=False)
     try:
         db.executemany(
-            "UPDATE stories SET access_count = access_count + 1 WHERE id = ?",
+            """UPDATE stories SET access_count = access_count + 1
+               WHERE id = ? AND deleted_at IS NULL""",
             [(story_id,) for story_id in unique_ids],
         )
         for source_id, target_id in combinations(sorted(unique_ids), 2):
@@ -1683,7 +2106,9 @@ def apply_recall_feedback(
 def count_stories() -> int:
     db = get_db()
     try:
-        return db.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
+        return db.execute(
+            "SELECT COUNT(*) FROM stories WHERE deleted_at IS NULL"
+        ).fetchone()[0]
     finally:
         db.close()
 
@@ -1781,7 +2206,8 @@ def get_related_stories(story_id: int, limit: int = 5) -> list[dict]:
             """SELECT s.*, e.weight, e.edge_type
                FROM edges e
                JOIN stories s ON s.id = CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
-               WHERE e.source_id = ? OR e.target_id = ?
+               WHERE (e.source_id = ? OR e.target_id = ?)
+                 AND s.deleted_at IS NULL
                ORDER BY e.weight DESC
                LIMIT ?""",
             (story_id, story_id, story_id, limit)
@@ -1808,7 +2234,8 @@ def get_related_stories_batch(
                    FROM edges e
                    JOIN stories s ON s.id = CASE
                        WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
-                   WHERE e.source_id = ? OR e.target_id = ?
+                   WHERE (e.source_id = ? OR e.target_id = ?)
+                     AND s.deleted_at IS NULL
                    ORDER BY e.weight DESC
                    LIMIT ?""",
                 (story_id, story_id, story_id, limit),
@@ -1833,7 +2260,7 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
                       s.applicability_json, s.environment_summary_json
                FROM story_vectors v
                JOIN stories s ON s.id = v.story_id
-               WHERE v.embedding MATCH ? AND k = ?
+               WHERE v.embedding MATCH ? AND k = ? AND s.deleted_at IS NULL
                ORDER BY v.distance""",
             (emb_blob, top_k)
         ).fetchall()
@@ -1872,7 +2299,8 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
         rows = db.execute(
             """SELECT id, title, abstract, content, keywords, embedding,
                       applicability_json, environment_summary_json
-               FROM stories WHERE embedding IS NOT NULL"""
+               FROM stories
+               WHERE embedding IS NOT NULL AND deleted_at IS NULL"""
         ).fetchall()
         if not rows:
             return []
@@ -1942,6 +2370,7 @@ def search_by_lexical(
                    FROM story_fts
                    JOIN stories s ON s.id = story_fts.rowid
                    WHERE story_fts MATCH ? AND s.embedding IS NOT NULL
+                     AND s.deleted_at IS NULL
                    ORDER BY bm25(story_fts, 8.0, 5.0, 2.0, 5.0)
                    LIMIT ?""",
                 (fts_query, max(top_k * 8, 16)),
@@ -1966,7 +2395,8 @@ def search_by_lexical(
             f"""SELECT s.id, s.title, s.abstract, s.content, s.keywords,
                        s.applicability_json, s.environment_summary_json
                 FROM stories s
-                WHERE s.embedding IS NOT NULL AND ({' OR '.join(clauses)})
+                WHERE s.embedding IS NOT NULL AND s.deleted_at IS NULL
+                  AND ({' OR '.join(clauses)})
                 LIMIT ?""",
             (*params, max(top_k * 32, 256)),
         ).fetchall()
@@ -2088,10 +2518,21 @@ def get_stats() -> dict:
             "sessions": db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0],
             "pending": db.execute("SELECT COUNT(*) FROM sessions WHERE status='pending'").fetchone()[0],
             "processed": db.execute("SELECT COUNT(*) FROM sessions WHERE status='processed'").fetchone()[0],
-            "stories": db.execute("SELECT COUNT(*) FROM stories").fetchone()[0],
+            "stories": db.execute(
+                "SELECT COUNT(*) FROM stories WHERE deleted_at IS NULL"
+            ).fetchone()[0],
+            "tombstones": db.execute(
+                "SELECT COUNT(*) FROM memory_tombstones"
+            ).fetchone()[0],
             "edges": db.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
-            "root_stories": db.execute("SELECT COUNT(*) FROM stories WHERE parent_id IS NULL").fetchone()[0],
-            "child_stories": db.execute("SELECT COUNT(*) FROM stories WHERE parent_id IS NOT NULL").fetchone()[0],
+            "root_stories": db.execute(
+                """SELECT COUNT(*) FROM stories
+                   WHERE parent_id IS NULL AND deleted_at IS NULL"""
+            ).fetchone()[0],
+            "child_stories": db.execute(
+                """SELECT COUNT(*) FROM stories
+                   WHERE parent_id IS NOT NULL AND deleted_at IS NULL"""
+            ).fetchone()[0],
             "profile": {
                 "id": config.PROFILE_ID,
                 "display_name": config.ACTIVE_PROFILE.display_name,
