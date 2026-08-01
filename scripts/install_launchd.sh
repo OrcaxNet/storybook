@@ -20,7 +20,6 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEMPLATE="$SCRIPT_DIR/com.storybook.dream.plist"
 PLIST_DIR="$HOME/Library/LaunchAgents"
 PLIST="$PLIST_DIR/$LABEL.plist"
-LOG_DIR="$PROJECT_DIR/logs"
 
 INTERVAL="14400"        # 默认 4 小时
 PYTHON_BIN=""
@@ -76,21 +75,22 @@ if ! "$PYTHON_BIN" -c "import storybook" >/dev/null 2>&1; then
   exit 1
 fi
 
+# 日志目录由当前用户 Profile registry 解析，不绑定仓库位置。
+LOG_DIR="$("$PYTHON_BIN" -c 'from storybook import config; print(config.LOG_DIR)')"
 mkdir -p "$PLIST_DIR" "$LOG_DIR"
 
 # ── 从模板渲染 ──
 echo "📝 渲染 plist -> $PLIST"
 # 用 python 做占位符替换，避免 sed 的分隔符/特殊字符问题
-"$PYTHON_BIN" - "$TEMPLATE" "$PLIST" "$PYTHON_BIN" "$PROJECT_DIR" "$LOG_DIR" "$INTERVAL" <<'PYEOF'
+"$PYTHON_BIN" - "$TEMPLATE" "$PLIST" "$PYTHON_BIN" "$LOG_DIR" "$INTERVAL" <<'PYEOF'
 import sys
-src, dst, pybin, proj, logdir, interval = sys.argv[1:7]
+src, dst, pybin, logdir, interval = sys.argv[1:6]
 text = open(src, encoding="utf-8").read()
 text = text.replace("__PYTHON_BIN__", pybin)
-text = text.replace("__STORYBOOK_DIR__", proj)
 text = text.replace("__LOG_DIR__", logdir)
 text = text.replace("__START_INTERVAL__", interval)
 open(dst, "w", encoding="utf-8").write(text)
-print(f"   python={pybin}\n   workdir={proj}\n   logdir={logdir}\n   interval={interval}s")
+print(f"   python={pybin}\n   logdir={logdir}\n   interval={interval}s")
 PYEOF
 
 # ── 加载（先卸载旧实例，再 bootstrap；bootstrap 失败回退 load -w）──

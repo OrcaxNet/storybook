@@ -1,7 +1,7 @@
 """评测编排：建语料 / 跑查询 / 跑加工分支 / 跑分裂，产出可序列化报告。
 
 设计要点：
-  * **隔离 DB** -- 每次评测把 ``config.DB_PATH`` 重定向到临时文件，绝不污染用户 ``data/memory.db``。
+  * **隔离 DB** -- 每次评测把 ``config.DB_PATH`` 重定向到临时文件，绝不污染用户 Profile 数据库。
   * **embedding 经 ``embeddings.embed`` 模块属性** -- 真实运行走 Ollama；测试用 fake_embedder 夹具
     monkeypatch 该属性即可注入确定性桩（processor 内部也走同一属性，故加工/分裂评测同样受控）。
   * **加工/分裂评测用确定性 CuratedLLM** -- 用 benchmark 里人工标注的 keywords/summary 替代 LLM 输出，

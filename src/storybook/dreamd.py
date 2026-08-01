@@ -144,10 +144,10 @@ def lock_holder_pid() -> Optional[int]:
 # ═══════════════════════════════════════════════
 
 def setup_dream_logging(log_path: Optional[Path] = None) -> Path:
-    """把 ``storybook`` 日志额外写入 ``logs/dream.log``（幂等）。
+    """把日志写入当前 Profile 的 ``logs/dream.log``（幂等）。
 
     守护 / 监听 / --once 入口调用；自动周期无 shell，日志落文件便于排查。
-    返回日志文件路径。测试不调用此函数，避免触碰真实 logs/。
+    返回日志文件路径。测试不调用此函数，避免触碰真实用户日志目录。
     """
     log_path = Path(log_path) if log_path else config.LOG_DIR / "dream.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)

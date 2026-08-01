@@ -19,6 +19,7 @@ test = [
 # MCP server 依赖：把记忆检索暴露给 MCP-aware agent（如 Claude Code）。
 # `uv pip install -e ".[mcp]"` 安装；之后 `storybook mcp` 启动 server。
 mcp = [
+    # mcp 2.x removed ``mcp.server.fastmcp`` used by the current adapter.
     "mcp>=1.2,<2",
 ]
 

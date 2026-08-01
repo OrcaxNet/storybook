@@ -3,18 +3,17 @@
 # macOS 用 launchd（见 com.storybook.dream.plist + install_launchd.sh）；
 # Linux 用 systemd 托管 `storybook dream` 守护进程（每 DREAM_INTERVAL 秒一轮）。
 #
-# 安装步骤（按需替换占位符 __PYTHON_BIN__ / __STORYBOOK_DIR__ / __USER__）：
+# 安装步骤（替换占位符 __PYTHON_BIN__）：
 #   1. 渲染：sed -e 's|__PYTHON_BIN__|/home/you/storybook/.venv/bin/python|' \
-#                -e 's|__STORYBOOK_DIR__|/home/you/storybook|' \
-#                -e 's|__USER__|you|' scripts/com.storybook.dream.service \
+#                scripts/com.storybook.dream.service \
 #                > ~/.config/systemd/user/storybook-dream.service
 #   2. 加载：systemctl --user daemon-reload
 #            systemctl --user enable --now storybook-dream.service
 #   3. 查日志：journalctl --user -u storybook-dream.service -f
-#            （dreamd 另写 <repo>/logs/dream.log）
+#            （dreamd 另写当前 Profile 日志目录下的 dream.log）
 #
 # 不想用 systemd 也可直接 nohup 后台跑：
-#   nohup __PYTHON_BIN__ -m storybook.cli dream >> __STORYBOOK_DIR__/logs/dream-daemon.log 2>&1 &
+#   nohup __PYTHON_BIN__ -m storybook.cli dream >/dev/null 2>&1 &
 
 [Unit]
 Description=Storybook dream cycle (offline coding-memory consolidation)
@@ -22,7 +21,6 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=__STORYBOOK_DIR__
 ExecStart=__PYTHON_BIN__ -m storybook.cli dream
 Restart=on-failure
 RestartSec=60

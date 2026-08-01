@@ -3,6 +3,9 @@ CLI 入口 — storybook 命令
 
 用法:
   storybook init                    初始化数据库
+  storybook profile show|list       查看用户级 Profile
+  storybook profile create|switch   创建隔离 Profile / 切换当前 Profile
+  storybook sync status             查看本地同步状态（v0.2 为 local-only）
   storybook doctor [--fix]          环境与健康自检（--fix 修复向量双写不一致）
   storybook import <path>           导入会话日志(JSON)
   storybook import                  从 Claude Code 采集（默认数据源）
@@ -43,6 +46,7 @@ from . import (
 )
 from . import eval as eval_module
 from . import search as search_module
+from .profiles import ProfileError
 
 
 def setup_logging(verbose: bool = False):
@@ -59,6 +63,142 @@ def setup_logging(verbose: bool = False):
 def cli(verbose):
     """🧠 Storybook - 离线 Coding 记忆系统"""
     setup_logging(verbose)
+
+
+def _profile_payload(profile, *, active: bool) -> dict:
+    paths = config.PROFILE_REGISTRY.paths_for(profile)
+    return {
+        "id": profile.id,
+        "display_name": profile.display_name,
+        "mode": profile.mode,
+        "sync_state": profile.sync_state,
+        "active": active,
+        "data_dir": str(paths.root),
+        "database": str(paths.database),
+        "index_dir": str(paths.index_dir),
+        "cache_dir": str(paths.cache_dir),
+        "log_dir": str(paths.log_dir),
+        "created_at": profile.created_at,
+    }
+
+
+@cli.group()
+def profile():
+    """👤 管理同一 OS 用户共享的 Storybook Profile。"""
+
+
+@profile.command(name="list")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+def profile_list(as_json):
+    """列出所有 local / isolated Profile。"""
+
+    active_id = config.PROFILE_REGISTRY.active_profile().id
+    items = [
+        _profile_payload(item, active=item.id == active_id)
+        for item in config.PROFILE_REGISTRY.list_profiles()
+    ]
+    if as_json:
+        click.echo(json.dumps({"profiles": items}, ensure_ascii=False, indent=2))
+        return
+    for item in items:
+        marker = "*" if item["active"] else " "
+        click.echo(
+            f"{marker} {item['display_name']}  {item['id']}  "
+            f"{item['mode']}  {item['sync_state']}"
+        )
+
+
+@profile.command(name="show")
+@click.argument("profile_ref", required=False)
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+def profile_show(profile_ref, as_json):
+    """显示当前或指定 Profile 的本地目录与状态。"""
+
+    try:
+        item = (
+            config.PROFILE_REGISTRY.resolve(profile_ref)
+            if profile_ref
+            else config.PROFILE_REGISTRY.active_profile()
+        )
+    except ProfileError as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = _profile_payload(
+        item, active=item.id == config.PROFILE_REGISTRY.active_profile().id
+    )
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"Profile      {payload['display_name']} ({payload['id']})")
+    click.echo(f"Mode         {payload['mode']}")
+    click.echo(f"Sync         {payload['sync_state']} (cross-device sync disabled)")
+    click.echo(f"Data         {payload['data_dir']}")
+    click.echo(f"Database     {payload['database']}")
+    click.echo(f"Indexes      {payload['index_dir']}")
+    click.echo(f"Cache        {payload['cache_dir']}")
+    click.echo(f"Logs         {payload['log_dir']}")
+
+
+@profile.command(name="create")
+@click.argument("display_name")
+@click.option(
+    "--mode",
+    type=click.Choice(["local", "isolated"]),
+    default="isolated",
+    show_default=True,
+    help="isolated 用于客户或敏感环境",
+)
+@click.option("--switch", "activate", is_flag=True, help="创建后立即切换")
+def profile_create(display_name, mode, activate):
+    """创建随机 UUID Profile；默认不影响当前 Profile。"""
+
+    try:
+        item = config.PROFILE_REGISTRY.create_profile(
+            display_name, mode=mode, activate=activate
+        )
+        if activate:
+            config.refresh_profile(item.id)
+    except ProfileError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"✅ 已创建 Profile: {item.display_name} ({item.id}) [{item.mode}]")
+    if activate:
+        click.echo(f"   已切换；数据库: {config.DB_PATH}")
+
+
+@profile.command(name="switch")
+@click.argument("profile_ref")
+def profile_switch(profile_ref):
+    """按 UUID 或显示名切换当前 Profile。"""
+
+    try:
+        item = config.switch_profile(profile_ref)
+    except ProfileError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"✅ 当前 Profile: {item.display_name} ({item.id})")
+    click.echo(f"   数据目录: {config.DATA_DIR}")
+
+
+@cli.group()
+def sync():
+    """🔄 查看同步状态（v0.2 仅提供 local-only 边界）。"""
+
+
+@sync.command(name="status")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+def sync_status(as_json):
+    """显示当前 Profile 的跨设备同步状态。"""
+
+    payload = {
+        "profile_id": config.PROFILE_ID,
+        "sync_state": config.SYNC_STATE,
+        "enabled": False,
+        "message": "v0.2 stores all memory locally; cross-device sync is not enabled.",
+    }
+    if as_json:
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"Sync           {payload['sync_state']}")
+    click.echo("Cross-device   disabled (v0.2)")
+    click.echo("Storage        local user profile")
 
 
 @cli.command()
@@ -367,6 +507,11 @@ def stats():
     s = store.get_stats()
     click.echo("\n📊 Storybook 记忆系统统计")
     click.echo("──────────────────────────────")
+    click.echo(
+        f"  Profile:      {s['profile']['display_name']} "
+        f"({s['profile']['mode']})"
+    )
+    click.echo(f"  Sync:         {s['sync_state']}")
     click.echo(f"  会话总数:   {s['sessions']}")
     click.echo(f"  待处理:     {s['pending']}")
     click.echo(f"  已处理:     {s['processed']}")
@@ -490,7 +635,7 @@ def eval(part, report, benchmark_path):
     processing 用真实 embedding + 确定性 LLM 桩，度量 merge/update 分支是否选对。
     split 度量分裂路径结构正确性。
 
-    需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染 data/memory.db。
+    需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染用户 Profile 数据库。
     用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
     """
     parts = ("retrieval", "processing", "split") if part == "all" else (part,)
