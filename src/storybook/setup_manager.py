@@ -134,6 +134,59 @@ class SetupPlan:
         }
 
 
+@dataclass(frozen=True)
+class _FileSnapshot:
+    """事务开始前的文件内容与元数据，用于精确回滚用户配置。"""
+
+    path: Path
+    existed: bool
+    data: bytes | None
+    mode: int | None
+    atime_ns: int | None
+    mtime_ns: int | None
+    missing_parents: tuple[Path, ...]
+
+    @classmethod
+    def capture(cls, path: Path) -> _FileSnapshot:
+        missing_parents: list[Path] = []
+        parent = path.parent
+        while not parent.exists() and parent != parent.parent:
+            missing_parents.append(parent)
+            parent = parent.parent
+        if not path.exists():
+            return cls(path, False, None, None, None, None, tuple(missing_parents))
+        metadata = path.stat()
+        return cls(
+            path,
+            True,
+            path.read_bytes(),
+            metadata.st_mode & 0o7777,
+            metadata.st_atime_ns,
+            metadata.st_mtime_ns,
+            tuple(missing_parents),
+        )
+
+    def restore_content(self) -> None:
+        if not self.existed:
+            self.path.unlink(missing_ok=True)
+            return
+        assert self.data is not None
+        atomic_write(self.path, self.data)
+        if self.mode is not None:
+            self.path.chmod(self.mode)
+        if self.atime_ns is not None and self.mtime_ns is not None:
+            os.utime(self.path, ns=(self.atime_ns, self.mtime_ns))
+
+    def remove_created_parents(self) -> None:
+        for parent in self.missing_parents:
+            try:
+                parent.rmdir()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                break
+
+
 class SetupManager:
     def __init__(
         self,
@@ -251,6 +304,41 @@ class SetupManager:
             self.state_path,
             (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
         )
+
+    def _transaction_snapshots(self, plan: SetupPlan) -> tuple[_FileSnapshot, ...]:
+        paths = {self.state_path}
+        paths.update(
+            Path(target)
+            for adapter in plan.adapters
+            if adapter["selected"]
+            for target in adapter["targets"]
+        )
+        return tuple(_FileSnapshot.capture(path) for path in sorted(paths, key=str))
+
+    @staticmethod
+    def _rollback_transaction(
+        snapshots: Sequence[_FileSnapshot], backup_dir: Path
+    ) -> list[str]:
+        errors: list[str] = []
+        for snapshot in reversed(snapshots):
+            try:
+                snapshot.restore_content()
+            except Exception as exc:  # noqa: BLE001 -- 汇总所有回滚失败
+                errors.append(f"{snapshot.path}: {exc}")
+        if errors:
+            return errors
+        try:
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+            backup_root = backup_dir.parent
+            if backup_root.exists():
+                backup_root.rmdir()
+        except OSError:
+            # 旧安装的其他备份会让父目录非空；本次目录已删除即不影响回滚。
+            pass
+        for snapshot in reversed(snapshots):
+            snapshot.remove_created_parents()
+        return errors
 
     def _ensure_models(
         self, *, download: bool, progress: Progress | None
@@ -387,12 +475,12 @@ class SetupManager:
         backup_dir = self.roots.state / "setup-backups" / (
             datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
         )
-        applied: list[tuple[AgentAdapter, dict[str, Any]]] = []
-        retired_prior: set[str] = set()
+        snapshots = self._transaction_snapshots(plan)
         adapter_results: list[dict[str, Any]] = []
         planned_changes = {
             item["adapter"]: bool(item["changed"]) for item in plan.adapters
         }
+        phase = "config"
         try:
             for adapter in self.adapters:
                 if adapter.name not in selected:
@@ -405,41 +493,41 @@ class SetupManager:
                             "SB_SETUP_CONFIG_DRIFT",
                             f"{adapter.display_name} 的 Storybook 节点已被修改，拒绝覆盖",
                         )
-                    retired_prior.add(adapter.name)
                 state = adapter.apply(self.context, backup_dir)
                 adapter_results.append(
                     {"name": adapter.name, "changed": bool(state.get("changed"))}
                 )
                 if state.get("changed"):
                     adapter_states[adapter.name] = state
-                    applied.append((adapter, state))
+            state = {
+                "schema_version": STATE_SCHEMA_VERSION,
+                "installed_at": existing_state.get("installed_at", _utc_now()),
+                "updated_at": _utc_now(),
+                "profile_id": config.PROFILE_ID,
+                "launcher": {
+                    "command": self.launcher.command,
+                    "args": list(self.launcher.args),
+                },
+                "adapters": adapter_states,
+            }
+            phase = "state"
+            self._write_state(state)
         except Exception as exc:
-            for adapter, state in reversed(applied):
-                try:
-                    adapter.uninstall(self.context, state)
-                except Exception:
-                    pass
-            if retired_prior and existing_state:
-                recovery = dict(existing_state)
-                recovery["updated_at"] = _utc_now()
-                recovery["adapters"] = {
-                    name: saved
-                    for name, saved in existing_state.get("adapters", {}).items()
-                    if name not in retired_prior
-                }
-                self._write_state(recovery)
+            rollback_errors = self._rollback_transaction(snapshots, backup_dir)
+            if rollback_errors:
+                raise SetupError(
+                    "SB_SETUP_ROLLBACK_FAILED",
+                    f"setup 失败且无法完整回滚: {'; '.join(rollback_errors)}",
+                    hint="从 setup-backups 恢复配置并检查磁盘空间或目录权限",
+                ) from exc
+            if phase == "state":
+                raise SetupError(
+                    "SB_SETUP_STATE_WRITE_FAILED",
+                    f"无法持久化 setup state: {exc}",
+                    hint="配置与旧 setup state 已回滚；检查磁盘空间和 state 目录权限后重试",
+                ) from exc
             code = exc.code if isinstance(exc, AdapterError) else "SB_SETUP_CONFIG_WRITE_FAILED"
-            raise SetupError(code, str(exc), hint="配置已回滚；修复后重试") from exc
-
-        state = {
-            "schema_version": STATE_SCHEMA_VERSION,
-            "installed_at": existing_state.get("installed_at", _utc_now()),
-            "updated_at": _utc_now(),
-            "profile_id": config.PROFILE_ID,
-            "launcher": {"command": self.launcher.command, "args": list(self.launcher.args)},
-            "adapters": adapter_states,
-        }
-        self._write_state(state)
+            raise SetupError(code, str(exc), hint="配置与旧 setup state 已回滚；修复后重试") from exc
 
         models, degraded = self._ensure_models(
             download=download_models, progress=progress

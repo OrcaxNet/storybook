@@ -365,6 +365,98 @@ def test_setup_updates_changed_launcher_without_duplicating_hook(
     assert "/new/location/storybook" in settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
 
 
+def test_state_write_failure_rolls_back_first_install_and_returns_json_error(
+    isolated_setup, monkeypatch
+):
+    manager, roots = isolated_setup
+    path = manager.home / ".cursor" / "mcp.json"
+    _write_json(path, {"mcpServers": {"existing": {"command": "keep"}}})
+    fixed_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(path, ns=(fixed_mtime_ns, fixed_mtime_ns))
+    before = path.read_bytes()
+
+    def fail_state_write(state):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(manager, "_write_state", fail_state_write)
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+
+    result = CliRunner().invoke(
+        cli, ["setup", "--json", "--agent", "cursor", "--skip-models"]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "SB_SETUP_STATE_WRITE_FAILED"
+    assert payload["error"]["message"]
+    assert payload["error"]["hint"]
+    assert "Traceback" not in result.output
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == fixed_mtime_ns
+    assert "storybook" not in json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
+    assert not manager.state_path.exists()
+    assert not (roots.state / "setup-backups").exists()
+
+
+def test_state_write_failure_rolls_back_launcher_upgrade_and_preserves_old_state(
+    isolated_setup, monkeypatch
+):
+    manager, roots = isolated_setup
+    path = manager.home / ".cursor" / "mcp.json"
+    _write_json(path, {"mcpServers": {"existing": {"command": "keep"}}})
+    manager.execute(requested_agents=("cursor",), download_models=False)
+
+    updated = SetupManager(
+        home=manager.home,
+        environ=manager.environ,
+        launcher=Launcher("/new/location/storybook"),
+        roots=roots,
+    )
+    monkeypatch.setattr(updated, "_ensure_models", lambda **kwargs: ([], []))
+    monkeypatch.setattr(
+        updated,
+        "_smoke_tests",
+        lambda selected: [{"name": "schema", "ok": True, "detail": "ready"}],
+    )
+    config_mtime_ns = 1_700_000_000_100_000_000
+    state_mtime_ns = 1_700_000_000_200_000_000
+    os.utime(path, ns=(config_mtime_ns, config_mtime_ns))
+    os.utime(manager.state_path, ns=(state_mtime_ns, state_mtime_ns))
+    config_before = path.read_bytes()
+    state_before = manager.state_path.read_bytes()
+    backup_root = roots.state / "setup-backups"
+    backups_before = sorted(
+        str(item.relative_to(backup_root)) for item in backup_root.rglob("*")
+    )
+
+    def fail_state_write(state):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(updated, "_write_state", fail_state_write)
+
+    with pytest.raises(SetupError) as raised:
+        updated.execute(requested_agents=("cursor",), download_models=False)
+
+    assert raised.value.code == "SB_SETUP_STATE_WRITE_FAILED"
+    assert raised.value.hint
+    assert path.read_bytes() == config_before
+    assert path.stat().st_mtime_ns == config_mtime_ns
+    assert manager.state_path.read_bytes() == state_before
+    assert manager.state_path.stat().st_mtime_ns == state_mtime_ns
+    assert "/opt/storybook/bin/storybook" in path.read_text(encoding="utf-8")
+    assert "/new/location/storybook" not in path.read_text(encoding="utf-8")
+    assert sorted(
+        str(item.relative_to(backup_root)) for item in backup_root.rglob("*")
+    ) == backups_before
+
+    uninstall = manager.uninstall()
+
+    assert uninstall["status"] == "uninstalled"
+    restored = json.loads(path.read_text(encoding="utf-8"))
+    assert restored == {"mcpServers": {"existing": {"command": "keep"}}}
+
+
 def test_purge_removes_profile_roots_after_explicit_manager_call(isolated_setup):
     manager, roots = isolated_setup
     result = manager.execute(requested_agents=(), download_models=False)
