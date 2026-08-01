@@ -467,7 +467,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `SIM_THRESHOLD_UPDATE_ONLY` | 0.92 | ≥ 仅补充细节（不合并内容） |
 | `SIM_THRESHOLD_LOW` | 0.75 | ≥ 且 <high 触发弱关联新建 |
 | `SIM_THRESHOLD_SEARCH` | 0.50 | 检索最低相似度 |
-| `ENVIRONMENT_SCORE_WEIGHT` | 0.08 | 环境适配度的有界次级权重；语义仍为主信号 |
+| `ENVIRONMENT_SCORE_WEIGHT` | 0.08 | 环境在同语义分桶内的有界次级权重；不反转语义主排序 |
 | `TOP_K_RETRIEVAL` / `TOP_K_SEARCH` | 5 / 3 | 做梦召回 / 用户搜索返回数 |
 | `STORY_MAX_CHARS` | 400 | Story 最大字数 |
 | `WEIGHT_INCREMENT` / `WEIGHT_MAX` | 0.1 / 1.0 | 共同召回提权 / 权重上限 |

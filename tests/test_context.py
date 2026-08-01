@@ -436,19 +436,25 @@ class TestStoryEnvironmentHistory:
 
 
 class TestEnvironmentAwareRecall:
-    def _seed_two_runtimes(self):
+    def _seed_two_runtimes(
+        self,
+        *,
+        dev_similarity: float = 0.80,
+        local_similarity: float = 0.80,
+        dev_tool: str = "cursor",
+    ):
         dev_session = store.add_session(
-            "cursor", "dev", context=_context(tool="cursor", runtime="devcontainer")
+            dev_tool, "dev", context=_context(tool=dev_tool, runtime="devcontainer")
         )
         local_session = store.add_session(
             "codex", "local", context=_context(tool="codex", runtime="local")
         )
         dev_story = store.add_story(
-            "dev experience", "content", [], with_cos(0, 0.80),
+            "dev experience", "content", [], with_cos(0, dev_similarity),
             source_session_ids=[dev_session],
         )
         local_story = store.add_story(
-            "local experience", "content", [], with_cos(0, 0.80),
+            "local experience", "content", [], with_cos(0, local_similarity),
             source_session_ids=[local_session],
         )
         return dev_story, local_story
@@ -466,6 +472,86 @@ class TestEnvironmentAwareRecall:
         assert result["top_matches"][0]["score"] > result["top_matches"][1]["score"]
         assert result["top_matches"][1]["warnings"]
         assert result["strict_filtered"] == 0
+
+    def test_perfect_similarity_tie_prefers_current_environment(
+        self, fake_embedder, monkeypatch
+    ):
+        dev_story, local_story = self._seed_two_runtimes(
+            dev_similarity=1.0,
+            local_similarity=1.0,
+            dev_tool="codex",
+        )
+        fake_embedder.register("q", basis(0))
+        current = _context(tool="codex", runtime="local")
+        original_search = store.search_by_vector
+
+        def dev_first(*args, **kwargs):
+            matches = original_search(*args, **kwargs)
+            return sorted(matches, key=lambda item: item["story_id"] != dev_story)
+
+        # sqlite-vec does not promise an order for identical vectors.  Force
+        # the conflicting Story first so the environment tie-break is tested.
+        monkeypatch.setattr(store, "search_by_vector", dev_first)
+
+        result = search.search("q", top_k=2, context=current)
+
+        assert [item["story_id"] for item in result["top_matches"]] == [
+            local_story, dev_story,
+        ]
+        assert all(item["similarity"] == 1.0 for item in result["top_matches"])
+        assert result["top_matches"][0]["environment_score"] > (
+            result["top_matches"][1]["environment_score"]
+        )
+        assert result["top_matches"][0]["score"] > result["top_matches"][1]["score"]
+        assert result["top_matches"][1]["warnings"]
+
+    def test_environment_signal_does_not_reverse_semantic_order(self, fake_embedder):
+        dev_story, local_story = self._seed_two_runtimes(
+            dev_similarity=0.81,
+            local_similarity=0.80,
+            dev_tool="codex",
+        )
+        fake_embedder.register("q", basis(0))
+        current = _context(tool="codex", runtime="local")
+
+        result = search.search("q", top_k=2, context=current)
+
+        assert [item["story_id"] for item in result["top_matches"]] == [
+            dev_story, local_story,
+        ]
+        assert result["top_matches"][0]["similarity"] > (
+            result["top_matches"][1]["similarity"]
+        )
+        assert result["top_matches"][0]["score"] > result["top_matches"][1]["score"]
+
+    def test_lexical_similarity_tie_prefers_current_environment(self, fake_embedder):
+        dev_session = store.add_session(
+            "cursor", "dev", context=_context(tool="cursor", runtime="devcontainer")
+        )
+        local_session = store.add_session(
+            "codex", "local", context=_context(tool="codex", runtime="local")
+        )
+        dev_story = store.add_story(
+            "shared fallback phrase", "same content", [], basis(0),
+            source_session_ids=[dev_session],
+        )
+        local_story = store.add_story(
+            "shared fallback phrase", "same content", [], basis(0),
+            source_session_ids=[local_session],
+        )
+        fake_embedder.register("shared fallback phrase", None)
+        current = _context(tool="codex", runtime="local")
+
+        result = search.search(
+            "shared fallback phrase", top_k=2, context=current,
+        )
+
+        assert result["mode"] == "lexical_fallback"
+        assert [item["story_id"] for item in result["top_matches"]] == [
+            local_story, dev_story,
+        ]
+        assert result["top_matches"][0]["score"] > result["top_matches"][1]["score"]
+        assert result["top_matches"][1]["warnings"]
 
     def test_strict_scope_filters_environment_conflict_only_when_requested(self, fake_embedder):
         dev_story, local_story = self._seed_two_runtimes()

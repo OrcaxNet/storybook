@@ -306,7 +306,14 @@ def _environment_rerank(
     scope: str,
     top_k: int,
 ) -> tuple[list[dict], int]:
-    """Apply the same bounded environment policy to vector and fallback lanes."""
+    """Apply the same semantic-first environment policy to every search lane.
+
+    Similarities emitted by the vector and lexical stores are rounded to four
+    decimals.  Environment fit therefore only breaks ties inside one semantic
+    bucket; it must never make a less relevant Story outrank a more relevant
+    one.  The public ``score`` mirrors that ordering without adding a positive
+    bonus that can saturate at 1.0 and erase the tie-break signal.
+    """
 
     reranked = []
     strict_filtered = 0
@@ -320,23 +327,45 @@ def _environment_rerank(
             strict_filtered += 1
             continue
         match.update(fit)
-        match["score"] = round(
-            max(0.0, min(
-                1.0,
-                match["similarity"]
-                + config.ENVIRONMENT_SCORE_WEIGHT * fit["environment_score"],
-            )),
-            4,
+        match["score"] = _environment_rank_score(
+            match["similarity"],
+            fit["environment_score"],
+            has_context=current_context is not None,
         )
         reranked.append(match)
     return (
         sorted(
             reranked,
-            key=lambda item: (item["score"], item["similarity"]),
+            key=lambda item: (item["similarity"], item["environment_score"]),
             reverse=True,
         )[:top_k],
         strict_filtered,
     )
+
+
+def _environment_rank_score(
+    similarity: float,
+    environment_score: float,
+    *,
+    has_context: bool,
+) -> float:
+    """Encode the environment tie-break below one similarity score quantum."""
+
+    similarity = max(0.0, min(1.0, float(similarity)))
+    if not has_context:
+        return round(similarity, 4)
+
+    environment_score = max(-1.0, min(1.0, float(environment_score)))
+    normalized_fit = (environment_score + 1.0) / 2.0
+    similarity_quantum = 10 ** -4
+    tie_break_span = (
+        similarity_quantum
+        * max(0.0, min(1.0, config.ENVIRONMENT_SCORE_WEIGHT))
+    )
+    # Penalising relative to the best possible fit keeps the score in [0, 1]
+    # and preserves a visible difference even when similarity is exactly 1.0.
+    penalty = (1.0 - normalized_fit) * tie_break_span
+    return round(max(0.0, similarity - penalty), 8)
 
 
 def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]:
