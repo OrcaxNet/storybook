@@ -1319,6 +1319,7 @@ def activate_embedding_backfill(
             rows.append({
                 "id": story["id"], "embedding": shadow["embedding"],
                 "content_hash": shadow["content_hash"],
+                "base_version": int(story["version"]),
             })
         db.execute("DELETE FROM story_vectors")
         for row in rows:
@@ -1342,7 +1343,7 @@ def activate_embedding_backfill(
                 db,
                 row["id"],
                 "embedding_switch",
-                base_version=int(story["version"]),
+                base_version=row["base_version"],
                 changed_fields=(
                     "embedding", "embedding_model", "embedding_version",
                     "embedding_content_hash", "embedding_status",
