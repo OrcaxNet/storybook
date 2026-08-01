@@ -6,12 +6,18 @@ import logging
 import uuid
 
 from . import config, embeddings, performance, store
+from . import context as context_module
 
 logger = logging.getLogger(__name__)
 
 
 def search(
-    query: str, top_k: int | None = None, *, record_diagnostics: bool = True
+    query: str,
+    top_k: int | None = None,
+    *,
+    context: dict | None = None,
+    scope: str = "profile",
+    record_diagnostics: bool = True,
 ) -> dict:
     """
     检索记忆：
@@ -22,6 +28,12 @@ def search(
     返回: {query, keywords, top_matches: [{story, similarity, related: [...]}]}
     """
     top_k = top_k or config.TOP_K_SEARCH
+    if scope not in ("profile", "strict"):
+        raise ValueError("scope 必须是 profile 或 strict")
+    current_context = (
+        context_module.normalize_envelope(context, profile_id=config.PROFILE_ID)
+        if context is not None else None
+    )
     request_id = uuid.uuid4().hex
     latency = performance.empty_latency()
     total_started = performance.now()
@@ -34,6 +46,8 @@ def search(
             "degraded": degraded,
             "degraded_reason": degraded_reason,
             "latency_ms": latency,
+            "scope": scope,
+            "context": current_context,
         })
 
         serialize_started = performance.now()
@@ -80,18 +94,49 @@ def search(
 
     # ── Step 2: 向量检索 ──
     vector_started = performance.now()
-    matches = store.search_by_vector(query_vec, top_k=top_k * 2)  # 多取一些再过滤
+    matches = store.search_by_vector(query_vec, top_k=max(top_k * 4, top_k))
     latency["vector"] = performance.elapsed_ms(vector_started)
 
     # 过滤低于阈值的
     rerank_started = performance.now()
     matches = [m for m in matches if m["similarity"] >= config.SIM_THRESHOLD_SEARCH]
-    matches = matches[:top_k]
+    reranked = []
+    strict_filtered = 0
+    for match in matches:
+        fit = context_module.evaluate_story_context(
+            current_context,
+            match.get("environments"),
+            match.get("applicability"),
+        )
+        if scope == "strict" and fit["strict_excluded"]:
+            strict_filtered += 1
+            continue
+        # Environment is a bounded secondary signal; semantic relevance stays dominant.
+        match.update(fit)
+        match["score"] = round(
+            max(0.0, min(
+                1.0,
+                match["similarity"]
+                + config.ENVIRONMENT_SCORE_WEIGHT * fit["environment_score"],
+            )),
+            4,
+        )
+        reranked.append(match)
+    matches = sorted(
+        reranked,
+        key=lambda item: (item["score"], item["similarity"]),
+        reverse=True,
+    )[:top_k]
     latency["rerank"] = performance.elapsed_ms(rerank_started)
 
     if not matches:
         return finish(
-            {"query": query, "keywords": keywords, "top_matches": []},
+            {
+                "query": query,
+                "keywords": keywords,
+                "top_matches": [],
+                "strict_filtered": strict_filtered,
+            },
             mode="vector",
         )
 
@@ -116,6 +161,12 @@ def search(
             "content": m["content"],
             "keywords": m["keywords"],
             "similarity": m["similarity"],
+            "score": m.get("score", m["similarity"]),
+            "environment_score": m.get("environment_score", 0.0),
+            "environment": m.get("matched_environment"),
+            "environments": m.get("environments", []),
+            "applicability": m.get("applicability", {}),
+            "warnings": m.get("warnings", []),
             "related": [
                 {
                     "story_id": r["id"],
@@ -134,6 +185,7 @@ def search(
             "query": query,
             "keywords": keywords,
             "top_matches": top_matches,
+            "strict_filtered": strict_filtered,
         },
         mode="vector",
     )
@@ -164,6 +216,17 @@ def format_search_result(result: dict) -> str:
         lines.append(f"   │ 📌 {m['title']}")
         lines.append(f"   │ {m['content'][:200]}")
         lines.append(f"   │ 关键词: {', '.join(m['keywords'])}")
+        if m.get("environment"):
+            lines.append(
+                f"   │ 来源环境: {context_module.environment_label(m['environment'])}"
+            )
+        applies, excludes = context_module.applicability_labels(m.get("applicability"))
+        if applies:
+            lines.append(f"   │ 适用于: {'; '.join(applies)}")
+        if excludes:
+            lines.append(f"   │ 不适用于: {'; '.join(excludes)}")
+        for warning in m.get("warnings", []):
+            lines.append(f"   │ ⚠ 当前环境差异: {warning}")
 
         if m.get("related"):
             lines.append("   │")

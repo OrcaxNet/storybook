@@ -29,6 +29,7 @@ import re
 
 from . import config
 from . import search as search_module
+from . import context as context_module
 
 logger = logging.getLogger(__name__)
 
@@ -253,6 +254,11 @@ def prime_context(cwd: str = "", first_prompt: str = "",
     top_k = top_k or config.PRIME_TOP_K
 
     query = build_query(cwd, first_prompt)
+    current_context = context_module.capture_context(
+        tool_type="other",
+        integration_mode="hook",
+        workspace_path=cwd or None,
+    )
     base = {
         "cwd": cwd,
         "query": query,
@@ -262,6 +268,7 @@ def prime_context(cwd: str = "", first_prompt: str = "",
         "matches": [],
         "truncated": False,
         "note": None,
+        "context": current_context,
     }
 
     if not query:
@@ -269,7 +276,12 @@ def prime_context(cwd: str = "", first_prompt: str = "",
         return base
 
     try:
-        result = search_module.search(query, top_k=top_k)
+        result = search_module.search(
+            query,
+            top_k=top_k,
+            context=current_context,
+            scope="profile",
+        )
     except Exception as e:  # noqa: BLE001  -- schema 未初始化 / DB 锁等：晨间简报须非侵入
         base["note"] = (
             f"召回异常：{e}。可能数据库未初始化，请运行 `storybook init`；"

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import stat
 import uuid
@@ -424,6 +425,15 @@ class TestProfileIdentityMigration:
                 uuid.UUID(row["global_id"])
                 assert row["profile_id"] == config.PROFILE_ID
                 assert row["sync_state"] == "local_only"
+            legacy_session = db.execute(
+                "SELECT context_json FROM sessions WHERE id = 1"
+            ).fetchone()
+            envelope = json.loads(legacy_session["context_json"])
+            # A pre-E5 Session must remain explicit unknown; migration must not
+            # mislabel the current machine/runtime as historical evidence.
+            assert envelope["device"]["id"] is None
+            assert envelope["runtime"]["kind"] == "unknown"
+            assert envelope["provenance"]["runtime.kind"] == "unknown"
         finally:
             db.close()
 
