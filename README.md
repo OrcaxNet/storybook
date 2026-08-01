@@ -18,6 +18,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🔗 **带权关联图**：Story 间有 `semantic` / `parent_child` / `sibling` 三类无向边，检索时沿边激活
 - 📐 **双索引存储**：SQLite + sqlite-vec（vec0 向量表），向量同时存于 `stories.embedding` 与 `story_vectors`，L2 归一化后用余弦相似度
 - 🔍 **联想检索**：向量召回 + 边图扩散，共同召回会反向增强边权重
+- 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 同时守护检索质量
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
 - 🏠 **完全离线**：只需本地 Ollama，零云端依赖
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
@@ -46,6 +47,8 @@ collector → store → processor (用 llm + embeddings) → search
 ### 检索（`search.search`）
 
 embed 查询（关键词 + 查询文本）→ vec0 top-K（取 `top_k*2`，按 `SIM_THRESHOLD_SEARCH=0.50` 过滤）→ 对每个命中，沿 `edges` 表（权重降序）浮现相关 Story，并对共同召回的 Story 之间加边权重；命中 Story 的 `access_count` 自增。
+
+查询响应包含 `request_id`、`mode`、`degraded` 与 `latency_ms.{cache,embed,vector,graph,rerank,serialize,total}`。同一份阶段数据会写入本地 `logs/query_performance.jsonl`，但落盘接口只接受固定白名单字段：不保存原始 query、Story 内容、绝对路径、hostname 或仓库 URL。文件权限为 `0600`，超过大小上限后只保留最近记录。
 
 ### 关联图
 
@@ -114,6 +117,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **processor**：create / merge / update 三分支 + split 路径，mock `llm`/`embeddings` 返回固定值，
   验证分支选择与边建立（弱关联建边、共同召回提权、父子/兄弟边）。
 - **search**：阈值过滤、关联激活、共同召回提权（每对每次仅 +0.1 一次）。
+- **performance**：阶段时钟故障注入、最近窗口百分位、cache/fallback 比例、诊断隐私白名单，以及 warm/cold、并发 1/5 benchmark 编排（测试用小数据集与 mock embedding）。
 - **prime**：query 构造（cwd / first_prompt）、主动注入门槛（高于检索）、token 预算裁剪、静默不注入（空库 / 低于门槛 / embedding 失败 / schema 缺失均不抛错）。
 - **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
 - **dreamd（做梦周期自动化）**：`fcntl.flock` 并发锁互斥与释放、`run_dream_cycle_once` 采集+加工/跳过/空、监听循环首帧追补与变化触发、定时守护、信号退出、`logs/dream.log` 幂等写入。全 mock，不依赖 Ollama。
@@ -144,6 +148,30 @@ python scripts/eval.py retrieval                # 等价独立脚本（未做 ed
 合并正确率 85.7%（`dup-docker-dns` sim 0.83 落在 0.85 阈值下方被误判为 create，阈值敏感性显示 0.82 可达 100%）；
 分裂结构正确率 100%。`tests/test_eval.py` 用确定性 mock 覆盖评测逻辑本身，无需 Ollama。
 
+## 📈 查询性能基线与本地诊断
+
+日常查询会自动记录无内容诊断。查看最近 100 次查询：
+
+```bash
+storybook status --performance
+storybook status --performance --json
+```
+
+完整性能基准复用 `data/retrieval_benchmark.json` 的人工 ground truth，并在隔离临时库中构造固定 seed 的 10k Story 数据集。默认跑 50 条固定查询、每条重复 20 次、并发 1 和 5，报告机器/模型状态/规模/重复次数、所有阶段的 p50/p95/p99，以及按 exact/synonym/cross_lang 分组的 recall@1/3/5 和 MRR。基准不会污染用户数据库，也不会把原始 query、Story 内容、绝对路径或仓库 URL 写入报告。
+
+```bash
+# warm：先预热模型，再跑 10k × 50 × 20 × concurrency(1,5)
+storybook benchmark --model-state warm --report data/perf-warm.json
+
+# cold：每个并发批次前用 Ollama keep_alive=0 卸载 embedding 模型
+storybook benchmark --model-state cold --report data/perf-cold.json
+
+# 快速 smoke（报告会如实记录非标准规模）
+storybook benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
+```
+
+连续运行时应比较报告中的 machine、embedding model/dim、model_state、dataset seed/size、repeats 与 concurrency；这些字段不同足以解释大多数基线漂移。缓存和 lexical fallback 属于后续快路径优化：当前实现会按统一 schema 报告其比例为 0，后续接入时无需改变口径。
+
 ## 🚀 使用
 
 ```bash
@@ -159,6 +187,8 @@ storybook process --watch [--interval N]  # 监听模式：轮询 ~/.claude/proj
 storybook dream --once                # 单次完整做梦周期（采集+加工）后退出；launchd/cron 入口
 storybook dream [--interval N]        # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
 storybook search "<query>" [--top 3] # 向量检索 + 关联 Story 激活
+storybook status --performance       # 最近 100 次查询 p50/p95、cache/fallback 比例
+storybook benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质量基准
 storybook stats                      # 系统统计
 storybook list [--limit 20]          # 列出所有 Story
 storybook show <story_id>            # 查看 Story 详情（含关联记忆）
@@ -276,7 +306,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `recall` | `query`（必填）, `top_k?`（默认 3） | 向量检索 + 关联激活，返回 `{query, count, matches:[{story_id,title,content,keywords,similarity,related}]}`。`count=0` 表示无匹配（记忆库为空或无相关记忆），此时 `matches` 为空，不返回噪声 |
+| `recall` | `query`（必填）, `top_k?`（默认 3） | 向量检索 + 关联激活，返回 `{query,count,matches,request_id,mode,degraded,degraded_reason,latency_ms}`。`count=0` 表示无匹配（记忆库为空或无相关记忆），此时 `matches` 为空，不返回噪声 |
 | `get_story` | `story_id`（必填） | 查看单条记忆详情（含关联记忆），剥离 1024 维 embedding |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
 | `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / Ollama 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
@@ -412,6 +442,8 @@ storybook/
 │   ├── llm.py          # Ollama LLM 调用
 │   ├── embeddings.py   # Ollama embedding 调用
 │   ├── search.py       # 向量检索 + 关联激活
+│   ├── performance.py  # 隐私安全的查询诊断 JSONL + 最近窗口汇总
+│   ├── perf_benchmark.py # 固定数据集 warm/cold 性能与质量基准
 │   ├── dreamd.py       # 做梦周期自动化（锁 / 监听 / 定时守护 / 日志）
 │   ├── prime.py        # 会话启动主动注入（晨间简报，复用 search）
 │   └── mcp_server.py   # MCP server（recall / get_story / stats / prime_context）

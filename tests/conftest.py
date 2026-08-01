@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from ._helpers import config, store, embeddings_mod, llm_mod, FakeEmbedder, FakeLLM
+from ._helpers import FakeEmbedder, FakeLLM, config, embeddings_mod, llm_mod, store
 
 
 @pytest.fixture(autouse=True)
@@ -14,6 +14,9 @@ def tmp_db(tmp_path, monkeypatch):
     """每个测试一个隔离的临时数据库（autouse）：重定向 ``config.DB_PATH`` 到 tmp_path。"""
     db_path = tmp_path / "test_memory.db"
     monkeypatch.setattr(config, "DB_PATH", db_path)
+    monkeypatch.setattr(
+        config, "PERFORMANCE_LOG_PATH", tmp_path / "query_performance.jsonl"
+    )
     store.init_db()
     return db_path
 
