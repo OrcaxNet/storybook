@@ -19,13 +19,15 @@ from .metrics import (
     recall_at_k, precision_at_k, mrr, merge_branch_accuracy, threshold_sweep,
 )
 from .runner import (
-    run_retrieval_eval, run_processing_eval, run_split_eval, run_all,
+    run_retrieval_eval, run_processing_eval, run_split_eval,
+    run_embedding_ablation, run_all,
     format_report, EvalReport,
 )
 
 __all__ = [
     "load_benchmark", "BENCHMARK_PATH", "Topic", "MergePair", "SplitCase",
     "recall_at_k", "precision_at_k", "mrr", "merge_branch_accuracy", "threshold_sweep",
-    "run_retrieval_eval", "run_processing_eval", "run_split_eval", "run_all",
+    "run_retrieval_eval", "run_processing_eval", "run_split_eval",
+    "run_embedding_ablation", "run_all",
     "format_report", "EvalReport",
 ]

@@ -60,11 +60,11 @@ For each pending session: LLM extracts keywords → embed `keywords + problem_de
 
 | Branch | Trigger | Action |
 |--------|---------|--------|
-| **create** | best sim < 0.85 | LLM summarizes to ≤400-char "问题/步骤/结果" story; link to low-match (0.75–0.85) stories with `weight = sim` |
-| **merge** | 0.85 ≤ sim < 0.92 | LLM merges old+new content; if result >400 chars or LLM says `SPLIT:YES`, split into child stories (`parent_id`, parent-child edge weight 1.0, sibling edges 0.5). On split the parent's vector is dropped from the index (`delete_story_vector`) so it no longer matches search; the `stories` row is kept for lineage. |
+| **create** | best sim < 0.85 | Persist Story v2 title/abstract/structured detail/sources without hard-truncating detail; link low matches with `weight = sim` |
+| **merge** | 0.85 ≤ sim < 0.92 | Merge structured evidence; split only for independent reusable conclusions/applicability boundaries, never character count. Parent revision remains auditable. |
 | **update** | sim ≥ 0.92 | merge keywords only, re-embed, strengthen existing edge weights (+0.1, capped 1.0) |
 
-Thresholds live in `config.py`, including `SIM_THRESHOLD_UPDATE_ONLY` (0.92, the merge-vs-update-only boundary). Story text is capped at `STORY_MAX_CHARS` (400).
+Thresholds live in `config.py`, including `SIM_THRESHOLD_UPDATE_ONLY` (0.92). Only the abstract/recall presentation has a budget; persisted detail and sources are lossless.
 
 ### Retrieval (`search.search`)
 Embed query (keywords + query) → vec0 top-K (fetches `top_k*2`, filters by `SIM_THRESHOLD_SEARCH=0.50`) → for each hit, surface related stories via `edges` (weight desc) and bump edge weights between co-retrieved stories. Hits also increment `stories.access_count`.
@@ -89,7 +89,7 @@ source Sessions, never a last-write-wins field.
 ## Configuration knobs (`config.py`)
 
 - Paths: `DB_PATH`/`INDEX_DIR`/`CACHE_DIR`/`LOG_DIR` resolve from the active user Profile; `PERFORMANCE_LOG_PATH` follows that Profile's `LOG_DIR`; `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
-- Thresholds: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_MAX_CHARS` (400).
+- Thresholds/budgets: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_ABSTRACT_MAX_CHARS` (600).
 - Weight rules: `WEIGHT_INCREMENT` (0.1), `WEIGHT_MAX` (1.0), `WEIGHT_PARENT_CHILD` (1.0).
 - LLM call options (temp 0.3, `num_ctx` 8192, 120s timeout) are hardcoded in `llm._chat`/`_generate`, except `think` which follows `config.LLM_THINK` (`STORYBOOK_LLM_THINK` env, default **off**). `qwythos-hermes` is Qwen3-arch with a thinking mode that makes extraction calls ~9× slower; thinking is unnecessary for keyword/summary/split tasks, so it's off by default. Set `STORYBOOK_LLM_THINK=1` only if retrieval accuracy drops.
 

@@ -86,7 +86,9 @@ def _build_recall_result(result: dict) -> dict:
         matches.append({
             "story_id": m["story_id"],
             "title": m["title"],
+            "abstract": m.get("abstract", m["content"]),
             "content": m["content"],
+            "truncated": bool(m.get("truncated")),
             "keywords": m["keywords"],
             "similarity": m["similarity"],
             "score": m.get("score", m["similarity"]),
@@ -162,16 +164,23 @@ def get_story_detail(story_id: int) -> dict:
     return {
         "story_id": story["id"],
         "title": story["title"],
+        "abstract": story.get("abstract", ""),
         "content": story["content"],
+        "detail": story.get("detail", {}),
+        "sources": story.get("sources", []),
         "keywords": story.get("keywords", []),
         "access_count": story.get("access_count", 0),
         "version": story.get("version", 1),
+        "embedding_model": story.get("embedding_model"),
+        "embedding_version": story.get("embedding_version"),
+        "embedding_content_hash": story.get("embedding_content_hash"),
         "parent_id": story.get("parent_id"),
         "source_session_ids": story.get("source_session_ids", []),
         "environments": story.get("environments", []),
         "applicability": story.get("applicability", {}),
         "created_at": story.get("created_at"),
         "updated_at": story.get("updated_at"),
+        "revisions": store.get_story_revisions(story_id),
         "related": _trim_related(related),
     }
 

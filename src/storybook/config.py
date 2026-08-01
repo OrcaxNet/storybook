@@ -145,6 +145,10 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("STORYBOOK_LLM_MODEL", "qwythos-hermes:latest")
 EMBED_MODEL = os.getenv("STORYBOOK_EMBED_MODEL", "qwen3-embedding:0.6b")
 EMBED_DIM = 1024
+EMBED_VERSION = os.getenv("STORYBOOK_EMBED_VERSION", "story-v2-default-v1")
+EMBED_REPRESENTATION = os.getenv(
+    "STORYBOOK_EMBED_REPRESENTATION", "default"
+)
 LLM_THINK = os.getenv("STORYBOOK_LLM_THINK", "0") == "1"  # Qwen3 思考模式；提取类任务关闭可约 9x 加速，准确率不足时设 1
 
 # ── 查询快路径 ──
@@ -182,7 +186,16 @@ SIM_THRESHOLD_LOW = 0.75       # ≥ 且 <high → 弱关联新建
 SIM_THRESHOLD_SEARCH = 0.50    # 检索最低相似度
 TOP_K_RETRIEVAL = 5            # 做梦时检索相似story数量
 TOP_K_SEARCH = 3               # 用户搜索返回Top3
-STORY_MAX_CHARS = 400          # Story最大字数
+# Story v2 only budgets the abstract and recall presentation. Structured detail
+# and source evidence are persisted losslessly; this legacy constant remains for
+# callers that still import it but no longer controls formation/splitting.
+STORY_MAX_CHARS = 400
+STORY_ABSTRACT_MAX_CHARS = int(
+    os.getenv("STORYBOOK_ABSTRACT_MAX_CHARS", "600")
+)
+RECALL_SUMMARY_MAX_CHARS = int(
+    os.getenv("STORYBOOK_RECALL_SUMMARY_MAX_CHARS", "600")
+)
 ENVIRONMENT_SCORE_WEIGHT = 0.08  # 环境仅在同语义分桶内作有界次序调节
 
 # ── 关联权重规则 ──

@@ -9,6 +9,7 @@ from typing import Optional
 import requests
 
 from . import config
+from . import story_v2
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +102,77 @@ def extract_keywords(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()][:10]
 
 
+def form_stories(session_content: str) -> list[dict]:
+    """Form one or more independently reusable Story v2 candidates.
+
+    Boundaries follow conclusions and applicability, never a fixed character
+    count.  A long atomic experience remains one Story; a short session with
+    two independent outcomes becomes two Stories sharing the same Session.
+    """
+
+    prompt = f"""你是 Agent 经历记忆整理器。把下面会话切分为一个或多个可独立复用的 Story。
+
+切分原则：
+- 每个 Story 只承载一个可独立复用的结论及其适用环境。
+- 同一问题的连续排查、动作和结果必须保持在同一个 Story，即使内容很长。
+- 两个问题有独立结果或不同适用条件时必须拆成两个 Story，即使会话很短。
+- 不按字符数硬切分，不丢失失败尝试、证据或环境边界。
+- abstract 是有预算的检索摘要；detail 必须保留完整问题、动作、结果与教训。
+
+只输出 JSON 数组。每项格式：
+{{
+  "title": "简短标题",
+  "abstract": "关键结论与适用条件摘要",
+  "detail": {{
+    "problem": "完整问题背景",
+    "actions": ["按顺序的动作"],
+    "outcome": "结果",
+    "pitfalls": ["失败教训或空数组"],
+    "evidence": ["可在原会话定位的证据描述"],
+    "applicability": {{"applies_when": [], "excludes_when": []}}
+  }},
+  "sources": [{{"evidence": ["原会话中的证据描述"]}}],
+  "keywords": ["检索关键词"]
+}}
+
+会话内容：
+{session_content}
+"""
+    result = _chat(prompt)
+    if result:
+        try:
+            start = result.find("[")
+            end = result.rfind("]")
+            if start >= 0 and end > start:
+                decoded = json.loads(result[start:end + 1])
+                if isinstance(decoded, list):
+                    stories = [
+                        story_v2.normalize_story_payload(item)
+                        for item in decoded if isinstance(item, dict)
+                    ]
+                    if stories:
+                        return stories
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("Story v2 formation JSON 解析失败，使用无损 fallback")
+
+    # Local model failures must not turn persistence into destructive clipping.
+    return [story_v2.normalize_story_payload({
+        "title": "未命名记忆",
+        "abstract": session_content,
+        "detail": {
+            "problem": session_content,
+            "actions": [],
+            "outcome": "",
+            "pitfalls": [],
+            "evidence": ["原始 Session 全文"],
+            "applicability": {"applies_when": [], "excludes_when": []},
+        },
+        "sources": [{"evidence": ["原始 Session 全文"]}],
+    }, fallback_content=session_content)]
+
+
 def summarize_session(session_content: str) -> dict:
-    """将会话浓缩为 ≤400字 的标准 story，返回 {title, content}"""
+    """Legacy one-Story formatter retained for older integrations."""
     prompt = f"""你是一个代码记忆管理专家。请将以下AI编程会话浓缩为不超过400字的结构化记忆。
 
 要求：
@@ -121,7 +191,7 @@ CONTENT: <问题-步骤-结果格式的记忆文本>"""
 
     result = _chat(prompt)
     if not result:
-        return {"title": "未命名记忆", "content": session_content[:400]}
+        return {"title": "未命名记忆", "content": session_content}
 
     title = "未命名记忆"
     content = result
@@ -133,10 +203,6 @@ CONTENT: <问题-步骤-结果格式的记忆文本>"""
         title = title_part.split("\n")[0].strip()[:50]
         if len(parts) > 1:
             content = parts[1].strip()
-
-    # 截断到 400 字
-    if len(content) > config.STORY_MAX_CHARS:
-        content = content[:config.STORY_MAX_CHARS - 3] + "..."
 
     return {"title": title, "content": content}
 
@@ -164,7 +230,7 @@ CONTENT: <合并后的记忆文本>"""
 
     result = _chat(prompt)
     if not result:
-        return {"title": "合并记忆", "content": (old_content + "\n" + new_content)[:400]}
+        return {"title": "合并记忆", "content": old_content + "\n" + new_content}
 
     title = "合并记忆"
     content = result
@@ -174,16 +240,11 @@ CONTENT: <合并后的记忆文本>"""
         if len(parts) > 1:
             content = parts[1].strip()
 
-    if len(content) > config.STORY_MAX_CHARS:
-        content = content[:config.STORY_MAX_CHARS - 3] + "..."
-
     return {"title": title, "content": content}
 
 
 def judge_split(merged_text: str) -> bool:
-    """判断合并后的 story 是否需要分裂"""
-    if len(merged_text) > config.STORY_MAX_CHARS:
-        return True
+    """按独立结论/适用性判断是否分裂，不使用字符阈值。"""
 
     prompt = f"""判断以下技术记忆是否包含两个或以上独立可复用的子步骤。
 
@@ -207,10 +268,10 @@ def split_story(merged_text: str) -> list[dict]:
     prompt = f"""请将以下技术记忆拆分为多个独立的子记忆。
 
 要求：
-1. 每个子记忆不超过400字
-2. 每个子记忆聚焦一个独立可复用的子问题
+1. 每个子记忆聚焦一个独立可复用的结论与适用条件
+2. 同一问题的完整证据与动作不可因长度拆散
 3. 保持"问题-步骤-结果"格式
-4. 通常拆分为2-3个子记忆
+4. 仅在存在多个独立结论时拆分
 
 记忆内容：
 {merged_text[:2000]}
@@ -225,7 +286,7 @@ CONTENT: <内容>"""
 
     result = _chat(prompt)
     if not result:
-        return [{"title": "拆分记忆", "content": merged_text[:400]}]
+        return [{"title": "拆分记忆", "content": merged_text}]
 
     # 解析子 story
     sub_stories = []
@@ -250,12 +311,9 @@ CONTENT: <内容>"""
                     break
             title = _fallback[:24] or f"子记忆 {idx}"
 
-        if len(content) > config.STORY_MAX_CHARS:
-            content = content[:config.STORY_MAX_CHARS - 3] + "..."
-
         sub_stories.append({"title": title, "content": content})
 
-    return sub_stories if sub_stories else [{"title": "拆分记忆", "content": merged_text[:400]}]
+    return sub_stories if sub_stories else [{"title": "拆分记忆", "content": merged_text}]
 
 
 def extract_problem_summary(raw_content: str) -> str:

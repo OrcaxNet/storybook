@@ -22,6 +22,7 @@ CLI 入口 — storybook 命令
   storybook search <query>          搜索记忆
   storybook status --performance    最近查询性能摘要
   storybook benchmark               10k Story warm/cold 查询基准
+  storybook embedding-backfill      增量构建并切换 embedding 版本
   storybook stats                   查看统计
   storybook list                    列出所有story
   storybook show <story_id>         查看story详情
@@ -40,6 +41,7 @@ from . import (
     collector,
     config,
     dreamd,
+    embeddings,
     health,
     perf_benchmark,
     performance,
@@ -711,6 +713,33 @@ def search(query, top, context_mode, scope, cwd):
     click.echo(output)
 
 
+@cli.command(name="embedding-backfill")
+@click.option("--model", default=None, help="目标 Ollama embedding 模型")
+@click.option("--version", required=True, help="不可变的目标 embedding 版本")
+@click.option(
+    "--representation",
+    type=click.Choice(["default", "full"]),
+    default="default",
+    show_default=True,
+)
+@click.option("--batch-size", type=click.IntRange(min=1), default=100,
+              show_default=True, help="本次最多处理的 Story 数；重复运行可续跑")
+@click.option("--no-activate", is_flag=True,
+              help="即使 shadow 已完整也不切换 serving 索引")
+def embedding_backfill(model, version, representation, batch_size, no_activate):
+    """增量重建 embedding shadow，并在完整后原子切换 serving index。"""
+
+    store.init_db()
+    result = embeddings.backfill(
+        model=model or config.EMBED_MODEL,
+        version=version,
+        representation=representation,
+        batch_size=batch_size,
+        activate=not no_activate,
+    )
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @cli.command()
 def stats():
     """📊 系统统计"""
@@ -841,25 +870,31 @@ def main():
 
 @cli.command()
 @click.argument("part", required=False, default="all",
-                type=click.Choice(["all", "retrieval", "processing", "split"]))
+                type=click.Choice([
+                    "all", "retrieval", "processing", "split", "ablation"
+                ]))
 @click.option("--report", "-r", type=click.Path(dir_okay=False, writable=True),
               help="把完整 JSON 报告写入该路径")
 @click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
               help="自定义 benchmark 数据集 JSON（默认 data/retrieval_benchmark.json）")
 def eval(part, report, benchmark_path):
-    """📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
+    """📐 检索、加工、分裂与 Story v2 embedding 表示消融
 
-    PART 取值：retrieval / processing / split / all（默认 all）。
+    PART 取值：retrieval / processing / split / ablation / all（默认 all）。
 
     retrieval 用真实 embedding + 人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、
     阈值敏感性曲线，并判定是否达 PRD「重复 bug 检索准确率≥70%」(recall@3)。
     processing 用真实 embedding + 确定性 LLM 桩，度量 merge/update 分支是否选对。
     split 度量分裂路径结构正确性。
+    ablation 比较 legacy/default/full/multi-vector，并按 exact/synonym/
+    cross-tool/cross-language 分组报告质量与时延。
 
     需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染用户 Profile 数据库。
     用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
     """
-    parts = ("retrieval", "processing", "split") if part == "all" else (part,)
+    parts = (
+        "retrieval", "processing", "split", "ablation"
+    ) if part == "all" else (part,)
     click.echo(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
 
     bp = benchmark_path

@@ -378,7 +378,9 @@ def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]
         top_matches.append({
             "story_id": match["story_id"],
             "title": match["title"],
+            "abstract": match.get("abstract", match["content"]),
             "content": match["content"],
+            "truncated": bool(match.get("truncated")),
             "keywords": match["keywords"],
             "similarity": match["similarity"],
             "score": match.get("score", match["similarity"]),
@@ -392,7 +394,11 @@ def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]
                 {
                     "story_id": item["id"],
                     "title": item["title"],
-                    "content": item["content"],
+                    "content": item.get("abstract") or item["content"],
+                    "truncated": bool(
+                        item.get("abstract")
+                        and item.get("abstract") != item.get("content")
+                    ),
                     "weight": item.get("weight", 0),
                     "edge_type": item.get("edge_type", "semantic"),
                 }

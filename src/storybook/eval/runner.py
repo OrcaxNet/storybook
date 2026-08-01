@@ -15,10 +15,13 @@ import contextlib
 import logging
 import sqlite3
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Optional
 
-from .. import config, store, embeddings, llm as llm_mod, processor
+import numpy as np
+
+from .. import config, store, embeddings, llm as llm_mod, processor, story_v2
 from . import benchmark as bm
 from . import metrics as M
 
@@ -28,6 +31,7 @@ KS = (1, 3, 5)
 # 阈值敏感性扫描点
 SEARCH_THRESHOLD_SWEEP = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
 HIGH_THRESHOLD_SWEEP = [0.80, 0.82, 0.85, 0.88, 0.90, 0.92, 0.95]
+ABLATION_MODES = ("legacy", "default", "full", "multi_vector")
 
 
 # ═══════════════════════════════════════════════
@@ -64,6 +68,7 @@ def _patch_llm(extract=None, summarize=None, merge=None, judge=None, split=None)
     saved = {
         "extract_keywords": llm_mod.extract_keywords,
         "summarize_session": llm_mod.summarize_session,
+        "form_stories": llm_mod.form_stories,
         "merge_stories": llm_mod.merge_stories,
         "judge_split": llm_mod.judge_split,
         "split_story": llm_mod.split_story,
@@ -72,6 +77,7 @@ def _patch_llm(extract=None, summarize=None, merge=None, judge=None, split=None)
         llm_mod.extract_keywords = extract
     if summarize is not None:
         llm_mod.summarize_session = summarize
+        llm_mod.form_stories = lambda content: [summarize(content)]
     if merge is not None:
         llm_mod.merge_stories = merge
     if judge is not None:
@@ -125,9 +131,6 @@ class CuratedLLM:
 
     def judge_split(self, merged_text):
         self._tick("judge_split")
-        # 复刻真实 llm.judge_split 的硬规则：合并文本 > STORY_MAX_CHARS 必分裂
-        if len(merged_text) > config.STORY_MAX_CHARS:
-            return True
         return bool(self.should_split)
 
     def split_story(self, merged_text):
@@ -269,6 +272,204 @@ def run_retrieval_eval(
         "negatives": neg_rows,
         "threshold_sweep": curve,
         "passes_70_percent_recall_at_3": passes_70,
+    }
+
+
+# ═══════════════════════════════════════════════
+#  Story v2 embedding representation ablation
+# ═══════════════════════════════════════════════
+
+def _topic_v2_payload(topic: bm.Topic) -> dict:
+    """Map the existing human-labelled topic into the Story v2 contract."""
+
+    return story_v2.normalize_story_payload({
+        "title": topic.title,
+        "abstract": topic.problem_desc,
+        "detail": {
+            "problem": topic.problem_desc,
+            "actions": [topic.content],
+            "outcome": topic.content,
+            "pitfalls": [],
+            "evidence": [topic.content],
+            "applicability": {
+                "applies_when": [{"domain": topic.domain}],
+                "excludes_when": [],
+            },
+        },
+        "sources": [{"evidence": ["retrieval benchmark ground truth"]}],
+        "keywords": topic.keywords,
+    })
+
+
+def _ablation_query_pairs(bench: bm.Benchmark) -> list[dict]:
+    pairs = list(bench.query_pairs)
+    # v1 of the benchmark predates ContextEnvelope. Add a deterministic
+    # cross-tool paraphrase from its human synonym label so reports always
+    # expose the required group without changing ground-truth topic identity.
+    for topic in bench.topics:
+        if "cross_tool" not in topic.queries:
+            pairs.append({
+                "query": (
+                    "在另一个 Agent 工具（Cursor/Codex/Claude Code）中遇到："
+                    + topic.queries.get("synonym", topic.problem_desc)
+                ),
+                "variant": "cross_tool",
+                "topic_id": topic.id,
+            })
+    return pairs
+
+
+def _percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int((len(ordered) - 1) * percentile))
+    return round(ordered[index], 3)
+
+
+def run_embedding_ablation(
+    benchmark_path: Path | str = None,
+    *,
+    baseline_mode: str = "legacy",
+) -> dict:
+    """Compare default/full/per-field multi-vector quality and local latency.
+
+    Query vectors and story vectors use the real configured embedding provider;
+    unit tests monkeypatch the module function. Multi-vector ranks a Story by
+    its best title/abstract/applicability field similarity and therefore records
+    three index vectors per Story instead of one.
+    """
+
+    bench = bm.load_benchmark(benchmark_path)
+    topics = {topic.id: topic for topic in bench.topics}
+    payloads = {topic.id: _topic_v2_payload(topic) for topic in bench.topics}
+    query_pairs = _ablation_query_pairs(bench)
+    results: dict[str, dict] = {}
+
+    for mode in ABLATION_MODES:
+        index_vectors: dict[str, list[list[float]]] = {}
+        index_latencies = []
+        embed_failures = 0
+        for topic_id, topic in topics.items():
+            payload = payloads[topic_id]
+            if mode == "legacy":
+                texts = [topic.index_text()]
+            elif mode == "multi_vector":
+                fields = story_v2.embedding_fields(payload)
+                texts = [
+                    fields[name] for name in ("title", "abstract", "applicability")
+                    if fields[name]
+                ]
+            else:
+                texts = [story_v2.embedding_input(payload, mode)]
+            vectors = []
+            for text in texts:
+                started = time.perf_counter()
+                vector = embeddings.embed(text)
+                index_latencies.append((time.perf_counter() - started) * 1000)
+                if vector:
+                    vectors.append(vector)
+                else:
+                    embed_failures += 1
+            if vectors:
+                index_vectors[topic_id] = vectors
+
+        rows = []
+        query_latencies = []
+        retrieval_latencies = []
+        for pair in query_pairs:
+            started = time.perf_counter()
+            query_vector = embeddings.embed(pair["query"])
+            query_latencies.append((time.perf_counter() - started) * 1000)
+            if not query_vector:
+                embed_failures += 1
+                continue
+            query_array = np.asarray(query_vector, dtype=np.float32)
+            ranking_started = time.perf_counter()
+            ranking = []
+            for topic_id, vectors in index_vectors.items():
+                similarities = [
+                    float(np.dot(query_array, np.asarray(vector, dtype=np.float32)))
+                    for vector in vectors
+                ]
+                ranking.append((topic_id, max(similarities)))
+            ranking.sort(key=lambda item: item[1], reverse=True)
+            retrieval_latencies.append(
+                (time.perf_counter() - ranking_started) * 1000
+            )
+            filtered = [
+                topic_id for topic_id, similarity in ranking
+                if similarity >= config.SIM_THRESHOLD_SEARCH
+            ]
+            rows.append({
+                "variant": pair["variant"],
+                "topic_id": pair["topic_id"],
+                "recall@3": M.recall_at_k(
+                    filtered, [pair["topic_id"]], 3
+                ),
+                "mrr": M.mrr(filtered, [pair["topic_id"]]),
+            })
+
+        def aggregate(subset, key):
+            return round(
+                sum(row[key] for row in subset) / len(subset), 4
+            ) if subset else 0.0
+
+        groups = {}
+        for variant in ("exact", "synonym", "cross_tool", "cross_lang"):
+            subset = [row for row in rows if row["variant"] == variant]
+            groups[variant] = {
+                "count": len(subset),
+                "recall@3": aggregate(subset, "recall@3"),
+                "mrr": aggregate(subset, "mrr"),
+            }
+        results[mode] = {
+            "recall@3": aggregate(rows, "recall@3"),
+            "mrr": aggregate(rows, "mrr"),
+            "query_count": len(rows),
+            "story_count": len(index_vectors),
+            "index_vectors_per_story": (
+                3 if mode == "multi_vector" else 1
+            ),
+            "embed_failures": embed_failures,
+            "groups": groups,
+            "latency_ms": {
+                "index_mean_per_vector": round(
+                    sum(index_latencies) / len(index_latencies), 3
+                ) if index_latencies else 0.0,
+                "index_mean_per_story": round(
+                    sum(index_latencies) / len(index_vectors), 3
+                ) if index_vectors else 0.0,
+                "query_p50": _percentile(query_latencies, 0.50),
+                "query_p95": _percentile(query_latencies, 0.95),
+                "retrieval_p50": _percentile(retrieval_latencies, 0.50),
+                "retrieval_p95": _percentile(retrieval_latencies, 0.95),
+            },
+        }
+
+    baseline = results[baseline_mode]["recall@3"]
+    default = results["default"]["recall@3"]
+    delta = round(default - baseline, 4)
+    passes = default >= baseline - 0.02
+    return {
+        "benchmark_version": bench.version,
+        "embedding_model": config.EMBED_MODEL,
+        "embedding_dimension": config.EMBED_DIM,
+        "similarity_threshold": config.SIM_THRESHOLD_SEARCH,
+        "topic_count": len(bench.topics),
+        "query_count": len(query_pairs),
+        "baseline_mode": baseline_mode,
+        "selected_mode": "default" if passes else baseline_mode,
+        "selection_gate": "recall@3 >= baseline - 0.02",
+        "default_delta_recall_at_3": delta,
+        "passes_two_point_non_regression": passes,
+        "modes": results,
+        "notes": [
+            "default = title + abstract + applicability",
+            "full = title + abstract + structured detail + applicability",
+            "multi_vector = max(title, abstract, applicability) field similarity",
+            "cross_tool is a deterministic paraphrase of each human synonym label",
+        ],
     }
 
 
@@ -415,7 +616,7 @@ def run_split_eval(
     results: list[dict] = []
     for case in bench.split_cases:
         with _isolated_db(db_path):
-            # 构造 >400 字的 merged 文本以强制触发分裂（judge_split 硬规则）
+            # 构造包含两段完整结论的 merged 文本，并用人工 split 标注触发。
             long_merged = case.incoming.summary["content"] + " " + (
                 "补充细节：" + case.existing.summary["content"]
             ) * 4
@@ -534,7 +735,7 @@ def run_split_eval(
         "passed": passed,
         "total": len(results),
         "accuracy": round(passed / len(results), 4) if results else 0.0,
-        "note": ("分裂触发由 judge_split 决定（>400 字硬规则 + 人工 SPLIT 标注）；"
+        "note": ("分裂触发由独立结论的人工 SPLIT 标注决定（不使用字符硬规则）；"
                  "结构校验：父向量移除、父子边 1.0、子向量入索引、子 story 可检索。"),
     }
 
@@ -544,11 +745,13 @@ def run_split_eval(
 # ═══════════════════════════════════════════════
 
 class EvalReport:
-    """三轮评测的汇总容器（dict-like，可 JSON 序列化）。"""
-    def __init__(self, retrieval=None, processing=None, split=None, meta=None):
+    """质量、加工、分裂与表示消融的汇总容器。"""
+    def __init__(self, retrieval=None, processing=None, split=None,
+                 ablation=None, meta=None):
         self.retrieval = retrieval
         self.processing = processing
         self.split = split
+        self.ablation = ablation
         self.meta = meta or {}
 
     def to_dict(self) -> dict:
@@ -557,12 +760,13 @@ class EvalReport:
             "retrieval": self.retrieval,
             "processing": self.processing,
             "split": self.split,
+            "ablation": self.ablation,
         }
 
 
 def run_all(
     db_path: Optional[Path] = None,
-    parts: tuple = ("retrieval", "processing", "split"),
+    parts: tuple = ("retrieval", "processing", "split", "ablation"),
     benchmark_path: Path | str = None,
 ) -> EvalReport:
     """跑指定子评测集合，返回 EvalReport。"""
@@ -576,6 +780,10 @@ def run_all(
     if "split" in parts:
         report.split = run_split_eval(db_path=db_path,
                                       benchmark_path=benchmark_path)
+    if "ablation" in parts:
+        report.ablation = run_embedding_ablation(
+            benchmark_path=benchmark_path
+        )
     return report
 
 
@@ -653,6 +861,36 @@ def format_report(report: EvalReport) -> str:
             lines.append(f"    {mark} {c['id']}: sim={c.get('sim')} branch={c.get('actual_branch')} "
                          f"split={c['actual_split']} checks={c['checks']}")
         lines.append(f"  说明: {sp['note']}")
+        lines.append("")
+
+    if report.ablation:
+        ab = report.ablation
+        lines.append("─" * 64)
+        lines.append("④ Story v2 embedding 表示消融")
+        lines.append("─" * 64)
+        for mode in ABLATION_MODES:
+            row = ab["modes"][mode]
+            latency = row["latency_ms"]
+            lines.append(
+                f"  {mode:12s}: recall@3={row['recall@3']:.2%} "
+                f"MRR={row['mrr']:.4f} vectors/story={row['index_vectors_per_story']} "
+                f"index/story={latency['index_mean_per_story']:.1f}ms "
+                f"query p95={latency['query_p95']:.1f}ms "
+                f"retrieval p95={latency['retrieval_p95']:.1f}ms"
+            )
+            groups = row["groups"]
+            lines.append(
+                " " * 16
+                + " | ".join(
+                    f"{name}={groups[name]['recall@3']:.2%}"
+                    for name in ("exact", "synonym", "cross_tool", "cross_lang")
+                )
+            )
+        lines.append(
+            f"  选型: {ab['selected_mode']} | default-baseline "
+            f"Δrecall@3={ab['default_delta_recall_at_3']:+.2%} | "
+            f"2pp 非劣门槛: {'✅' if ab['passes_two_point_non_regression'] else '❌'}"
+        )
         lines.append("")
 
     lines.append("=" * 64)
