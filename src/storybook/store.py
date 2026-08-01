@@ -114,6 +114,7 @@ def get_db(
 
 def init_db():
     """初始化数据库 schema，并补齐 v0.2 Profile/同步预留字段。"""
+    config.ensure_profile()
     db = get_db()
     try:
         db.executescript(_SCHEMA)

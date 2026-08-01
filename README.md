@@ -65,7 +65,7 @@ embed 查询（关键词 + 查询文本）→ vec0 top-K（取 `top_k*2`，按 `
 - **Ollama** 运行于 `http://localhost:11434`（可用 `OLLAMA_HOST` 覆盖），并拉取两个模型：
   - LLM：`qwythos-hermes:latest`（可用 `STORYBOOK_LLM_MODEL` 覆盖）
   - Embedding：`qwen3-embedding:0.6b`，**1024 维**（可用 `STORYBOOK_EMBED_MODEL` 覆盖）；需与 `config.EMBED_DIM` 一致
-- 依赖：`click`、`requests`、`numpy`、`sqlite-vec`
+- 依赖：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
 
 ```bash
 # 拉模型
@@ -83,9 +83,8 @@ uv venv .venv
 VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .
 # （项目目录移动后 shebang 可能失效，重新跑一次即可）
 
-# 3. 验证
-storybook profile show
-storybook stats
+# 3. 一键建立 Profile、接入已检测到的 Agent 并运行端到端自检
+storybook setup
 ```
 
 不想安装也可直接跑模块：
@@ -93,6 +92,32 @@ storybook stats
 ```bash
 PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 ```
+
+### 一键 setup 与安全卸载
+
+`storybook setup` 会先展示完整改动计划，再创建用户级 Profile/schema、检测并接入
+Claude Code、Cursor、Codex，检查或下载本地 Ollama 模型，最后执行 schema、embedding、
+adapter、recall smoke test。三类 Agent 都复用同一个 `storybook mcp` stdio server；Claude
+Code 还会安装幂等的 `SessionStart` recall hook。无需手工编辑 JSON/TOML。
+
+```bash
+storybook setup                         # 交互确认
+storybook setup --yes                   # 非交互安装
+storybook setup --dry-run               # 严格零写入（不建目录/DB、不下载模型）
+storybook setup --json                  # 结构化结果，便于自动化
+storybook setup --agent codex --yes     # 可重复 --agent，覆盖自动检测
+storybook setup --skip-models --yes     # 离线跳过缺失模型，状态为 degraded
+
+storybook uninstall                     # 恢复 setup 写入的节点，默认保留全部记忆
+storybook uninstall --dry-run
+storybook uninstall --purge-data        # 交互式二次确认后永久删除数据
+storybook uninstall --yes --purge-data --confirm-purge  # 非交互双重显式确认
+```
+
+配置更新使用同目录原子替换，并在用户 state 目录保存原文件备份与 hash；重复执行不会
+重复 MCP 节点或 hook。卸载只恢复名为 `storybook` 的受管节点，保留其他 server、hook
+和设置；若节点在安装后被人工修改，会报告 drift 并保留恢复状态，避免覆盖用户改动。
+旧项目级 `data/memory.db` 只会在计划/结果中提示，不会由 setup 擅自迁移或删除。
 
 ## 👤 用户级 Profile 与共享存储
 
@@ -148,7 +173,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **prime**：query 构造（cwd / first_prompt）、主动注入门槛（高于检索）、token 预算裁剪、静默不注入（空库 / 低于门槛 / embedding 失败 / schema 缺失均不抛错）。
 - **集成**：用 `generate_sample_sessions` 与 `test_logs/*.json` 跑通 collector → store → processor → search 全链路。
 - **dreamd（做梦周期自动化）**：`fcntl.flock` 并发锁互斥与释放、`run_dream_cycle_once` 采集+加工/跳过/空、监听循环首帧追补与变化触发、定时守护、信号退出、`logs/dream.log` 幂等写入。全 mock，不依赖 Ollama。
-- **MCP server**：`tests/test_mcp_server.py` 覆盖四个工具（`recall`/`get_story`/`stats`/`prime_context`）的核心逻辑与 FastMCP 装配/端到端调用。需 `.[mcp,test]`（即多装 `[mcp]` extra）；未装时该文件自动 skip，不影响基础 `pytest` 全绿。
+- **MCP server**：`tests/test_mcp_server.py` 覆盖四个工具（`recall`/`get_story`/`stats`/`prime_context`）的核心逻辑与 FastMCP 装配/端到端调用。
 
 ## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
 
@@ -208,6 +233,8 @@ storybook benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 
 ```bash
 storybook init                       # 初始化数据库 schema + vec0 虚表（其它命令也会自动初始化）
+storybook setup [--yes|--dry-run|--json]  # 用户级存储 + 三类 Agent 接入 + smoke test
+storybook uninstall [--purge-data]   # 恢复受管配置；默认保留记忆
 storybook profile show|list          # 查看用户级 Profile 与数据目录
 storybook profile create NAME        # 创建 isolated Profile（可加 --switch）
 storybook profile switch ID_OR_NAME  # 切换当前 Profile
@@ -301,7 +328,7 @@ MCP server 是一个独立 stdio 进程，**复用** `search.search` / `store.ge
 
 ### 安装
 
-MCP SDK 作为可选依赖，需单独安装：
+MCP SDK 已包含在基础安装中；旧版 `.[mcp]` 安装命令仍兼容：
 
 ```bash
 VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[mcp]"
@@ -505,7 +532,7 @@ storybook/
 
 - **完全离线**：所有 LLM / embedding 走本地 Ollama，不发送任何数据到云端。
 - **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
-- **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（需 `[mcp]` extra；接入见上文「🔌 MCP 接入」）。
+- **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「🔌 MCP 接入」）。
 - **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / Ollama 不可用时静默不注入（见上文「🌅 会话启动注入」）。
 - `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「🧪 测试」与「🌙 做梦周期自动化」）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。

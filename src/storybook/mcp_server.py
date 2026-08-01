@@ -12,16 +12,16 @@
                                   ≤2k token 的精简摘要，相关度不足时静默不注入
 
 启动方式（二选一，均为独立进程，不依赖 CLI 运行态）：
-  storybook mcp                   # 经 CLI 入口（需安装 [mcp] extra）
+  storybook mcp                   # 经 CLI 入口
   python -m storybook.mcp_server  # 直接跑模块（editable 安装后即可）
 
-MCP SDK 采用延迟导入：base 安装无需 ``mcp`` 依赖，仅在使用 MCP server 时才需要。
+MCP SDK 保持延迟导入，便于核心逻辑隔离测试；v0.2 起已是基础安装依赖。
 """
 from __future__ import annotations
 
 import logging
 
-from . import embeddings, store  # embeddings/store 导入 config，触发 .env / 目录初始化
+from . import embeddings, store  # embeddings 提供预热；DB 初始化由 _ensure_db 显式触发
 from . import prime as prime_module
 from . import search as search_module
 
@@ -196,8 +196,7 @@ def prime_context_memories(cwd: str = "", first_prompt: str = "",
 def create_server():
     """构造并返回 FastMCP server，注册四个工具。
 
-    ``mcp`` SDK 在此处延迟导入：未安装 [mcp] extra 时抛 ModuleNotFoundError，
-    由 ``main`` 转为可操作提示。
+    ``mcp`` SDK 在此处延迟导入；缺失时由 ``main`` 转为可操作提示。
     """
     from mcp.server.fastmcp import FastMCP
 
@@ -267,7 +266,7 @@ def main() -> None:
     except ModuleNotFoundError as e:
         if "mcp" in str(e).lower():
             raise SystemExit(
-                "未安装 MCP SDK。请运行：uv pip install -e \".[mcp]\""
+                "未安装 MCP SDK。请重新安装 Storybook 基础依赖"
             )
         raise
     mcp.run()  # 默认 stdio 传输
