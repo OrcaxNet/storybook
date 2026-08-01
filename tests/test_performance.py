@@ -7,7 +7,7 @@ from itertools import chain
 import pytest
 from click.testing import CliRunner
 
-from storybook import config, perf_benchmark, performance, search, store
+from storybook import config, feedback, perf_benchmark, performance, search, store
 from storybook.cli import cli
 
 from ._helpers import basis
@@ -78,7 +78,9 @@ class TestQueryDiagnostics:
         assert payload["performance"]["latency_ms"]["total"]["p95"] == 12.5
 
 
-@pytest.mark.parametrize("delayed_stage", ["embed", "vector", "rerank", "graph", "serialize"])
+@pytest.mark.parametrize(
+    "delayed_stage", ["cache", "embed", "vector", "rerank", "graph", "serialize"]
+)
 def test_mocked_stage_latency_is_attributed_to_that_stage(
     delayed_stage, fake_embedder, monkeypatch
 ):
@@ -86,11 +88,11 @@ def test_mocked_stage_latency_is_attributed_to_that_stage(
     fake_embedder.register("q", basis(0))
     durations = {
         stage: (0.025 if stage == delayed_stage else 0.0)
-        for stage in ("embed", "vector", "rerank", "graph", "serialize")
+        for stage in ("cache", "embed", "vector", "rerank", "graph", "serialize")
     }
     current = 0.0
     values = [current]  # total start
-    for stage in ("embed", "vector", "rerank", "graph", "serialize"):
+    for stage in ("cache", "embed", "vector", "rerank", "graph", "serialize"):
         values.extend((current, current + durations[stage]))
         current += durations[stage]
     values.append(current)  # total end
@@ -102,7 +104,7 @@ def test_mocked_stage_latency_is_attributed_to_that_stage(
     assert result["latency_ms"][delayed_stage] == 25.0
     assert result["latency_ms"]["total"] == 25.0
     other_stages = {
-        stage for stage in ("embed", "vector", "rerank", "graph", "serialize")
+        stage for stage in ("cache", "embed", "vector", "rerank", "graph", "serialize")
         if stage != delayed_stage
     }
     assert all(result["latency_ms"][stage] == 0.0 for stage in other_stages)
@@ -163,3 +165,48 @@ class TestPerformanceBenchmark:
         # 4 requests: concurrency=1 有 4 批，concurrency=2 有 2 批。
         assert len(calls) == 6
         assert report["model"]["state"] == "cold"
+
+    def test_10k_reference_cache_and_warm_lanes_meet_gates(self, fake_embedder):
+        """固定 mock embedding 隔离模型波动，守护索引/缓存自身的 10k 门槛。"""
+        self._register_fixed_vectors(fake_embedder)
+
+        report = perf_benchmark.run_performance_benchmark(
+            story_count=10_000,
+            query_count=6,
+            repeats=2,
+            concurrencies=(1,),
+            model_state="warm",
+        )
+
+        scenario = report["scenarios"][0]
+        assert scenario["latency_by_mode"]["cache"]["total"]["p95"] <= 80
+        assert scenario["latency_by_mode"]["vector"]["total"]["p95"] <= 1_000
+        assert scenario["quality"]["overall"]["recall@3"] >= 0.98
+
+    def test_10k_fallback_lane_completes_within_500ms(self, fake_embedder):
+        bench = self._register_fixed_vectors(fake_embedder)
+        pairs = perf_benchmark._fixed_query_pairs(bench, 6)
+        required_topics = {pair["topic_id"] for pair in pairs}
+
+        with perf_benchmark._isolated_database():
+            perf_benchmark._seed_dataset(
+                bench, story_count=10_000, required_topics=required_topics
+            )
+            for pair in pairs:
+                fake_embedder.register(pair["query"], None)
+
+            durations = []
+            for _ in range(2):
+                for pair in pairs:
+                    result = search.search(
+                        pair["query"], top_k=5, record_diagnostics=False
+                    )
+                    assert result["mode"] == "lexical_fallback"
+                    assert result["fallback_status"] == "ok"
+                    durations.append(
+                        result["latency_ms"]["fallback"]
+                        + result["latency_ms"]["graph"]
+                    )
+            assert feedback.flush_feedback(timeout=5.0)
+
+        assert performance.percentile(durations, 95) <= 500

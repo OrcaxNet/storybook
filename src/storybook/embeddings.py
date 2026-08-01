@@ -2,6 +2,8 @@
 嵌入层 — 封装 Ollama embedding API + 余弦相似度
 """
 import logging
+import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -11,19 +13,30 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
+_STATE_LOCK = threading.Lock()
+_LAST_SUCCESS_AT: float | None = None
 
-def embed(text: str, model: str = None) -> Optional[list[float]]:
+
+def embed(
+    text: str,
+    model: str = None,
+    *,
+    timeout_seconds: float | None = None,
+    keep_alive: str | None = None,
+) -> Optional[list[float]]:
     """调用 Ollama 生成语义向量，返回 L2 归一化后的向量。
 
     - 维度不匹配 / 零向量时返回 None（上层据此标记 failed 或报错，不再传入坏向量）。
     - 归一化保证 store.search_by_vector 中 ``1 - dist²/2`` 等于 cosine 相似度（精确）。
     """
     model = model or config.EMBED_MODEL
+    timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
+    keep_alive = config.EMBED_KEEP_ALIVE if keep_alive is None else keep_alive
     try:
         resp = requests.post(
             f"{config.OLLAMA_HOST}/api/embeddings",
-            json={"model": model, "prompt": text},
-            timeout=30,
+            json={"model": model, "prompt": text, "keep_alive": keep_alive},
+            timeout=(min(1.0, timeout_seconds), timeout_seconds),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -36,7 +49,43 @@ def embed(text: str, model: str = None) -> Optional[list[float]]:
         if norm == 0:
             logger.warning("零向量，跳过")
             return None
-        return (arr / norm).tolist()
+        result = (arr / norm).tolist()
+        mark_model_used()
+        return result
     except Exception as e:
         logger.error("Embedding 失败: %s", e)
         return None
+
+
+def model_state() -> str:
+    """返回本进程观察到的模型 warm/cold 状态。"""
+
+    with _STATE_LOCK:
+        last_success = _LAST_SUCCESS_AT
+    if last_success is None:
+        return "cold"
+    if time.monotonic() - last_success > config.EMBED_WARM_WINDOW_SECONDS:
+        return "cold"
+    return "warm"
+
+
+def mark_model_used() -> None:
+    global _LAST_SUCCESS_AT
+    with _STATE_LOCK:
+        _LAST_SUCCESS_AT = time.monotonic()
+
+
+def mark_model_cold() -> None:
+    global _LAST_SUCCESS_AT
+    with _STATE_LOCK:
+        _LAST_SUCCESS_AT = None
+
+
+def prewarm() -> bool:
+    """best-effort 预热 embedding 模型，并用 keep_alive 保持驻留。"""
+
+    return bool(embed(
+        "storybook embedding warmup",
+        timeout_seconds=config.QUERY_COLD_TIMEOUT_SECONDS,
+        keep_alive=config.EMBED_KEEP_ALIVE,
+    ))

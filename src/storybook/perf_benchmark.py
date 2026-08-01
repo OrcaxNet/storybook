@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import requests
 
-from . import config, embeddings, performance, store
+from . import config, embeddings, feedback, performance, query_cache, store
 from . import search as search_module
 from .eval import benchmark as benchmark_module
 from .eval import metrics
@@ -77,6 +77,7 @@ def run_performance_benchmark(
                     unload_model_fn=unload_model_fn,
                 )
             )
+        feedback.flush_feedback(timeout=30.0)
         database_bytes = db_path.stat().st_size if db_path.exists() else 0
 
     return {
@@ -141,6 +142,14 @@ def format_benchmark_report(report: dict) -> str:
             f"{total['p99']:.3f}ms | cache={scenario['cache_hit_ratio']:.1%} | "
             f"fallback={scenario['fallback_ratio']:.1%}"
         )
+        cache_total = scenario.get("latency_by_mode", {}).get("cache", {}).get("total")
+        vector_total = scenario.get("latency_by_mode", {}).get("vector", {}).get("total")
+        if cache_total or vector_total:
+            lines.append(
+                "  lane p95(ms): "
+                f"cache={(cache_total or {}).get('p95', 0):.3f} · "
+                f"vector={(vector_total or {}).get('p95', 0):.3f}"
+            )
         stage_bits = []
         for stage in performance.LATENCY_STAGES[:-1]:
             stage_bits.append(
@@ -280,11 +289,14 @@ def _run_scenario(
     unload_model_fn: Callable[[], None] | None,
 ) -> dict:
     tasks = [pair for _ in range(repeats) for pair in pairs]
+    query_cache.clear()
     if (
         model_state == "warm"
         and not embeddings.embed("storybook performance benchmark warmup")
     ):
         raise RuntimeError("embedding 预热失败")
+    if model_state == "warm":
+        embeddings.mark_model_used()
 
     unload = unload_model_fn or unload_embedding_model
     outputs = []
@@ -293,6 +305,8 @@ def _run_scenario(
             batch = tasks[start:start + concurrency]
             if model_state == "cold":
                 unload()
+                embeddings.mark_model_cold()
+                query_cache.clear()
             futures = [
                 executor.submit(
                     _query_once, pair, topic_to_story[pair["topic_id"]]
@@ -311,10 +325,30 @@ def _run_scenario(
         }
 
     fallback_rows = [row for row in outputs if row["mode"] == "lexical_fallback"]
+    latency_by_mode = {}
+    for mode in ("cache", "vector", "lexical_fallback"):
+        mode_rows = [row for row in outputs if row["mode"] == mode]
+        if not mode_rows:
+            continue
+        latency_by_mode[mode] = {
+            stage: {
+                "p50": performance.percentile(
+                    [row["latency_ms"][stage] for row in mode_rows], 50
+                ),
+                "p95": performance.percentile(
+                    [row["latency_ms"][stage] for row in mode_rows], 95
+                ),
+                "p99": performance.percentile(
+                    [row["latency_ms"][stage] for row in mode_rows], 99
+                ),
+            }
+            for stage in performance.LATENCY_STAGES
+        }
     return {
         "concurrency": concurrency,
         "sample_count": len(outputs),
         "latency_ms": latency,
+        "latency_by_mode": latency_by_mode,
         "cache_hit_ratio": _ratio(
             sum(row["mode"] == "cache" for row in outputs), len(outputs)
         ),

@@ -91,7 +91,7 @@ class FakeEmbedder:
         assert len(vector) == DIM
         self._default = vector
 
-    def __call__(self, text: str, model: str = None):
+    def __call__(self, text: str, model: str = None, **kwargs):
         self.calls.append(text)
         if text in self._overrides:
             return self._overrides[text]
