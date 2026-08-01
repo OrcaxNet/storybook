@@ -21,6 +21,9 @@ from . import story_v2
 
 logger = logging.getLogger(__name__)
 
+LEGACY_EMBED_VERSION = "story-v1-unversioned"
+LEGACY_EMBED_REPRESENTATION = "legacy"
+
 _SCHEMA = """
 -- 会话日志表（原始导入数据）
 CREATE TABLE IF NOT EXISTS sessions (
@@ -231,11 +234,23 @@ def init_db():
                 embedding FLOAT[{config.EMBED_DIM}]
             )
         """)
+        legacy_vector = db.execute(
+            """SELECT 1 FROM stories
+               WHERE embedding IS NOT NULL AND embedding_version IS NULL
+               LIMIT 1"""
+        ).fetchone()
+        initial_version = (
+            LEGACY_EMBED_VERSION if legacy_vector else config.EMBED_VERSION
+        )
+        initial_representation = (
+            LEGACY_EMBED_REPRESENTATION
+            if legacy_vector else config.EMBED_REPRESENTATION
+        )
         db.execute(
             """INSERT OR IGNORE INTO embedding_index_state (
                    id, active_model, active_version, active_representation
                ) VALUES (1, ?, ?, ?)""",
-            (config.EMBED_MODEL, config.EMBED_VERSION, config.EMBED_REPRESENTATION),
+            (config.EMBED_MODEL, initial_version, initial_representation),
         )
         db.commit()
         logger.info("数据库初始化完成: %s", config.DB_PATH)
@@ -499,12 +514,20 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
         "embedding_content_hash": "TEXT",
         "embedding_status": "TEXT NOT NULL DEFAULT 'active'",
     }
-    columns = {
+    original_columns = {
         row["name"] for row in db.execute("PRAGMA table_info(stories)").fetchall()
     }
     for name, declaration in additions.items():
-        if name not in columns:
+        if name not in original_columns:
             db.execute(f"ALTER TABLE stories ADD COLUMN {name} {declaration}")
+
+    structure_was_legacy = not {
+        "abstract", "detail_json", "sources_json"
+    }.issubset(original_columns)
+    metadata_was_legacy = not {
+        "embedding_model", "embedding_version", "embedding_content_hash",
+        "embedding_status",
+    }.issubset(original_columns)
 
     rows = db.execute("SELECT * FROM stories ORDER BY id").fetchall()
     for row in rows:
@@ -521,47 +544,71 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
             },
             source_session_ids=source_ids,
         )
-        embedding_model = row["embedding_model"]
-        embedding_version = row["embedding_version"]
-        embedding_hash = row["embedding_content_hash"]
-        if row["embedding"] is not None:
-            embedding_model = embedding_model or config.EMBED_MODEL
-            embedding_version = embedding_version or config.EMBED_VERSION
-            embedding_hash = embedding_hash or story_v2.content_hash(payload)
-        db.execute(
-            """UPDATE stories SET
-                   abstract = ?, detail_json = ?, sources_json = ?,
-                   embedding_model = ?, embedding_version = ?,
-                   embedding_content_hash = ?, embedding_status = ?
-               WHERE id = ?""",
-            (
-                payload["abstract"],
-                json.dumps(payload["detail"], ensure_ascii=False, sort_keys=True),
-                json.dumps(payload["sources"], ensure_ascii=False, sort_keys=True),
-                embedding_model,
-                embedding_version,
-                embedding_hash,
-                "active" if row["embedding"] is not None else "archived",
-                row["id"],
-            ),
-        )
+        if structure_was_legacy:
+            db.execute(
+                """UPDATE stories SET abstract = ?, detail_json = ?, sources_json = ?
+                   WHERE id = ?""",
+                (
+                    payload["abstract"],
+                    json.dumps(
+                        payload["detail"], ensure_ascii=False, sort_keys=True
+                    ),
+                    json.dumps(
+                        payload["sources"], ensure_ascii=False, sort_keys=True
+                    ),
+                    row["id"],
+                ),
+            )
+        if metadata_was_legacy:
+            # An unversioned v0.1 BLOB has no trustworthy model/input/hash
+            # provenance.  Keep it available for an explicit legacy serving
+            # window, but require shadow backfill before claiming v2 metadata.
+            existing_model = (
+                row["embedding_model"]
+                if "embedding_model" in original_columns else None
+            )
+            existing_version = (
+                row["embedding_version"]
+                if "embedding_version" in original_columns else None
+            )
+            existing_hash = (
+                row["embedding_content_hash"]
+                if "embedding_content_hash" in original_columns else None
+            )
+            existing_status = (
+                row["embedding_status"]
+                if "embedding_status" in original_columns else None
+            )
+            provenance_complete = all(
+                (existing_model, existing_version, existing_hash)
+            )
+            if row["embedding"] is None:
+                migrated_status = "archived"
+            elif existing_status in {"stale", "failed", "archived"}:
+                migrated_status = existing_status
+            elif provenance_complete:
+                migrated_status = "active"
+            else:
+                migrated_status = "stale"
+            db.execute(
+                """UPDATE stories SET embedding_model = ?,
+                          embedding_version = ?,
+                          embedding_content_hash = ?,
+                          embedding_status = ?
+                   WHERE id = ?""",
+                (
+                    existing_model, existing_version, existing_hash,
+                    migrated_status, row["id"],
+                ),
+            )
+        migrated = db.execute(
+            "SELECT * FROM stories WHERE id = ?", (row["id"],)
+        ).fetchone()
         revision_exists = db.execute(
             "SELECT 1 FROM story_revisions WHERE story_id = ? AND story_version = ?",
             (row["id"], row["version"]),
         ).fetchone()
         if revision_exists is None:
-            snapshot = {
-                "title": payload["title"],
-                "abstract": payload["abstract"],
-                "content": payload["content"],
-                "detail": payload["detail"],
-                "sources": payload["sources"],
-                "keywords": payload["keywords"],
-                "applicability": payload["applicability"],
-                "embedding_model": embedding_model,
-                "embedding_version": embedding_version,
-                "embedding_content_hash": embedding_hash,
-            }
             db.execute(
                 """INSERT INTO story_revisions (
                        story_id, story_version, event_type, snapshot_json,
@@ -569,7 +616,11 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
                    ) VALUES (?, ?, 'migrate', ?, ?)""",
                 (
                     row["id"], row["version"],
-                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    json.dumps(
+                        _revision_snapshot(migrated),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
                     json.dumps(source_ids),
                 ),
             )
@@ -1243,11 +1294,15 @@ def add_story(title: str, content: str, keywords: list[str],
         active_spec = _active_embedding_spec(db)
         embedding_model = embedding_model or active_spec["active_model"]
         embedding_version = embedding_version or active_spec["active_version"]
-        embedding_content_hash = (
-            embedding_content_hash or story_v2.content_hash(
-                payload, active_spec["active_representation"]
-            )
+        expected_hash = story_v2.content_hash(
+            payload, active_spec["active_representation"]
         )
+        if (
+            embedding_content_hash is not None
+            and embedding_content_hash != expected_hash
+        ):
+            raise ValueError("embedding_content_hash does not match persisted Story")
+        embedding_content_hash = expected_hash
         cur = db.execute(
             """INSERT INTO stories (
                    global_id, profile_id, sync_state,
@@ -1304,29 +1359,57 @@ def update_story(story_id: int, title: str = None, content: str = None,
             return
         sets = []
         params = []
+
         if title is not None:
             sets.append("title = ?")
             params.append(title)
-        if content is not None:
-            sets.append("content = ?")
-            params.append(content)
         if abstract is not None:
             bounded, _ = story_v2.bound_abstract(abstract)
             sets.append("abstract = ?")
             params.append(bounded)
-        if detail is not None:
-            normalized_detail = story_v2.normalize_detail(
-                detail,
-                legacy_content=content if content is not None else current["content"],
-                applicability=applicability or current["applicability_json"],
+
+        current_applicability = context_module.normalize_applicability(
+            current["applicability_json"]
+        )
+        effective_applicability = (
+            context_module.normalize_applicability(applicability)
+            if applicability is not None else current_applicability
+        )
+        if detail is not None or applicability is not None:
+            raw_detail = dict(
+                detail
+                if isinstance(detail, dict)
+                else _json_load(current["detail_json"], {})
             )
+            if content is not None and detail is None:
+                raw_detail["problem"] = content
+            if applicability is not None:
+                raw_detail["applicability"] = effective_applicability
+            normalized_detail = story_v2.normalize_detail(
+                raw_detail,
+                legacy_content=content if content is not None else current["content"],
+                applicability=effective_applicability,
+            )
+            effective_applicability = normalized_detail["applicability"]
             sets.append("detail_json = ?")
             params.append(json.dumps(
                 normalized_detail, ensure_ascii=False, sort_keys=True
             ))
-            if content is None:
-                sets.append("content = ?")
-                params.append(story_v2.render_detail(normalized_detail))
+            sets.extend(("content = ?", "applicability_json = ?"))
+            params.extend((
+                (
+                    content
+                    if content is not None
+                    else story_v2.render_detail(normalized_detail)
+                ),
+                json.dumps(
+                    effective_applicability, ensure_ascii=False, sort_keys=True
+                ),
+            ))
+        elif content is not None:
+            sets.append("content = ?")
+            params.append(content)
+
         if sources is not None or source_session_ids is not None:
             effective_ids = list(dict.fromkeys(
                 source_session_ids
@@ -1357,52 +1440,48 @@ def update_story(story_id: int, title: str = None, content: str = None,
             emb_blob = np.array(embedding, dtype=np.float32).tobytes()
             sets.append("embedding = ?")
             params.append(emb_blob)
-        if applicability is not None:
-            sets.append("applicability_json = ?")
-            params.append(json.dumps(
-                context_module.normalize_applicability(applicability),
-                ensure_ascii=False,
-                sort_keys=True,
-            ))
-        representation_changed = any(
-            value is not None
-            for value in (title, content, abstract, detail, applicability)
-        )
-        if embedding is not None:
-            active_spec = _active_embedding_spec(db)
-            stored_abstract = (
-                story_v2.bound_abstract(abstract)[0]
-                if abstract is not None else current["abstract"]
-            )
-            next_story = {
-                "title": title if title is not None else current["title"],
-                "abstract": stored_abstract,
-                "content": content if content is not None else current["content"],
-                "detail": detail if detail is not None else _json_load(current["detail_json"], {}),
-                "applicability": (
-                    applicability if applicability is not None
-                    else _json_load(current["applicability_json"], {})
-                ),
-                "keywords": keywords if keywords is not None else _json_load(current["keywords"], []),
-            }
-            sets.extend((
-                "embedding_model = ?", "embedding_version = ?",
-                "embedding_content_hash = ?", "embedding_status = 'active'",
-            ))
-            params.extend((
-                embedding_model or active_spec["active_model"],
-                embedding_version or active_spec["active_version"],
-                embedding_content_hash or story_v2.content_hash(
-                    next_story, active_spec["active_representation"]
-                ),
-            ))
-        elif representation_changed:
-            sets.append("embedding_status = 'stale'")
+
         sets.append("version = version + 1")
         sets.append("updated_at = datetime('now')")
         params.append(story_id)
 
         db.execute(f"UPDATE stories SET {', '.join(sets)} WHERE id = ?", params)
+
+        persisted = db.execute(
+            "SELECT * FROM stories WHERE id = ?", (story_id,)
+        ).fetchone()
+        active_spec = _active_embedding_spec(db)
+        expected_hash = story_v2.content_hash(
+            _row_to_story(persisted), active_spec["active_representation"]
+        )
+        if embedding is not None:
+            if (
+                embedding_content_hash is not None
+                and embedding_content_hash != expected_hash
+            ):
+                raise ValueError(
+                    "embedding_content_hash does not match persisted Story"
+                )
+            db.execute(
+                """UPDATE stories SET embedding_model = ?, embedding_version = ?,
+                          embedding_content_hash = ?, embedding_status = 'active'
+                   WHERE id = ?""",
+                (
+                    embedding_model or active_spec["active_model"],
+                    embedding_version or active_spec["active_version"],
+                    expected_hash,
+                    story_id,
+                ),
+            )
+        elif (
+            persisted["embedding"] is not None
+            and persisted["embedding_status"] != "archived"
+            and persisted["embedding_content_hash"] != expected_hash
+        ):
+            db.execute(
+                "UPDATE stories SET embedding_status = 'stale' WHERE id = ?",
+                (story_id,),
+            )
 
         # 如果向量更新了，同步到虚拟表
         if embedding is not None:
@@ -1414,7 +1493,10 @@ def update_story(story_id: int, title: str = None, content: str = None,
                 (story_id, emb_blob)
             )
         _record_revision(db, story_id, event_type)
-        if any(value is not None for value in (title, content, keywords, embedding)):
+        if any(value is not None for value in (
+            title, content, keywords, embedding, applicability, abstract,
+            detail, sources, source_session_ids,
+        )):
             _bump_index_version(db)
         db.commit()
         logger.info("更新 story #%d", story_id)
@@ -1547,6 +1629,7 @@ def update_story_raw_sessions(story_id: int, session_ids: list[int]):
             )
         )
         _record_revision(db, story_id, "source_update")
+        _bump_index_version(db)
         db.commit()
     finally:
         db.close()

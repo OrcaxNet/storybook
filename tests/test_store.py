@@ -136,6 +136,49 @@ class TestStoryCRUD:
     def test_get_story_missing(self):
         assert store.get_story(99999) is None
 
+    @pytest.mark.parametrize("status", ["stale", "failed"])
+    def test_init_db_preserves_embedding_status_and_metadata(self, status):
+        sid = store.add_story("t", "c", [], basis(0))
+        store.update_story(sid, title="changed")
+        db = store.get_db(load_vector_extension=False)
+        try:
+            db.execute(
+                "UPDATE stories SET embedding_status = ? WHERE id = ?",
+                (status, sid),
+            )
+            db.commit()
+        finally:
+            db.close()
+        before = store.get_story(sid)
+
+        store.init_db()
+
+        after = store.get_story(sid)
+        assert after["embedding_status"] == status
+        assert after["embedding_model"] == before["embedding_model"]
+        assert after["embedding_version"] == before["embedding_version"]
+        assert after["embedding_content_hash"] == before["embedding_content_hash"]
+
+    def test_story_v2_updates_invalidate_query_cache_version(self):
+        source_id = store.add_session("test", "raw", "problem")
+        sid = store.add_story("t", "c", [], basis(0))
+        updates = [
+            {"abstract": "new abstract"},
+            {"detail": {"problem": "new detail", "outcome": "done"}},
+            {"applicability": {"applies_when": [{"runtime.kind": "local"}]}},
+            {"sources": [{"evidence": ["line 1"]}]},
+            {"source_session_ids": [source_id]},
+        ]
+
+        for kwargs in updates:
+            before = store.get_index_version()
+            store.update_story(sid, **kwargs)
+            assert store.get_index_version() == before + 1
+
+        before = store.get_index_version()
+        store.update_story_raw_sessions(sid, [source_id])
+        assert store.get_index_version() == before + 1
+
 
 # ═══════════════════════════════════════════════
 #  无向边归一 _edge_pair / add_or_update_edge / increment_edge_weight

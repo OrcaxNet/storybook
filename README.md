@@ -59,6 +59,8 @@ collector → store → processor (用 llm + embeddings) → search
 
 每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录 create/update/merge/split 快照。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
 
+从 v0.1 升级时，无法审计模型、输入表示与 hash 的旧向量会保留为 `story-v1-unversioned/legacy` 服务窗口，Story 标记为 `stale` 且不冒充 v2 元数据；必须完成可续跑的 shadow backfill 后，才会原子切换为 v2 active 状态。重复初始化不会覆盖 `stale`、`failed` 或 `archived` 等真实状态。
+
 ```bash
 # 每次最多重建 100 条；重复运行自动跳过 content_hash 未变化的 ready 项
 storybook embedding-backfill --model qwen3-embedding:0.6b \

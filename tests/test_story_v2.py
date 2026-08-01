@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+
+import numpy as np
+import pytest
 
 from storybook import config, embeddings, mcp_server, processor, store, story_v2
 
@@ -181,3 +185,119 @@ def test_story_metadata_hash_is_stable_and_auditable():
     assert story["embedding_version"] == config.EMBED_VERSION
     assert story["embedding_content_hash"] == story_v2.content_hash(story)
     json.dumps(store.get_story_revisions(story_id), ensure_ascii=False)
+
+
+@pytest.mark.parametrize("representation", ["default", "full", "legacy"])
+def test_update_hash_matches_final_persisted_story_for_active_representation(
+    representation,
+):
+    story_id = store.add_story("old", "old content", ["old"], basis(0))
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute(
+            "UPDATE embedding_index_state SET active_representation = ? WHERE id = 1",
+            (representation,),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    detail = {
+        "problem": "new problem",
+        "actions": ["new action"],
+        "outcome": "new outcome",
+        "evidence": ["new evidence"],
+        "applicability": {
+            "applies_when": [{"runtime.kind": "local"}],
+            "excludes_when": [],
+        },
+    }
+    store.update_story(
+        story_id,
+        title="new title",
+        abstract="new abstract",
+        detail=detail,
+        keywords=["new"],
+        embedding=basis(1),
+    )
+
+    story = store.get_story(story_id)
+    assert story["content"] == story_v2.render_detail(story["detail"])
+    assert story["applicability"] == story["detail"]["applicability"]
+    assert story["embedding_content_hash"] == story_v2.content_hash(
+        story, representation
+    )
+
+
+def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch):
+    config.DB_PATH.unlink()
+    legacy = sqlite3.connect(config.DB_PATH)
+    legacy.executescript(
+        """
+        CREATE TABLE sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            raw_content TEXT NOT NULL,
+            problem_desc TEXT,
+            code_snippets TEXT,
+            conclusion TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT DEFAULT (datetime('now')),
+            processed_at TEXT
+        );
+        CREATE TABLE stories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            keywords TEXT NOT NULL DEFAULT '[]',
+            embedding BLOB,
+            parent_id INTEGER,
+            source_session_ids TEXT DEFAULT '[]',
+            access_count INTEGER DEFAULT 0,
+            version INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            weight REAL DEFAULT 0.0,
+            edge_type TEXT DEFAULT 'semantic',
+            UNIQUE(source_id, target_id)
+        );
+        """
+    )
+    legacy.execute(
+        "INSERT INTO stories (title, content, embedding) VALUES (?, ?, ?)",
+        (
+            "legacy",
+            "legacy content",
+            np.asarray(basis(0), dtype=np.float32).tobytes(),
+        ),
+    )
+    legacy.commit()
+    legacy.close()
+
+    store.init_db()
+    store.init_db()
+
+    migrated = store.get_story(1)
+    initial_state = store.get_embedding_index_state()
+    assert migrated["embedding_status"] == "stale"
+    assert migrated["embedding_version"] is None
+    assert migrated["embedding_content_hash"] is None
+    assert initial_state["active_version"] != config.EMBED_VERSION
+    assert initial_state["active_representation"] == "legacy"
+
+    monkeypatch.setattr(embeddings, "embed", lambda *args, **kwargs: basis(2))
+    result = embeddings.backfill(
+        model=config.EMBED_MODEL,
+        version=config.EMBED_VERSION,
+        representation="default",
+    )
+    switched = store.get_story(1)
+    assert result["activation"]["activated"] == 1
+    assert switched["embedding_status"] == "active"
+    assert switched["embedding_version"] == config.EMBED_VERSION
+    assert switched["embedding_content_hash"] == story_v2.content_hash(switched)
