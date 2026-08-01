@@ -70,6 +70,33 @@ class TestContextEnvelopePersistence:
         assert envelope["workspace"]["id"] is None
         assert envelope["provenance"]["workspace.id"] == "unknown"
 
+    def test_partial_historical_envelope_does_not_detect_current_machine(
+        self, monkeypatch
+    ):
+        def fail_local_detection(*args, **kwargs):
+            raise AssertionError("historical normalization read local environment")
+
+        monkeypatch.setattr(context_module, "_local_device_id", fail_local_detection)
+        monkeypatch.setattr(context_module, "_runtime_kind", fail_local_detection)
+
+        envelope = context_module.normalize_envelope({
+            "tool": {"type": "cursor", "integration_mode": "log_import"},
+        })
+
+        assert envelope["tool"]["type"] == "cursor"
+        assert envelope["tool"]["installation_id"] is None
+        assert all(value is None for value in envelope["device"].values())
+        assert envelope["runtime"] == {
+            "kind": None,
+            "remote_host_hash": None,
+            "container_id_hash": None,
+            "shell": None,
+            "versions": {},
+        }
+        for field in (*envelope["device"], *envelope["runtime"]):
+            group = "device" if field in envelope["device"] else "runtime"
+            assert envelope["provenance"][f"{group}.{field}"] == "unknown"
+
     def test_sensitive_adapter_values_are_hashed_or_aliased(self):
         envelope = context_module.capture_context(
             tool_type="codex",
@@ -349,6 +376,36 @@ class TestContextEnvelopePersistence:
         assert parsed["context"]["tool"]["version"] == "1.2.3"
         assert parsed["context"]["workspace"]["project_label"] == "repo-a"
 
+    def test_claude_log_context_is_independent_of_import_runtime(
+        self, tmp_path, monkeypatch
+    ):
+        log = tmp_path / "stable-session.jsonl"
+        log.write_text(
+            json.dumps({
+                "type": "user",
+                "cwd": "/work/repo-a",
+                "timestamp": "2026-08-01T01:02:03Z",
+                "message": {"role": "user", "content": "diagnose stable failure"},
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        monkeypatch.delenv("SSH_CLIENT", raising=False)
+        local_context = collector._parse_claude_jsonl(
+            log, "stable-session"
+        )["context"]
+        monkeypatch.setenv("SSH_CONNECTION", "10.0.0.1 1 10.0.0.2 22")
+        ssh_context = collector._parse_claude_jsonl(
+            log, "stable-session"
+        )["context"]
+
+        local_context.pop("captured_at")
+        ssh_context.pop("captured_at")
+        assert local_context == ssh_context
+        assert all(value is None for value in local_context["device"].values())
+        assert local_context["runtime"]["kind"] is None
+        assert local_context["runtime"]["remote_host_hash"] is None
+
 
 class TestStoryEnvironmentHistory:
     def test_story_keeps_all_source_environments(self):
@@ -448,3 +505,16 @@ class TestEnvironmentAwareRecall:
         fake_embedder.register("q", basis(0))
         with pytest.raises(ValueError, match="scope"):
             search.search("q", scope="project-only")
+
+    def test_unknown_mcp_tool_does_not_create_false_tool_conflict(self):
+        current = context_module.capture_context(
+            tool_type="other", integration_mode="mcp", runtime_kind="local"
+        )
+        story = context_module.capture_context(
+            tool_type="claude_code", integration_mode="hook", runtime_kind="local"
+        )
+
+        fit = context_module.evaluate_story_context(current, [story], {})
+
+        assert not any("tool differs" in warning for warning in fit["warnings"])
+        assert fit["strict_excluded"] is False

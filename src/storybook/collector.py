@@ -64,12 +64,21 @@ def _extract_from_vscdb(vscdb_path: Path) -> list[dict]:
                     value = value.decode("utf-8", errors="ignore")
                 data = json.loads(value)
                 # 尝试解析会话结构
-                adapter_context = context_module.capture_context(
-                    tool_type="cursor",
-                    integration_mode="log_import",
-                    workspace_path=_cursor_workspace_path(vscdb_path),
-                    provenance="detected",
-                )
+                workspace_path = _cursor_workspace_path(vscdb_path)
+                adapter_context = context_module.normalize_envelope({
+                    "tool": {
+                        "type": "cursor",
+                        "integration_mode": "log_import",
+                    },
+                    "workspace": (
+                        {"path": workspace_path} if workspace_path else {}
+                    ),
+                    "provenance": {
+                        "tool.type": "detected",
+                        "tool.integration_mode": "detected",
+                        "workspace.path": "detected",
+                    },
+                })
                 for conv in _parse_cursor_conversation(
                     data, row["key"], adapter_context=adapter_context
                 ):
@@ -292,15 +301,27 @@ def _parse_claude_jsonl(path: Path, session_id: str) -> Optional[dict]:
         "problem_desc": problem_desc,
         "code_snippets": "[]",
         "conclusion": assistant_texts[-1][:300] if assistant_texts else "",
-        "context": context_module.capture_context(
-            tool_type="claude_code",
-            tool_version=tool_version,
-            integration_mode="log_import",
-            external_session_id=session_id,
-            workspace_path=cwd,
-            branch=branch,
-            started_at=started_at,
-        ),
+        "context": context_module.normalize_envelope({
+            "tool": {
+                "type": "claude_code",
+                "version": tool_version,
+                "integration_mode": "log_import",
+            },
+            "session": {
+                "external_session_id": session_id,
+                "started_at": started_at,
+            },
+            "workspace": {"path": cwd, "branch": branch},
+            "provenance": {
+                "tool.type": "detected",
+                "tool.version": "reported",
+                "tool.integration_mode": "detected",
+                "session.external_session_id": "detected",
+                "session.started_at": "reported",
+                "workspace.path": "reported",
+                "workspace.branch": "reported",
+            },
+        }),
     }
 
 

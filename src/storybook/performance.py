@@ -20,7 +20,9 @@ from . import config
 
 logger = logging.getLogger(__name__)
 
-LATENCY_STAGES = ("cache", "embed", "vector", "graph", "rerank", "serialize", "total")
+LATENCY_STAGES = (
+    "cache", "embed", "vector", "fallback", "graph", "rerank", "serialize", "total"
+)
 _VALID_MODES = {"cache", "vector", "lexical_fallback", "unavailable", "error"}
 _VALID_DEGRADED_REASONS = {
     "embedding_unavailable",
@@ -75,7 +77,7 @@ def record_query_diagnostic(
         for stage in LATENCY_STAGES
     }
     record = {
-        "schema_version": 1,
+        "schema_version": 2,
         "timestamp": datetime.now(UTC).isoformat(),
         "request_id": _safe_request_id(request_id),
         "mode": safe_mode,

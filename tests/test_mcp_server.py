@@ -144,11 +144,13 @@ class TestRecallMemories:
         assert strict["matches"] == []
         assert strict["strict_filtered"] == 1
 
-    def test_embedding_failure_raises_actionable_error(self, fake_embedder):
+    def test_embedding_failure_returns_degraded_state(self, fake_embedder):
         fake_embedder.register("q", None)   # 模拟向量生成失败（Ollama 不可用等）
-        with pytest.raises(RuntimeError) as exc:
-            mcp_server.recall_memories("q")
-        assert "storybook doctor" in str(exc.value)
+        out = mcp_server.recall_memories("q")
+        assert out["count"] == 0
+        assert out["degraded"] is True
+        assert out["result_state"] == "degraded_empty"
+        assert out["fallback_status"] == "ok"
 
     def test_empty_query_raises(self):
         with pytest.raises(ValueError):
@@ -213,6 +215,22 @@ class TestGetStatsOverview:
 # ═══════════════════════════════════════════════
 
 class TestPrimeContextMemories:
+    def test_marks_unknown_tool_with_mcp_integration(self, monkeypatch):
+        captured = {}
+
+        def fake_prime_context(**kwargs):
+            captured.update(kwargs)
+            return {"injected": False, "briefing": ""}
+
+        monkeypatch.setattr(
+            mcp_server.prime_module, "prime_context", fake_prime_context
+        )
+
+        mcp_server.prime_context_memories(cwd="/x/proj", first_prompt="q")
+
+        assert captured["tool_type"] == "other"
+        assert captured["integration_mode"] == "mcp"
+
     def test_injects_on_match(self, fake_embedder):
         a = _seed("A", basis(0))
         fake_embedder.register("q", basis(0))

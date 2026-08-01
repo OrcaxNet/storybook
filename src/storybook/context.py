@@ -524,6 +524,7 @@ def normalize_envelope(
 ) -> dict:
     """Normalize nested or PRD-style flattened input to a canonical envelope."""
 
+    explicit_context = value is not None
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -531,12 +532,29 @@ def normalize_envelope(
             value = None
     value = value if isinstance(value, dict) else {}
     source_tool, source_mode = _source_tool(source)
-    base = capture_context(
-        tool_type=source_tool,
-        integration_mode=source_mode,
-        captured_at=captured_at or value.get("captured_at"),
+    target_profile = (
+        _uuid_or_none(profile_id or value.get("profile_id")) or config.PROFILE_ID
     )
-    base["profile_id"] = _uuid_or_none(profile_id or value.get("profile_id")) or config.PROFILE_ID
+    if explicit_context:
+        # A supplied envelope is evidence, often imported from another machine.
+        # Missing leaves must remain unknown instead of inheriting this process.
+        base = _empty_envelope(
+            target_profile,
+            _normalise_timestamp(captured_at or value.get("captured_at")) or utc_now(),
+        )
+        if source_tool != "other":
+            base["tool"]["type"] = source_tool
+            base["tool"]["integration_mode"] = source_mode
+            base["provenance"]["tool.type"] = "reported"
+            base["provenance"]["tool.integration_mode"] = "reported"
+    else:
+        # No context means a new live Session, where local detection is desired.
+        base = capture_context(
+            tool_type=source_tool,
+            integration_mode=source_mode,
+            captured_at=captured_at,
+        )
+    base["profile_id"] = target_profile
 
     supplied_provenance = value.get("provenance")
     supplied_provenance = supplied_provenance if isinstance(supplied_provenance, dict) else {}
@@ -819,6 +837,10 @@ def _compare_environment(current: dict, story: dict) -> dict:
         left = _get(current, field)
         right = _get(story, field)
         if left in (None, "", "unknown") or right in (None, "", "unknown"):
+            continue
+        if field == "tool.type" and "other" in (left, right):
+            # ``other`` means the caller could not identify its host agent; it
+            # must not create a concrete cross-tool conflict.
             continue
         compared = True
         if left == right:

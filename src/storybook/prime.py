@@ -221,8 +221,15 @@ def _build_briefing(candidates: list[dict], token_budget: int
 #  主动注入核心
 # ═══════════════════════════════════════════════
 
-def prime_context(cwd: str = "", first_prompt: str = "",
-                  top_k: int = None, token_budget: int = None) -> dict:
+def prime_context(
+    cwd: str = "",
+    first_prompt: str = "",
+    top_k: int = None,
+    token_budget: int = None,
+    *,
+    tool_type: str = "other",
+    integration_mode: str = "manual",
+) -> dict:
     """主动召回并生成"晨间简报"。
 
     基于 ``cwd`` + 可选 ``first_prompt`` 构造 query，复用 ``search.search`` 召回 top-N
@@ -255,8 +262,8 @@ def prime_context(cwd: str = "", first_prompt: str = "",
 
     query = build_query(cwd, first_prompt)
     current_context = context_module.capture_context(
-        tool_type="other",
-        integration_mode="hook",
+        tool_type=tool_type,
+        integration_mode=integration_mode,
         workspace_path=cwd or None,
     )
     base = {
@@ -297,6 +304,14 @@ def prime_context(cwd: str = "", first_prompt: str = "",
         )
         return base
 
+    if result.get("degraded") and not result.get("top_matches"):
+        reason = result.get("degraded_reason") or "embedding_unavailable"
+        base["note"] = (
+            f"召回已降级（{reason}），关键词 fallback 未命中；"
+            f"这不等同于确认无相关记忆。可运行 `storybook doctor` 排查。"
+        )
+        return base
+
     # 主动注入用更高相关度门槛，避免弱相关记忆污染每次会话开头
     candidates = [
         m for m in result.get("top_matches", [])
@@ -304,6 +319,10 @@ def prime_context(cwd: str = "", first_prompt: str = "",
     ]
     if not candidates:
         # 相关度不足：静默不注入，无 note（这是正常情况，非异常）
+        if result.get("degraded"):
+            base["note"] = (
+                "召回使用关键词降级，但候选未达到主动注入门槛；未注入上下文。"
+            )
         return base
 
     # search.search 已按相似度降序返回，显式保证一次

@@ -95,6 +95,34 @@ EMBED_MODEL = os.getenv("STORYBOOK_EMBED_MODEL", "qwen3-embedding:0.6b")
 EMBED_DIM = 1024
 LLM_THINK = os.getenv("STORYBOOK_LLM_THINK", "0") == "1"  # Qwen3 思考模式；提取类任务关闭可约 9x 加速，准确率不足时设 1
 
+# ── 查询快路径 ──
+# Ollama 的 keep_alive 由每次 embedding 请求续期；进程内 warm window 用于选择
+# 2s/5s 硬超时预算，不作为跨进程主键或持久状态。
+EMBED_KEEP_ALIVE = os.getenv("STORYBOOK_EMBED_KEEP_ALIVE", "10m")
+EMBED_WARM_WINDOW_SECONDS = float(
+    os.getenv("STORYBOOK_EMBED_WARM_WINDOW_SECONDS", "600")
+)
+QUERY_WARM_TIMEOUT_SECONDS = float(
+    os.getenv("STORYBOOK_QUERY_WARM_TIMEOUT_SECONDS", "2")
+)
+QUERY_COLD_TIMEOUT_SECONDS = float(
+    os.getenv("STORYBOOK_QUERY_COLD_TIMEOUT_SECONDS", "5")
+)
+QUERY_FALLBACK_TIMEOUT_SECONDS = float(
+    os.getenv("STORYBOOK_QUERY_FALLBACK_TIMEOUT_SECONDS", "0.5")
+)
+QUERY_VECTOR_CACHE_SIZE = int(os.getenv("STORYBOOK_QUERY_VECTOR_CACHE_SIZE", "256"))
+QUERY_RESULT_CACHE_SIZE = int(os.getenv("STORYBOOK_QUERY_RESULT_CACHE_SIZE", "128"))
+QUERY_VECTOR_CACHE_TTL_SECONDS = float(
+    os.getenv("STORYBOOK_QUERY_VECTOR_CACHE_TTL_SECONDS", "900")
+)
+QUERY_RESULT_CACHE_TTL_SECONDS = float(
+    os.getenv("STORYBOOK_QUERY_RESULT_CACHE_TTL_SECONDS", "300")
+)
+QUERY_FEEDBACK_QUEUE_SIZE = int(
+    os.getenv("STORYBOOK_QUERY_FEEDBACK_QUEUE_SIZE", "1024")
+)
+
 # ── 记忆加工阈值 ──
 SIM_THRESHOLD_HIGH = 0.85      # ≥ → 合并/更新
 SIM_THRESHOLD_UPDATE_ONLY = 0.92  # ≥ → 仅补充细节（不合并内容）

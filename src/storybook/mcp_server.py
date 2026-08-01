@@ -4,7 +4,7 @@
 ``store.get_stats`` / ``prime.prime_context``，不重复实现检索逻辑。
 
 工具：
-  - recall(query, top_k?)        向量检索 + 关联激活（与 CLI ``search`` 同源，含 access_count/边权提权副作用）
+  - recall(query, top_k?)        缓存/向量/词法降级 + 关联激活（反馈写异步入队）
   - get_story(story_id)          查看单条记忆详情（含关联记忆）
   - stats()                      记忆库概况
   - prime_context(cwd, first_prompt?, top_k?)
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from . import config, store  # config 触发 .env / 目录初始化
+from . import embeddings, store  # embeddings/store 导入 config，触发 .env / 目录初始化
 from . import prime as prime_module
 from . import search as search_module
 
@@ -43,6 +43,13 @@ def _ensure_db() -> None:
         store.init_db()
     except Exception as e:  # noqa: BLE001
         logger.warning("init_db 失败，工具调用时将按需报错: %s", e)
+
+
+def _prewarm_embedding() -> None:
+    """MCP 启动时 best-effort 预热，失败后查询仍可走词法降级。"""
+
+    if not embeddings.prewarm():
+        logger.warning("embedding 预热失败；recall 将在需要时走快速降级")
 
 
 # ═══════════════════════════════════════════════
@@ -88,6 +95,7 @@ def _build_recall_result(result: dict) -> dict:
             "environments": m.get("environments", []),
             "applicability": m.get("applicability", {}),
             "warnings": m.get("warnings", []),
+            "retrieval_source": m.get("retrieval_source", "vector"),
             "related": _trim_related(m.get("related", [])),
         })
     return {
@@ -98,6 +106,10 @@ def _build_recall_result(result: dict) -> dict:
         "mode": result.get("mode", "vector"),
         "degraded": bool(result.get("degraded")),
         "degraded_reason": result.get("degraded_reason"),
+        "result_state": result.get("result_state", "results" if matches else "no_match"),
+        "fallback_status": result.get("fallback_status"),
+        "cache_hit": bool(result.get("cache_hit")),
+        "index_version": result.get("index_version"),
         "latency_ms": result.get("latency_ms", {}),
         "scope": result.get("scope", "profile"),
         "strict_filtered": result.get("strict_filtered", 0),
@@ -116,12 +128,13 @@ def recall_memories(
 ) -> dict:
     """召回与查询相关的记忆（向量检索 + 关联激活）。
 
-    复用 ``search.search``，继承其 access_count 自增与共同召回边权提权副作用
-    （与人脑"反复回忆加深记忆路径"的隐喻一致）。
+    复用 ``search.search``；access_count 与共同召回边权反馈异步入队，
+    不占用 recall 响应热路径。
 
     返回 ``{query, count, matches: [...]}``；``count == 0`` 表示无匹配
     （记忆库为空或无相关记忆），此时 ``matches`` 为空列表，不返回噪声。
-    embedding 不可用（Ollama 未运行等）时抛 ``RuntimeError`` 并给出可操作提示。
+    embedding 不可用或超时时返回 ``degraded=true``，并尝试 500ms 内的词法降级；
+    ``result_state`` 可区分正常无匹配与降级空结果。
     """
     if not query or not query.strip():
         raise ValueError("query 不能为空")
@@ -132,12 +145,6 @@ def recall_memories(
         context=context,
         scope=scope,
     )
-    if result.get("error"):
-        # search.search 在向量生成失败时返回 error 键；对 agent 而言这是环境问题而非"无匹配"
-        raise RuntimeError(
-            f"recall 失败：{result['error']}。请确认 Ollama 已运行且 embedding 模型"
-            f"（{config.EMBED_MODEL}）可用，可运行 `storybook doctor` 排查。"
-        )
     return _build_recall_result(result)
 
 
@@ -199,7 +206,13 @@ def prime_context_memories(cwd: str = "", first_prompt: str = "",
     语义见 ``prime.prime_context``：相关度不足 / 召回为空 / Ollama 不可用时
     ``injected=False``、``briefing=""``，不抛错（晨间简报须非侵入）。
     """
-    return prime_module.prime_context(cwd=cwd, first_prompt=first_prompt, top_k=top_k)
+    return prime_module.prime_context(
+        cwd=cwd,
+        first_prompt=first_prompt,
+        top_k=top_k,
+        tool_type="other",
+        integration_mode="mcp",
+    )
 
 
 # ═══════════════════════════════════════════════
@@ -227,8 +240,8 @@ def create_server():
 
         在开始一项新任务前调用，复用过往相似经历。返回 count 表示命中数；
         count=0 表示无相关记忆，应直接继续而非反复重试。related 仅含摘要，
-        需要某条关联的全文请用 get_story。embedding 不可用时会报错
-        （先确认 Ollama 运行，或 `storybook doctor`）。
+        需要某条关联的全文请用 get_story。embedding 不可用或超时时返回
+        degraded 状态与词法 fallback；可用 `storybook doctor` 排查环境。
 
         Args:
             query: 自然语言查询，描述当前任务或问题。
@@ -281,6 +294,7 @@ def create_server():
 def main() -> None:
     """MCP server 入口：确保 DB -> 装配 server -> 以 stdio 运行。"""
     _ensure_db()
+    _prewarm_embedding()
     try:
         mcp = create_server()
     except ModuleNotFoundError as e:

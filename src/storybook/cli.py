@@ -280,6 +280,7 @@ def prime(cwd, first_prompt, top_k, token_budget, output_format):
         result = prime_module.prime_context(
             cwd=cwd, first_prompt=first_prompt,
             top_k=top_k, token_budget=token_budget,
+            tool_type="claude_code", integration_mode="hook",
         )
     except Exception as e:  # noqa: BLE001  -- 绝不向 hook 上下文抛错
         result = {

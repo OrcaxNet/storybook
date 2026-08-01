@@ -5,9 +5,12 @@
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
-from storybook import store, search as search_module, config
+from storybook import embeddings, feedback, store, search as search_module, config
 from ._helpers import basis, with_cos
 
 
@@ -75,6 +78,7 @@ class TestAssociationActivation:
         related_ids = [r["story_id"] for r in match["related"]]
         assert b in related_ids
         # 命中 story 的 access_count 自增
+        assert feedback.flush_feedback(timeout=1.0)
         assert store.get_story(a)["access_count"] == 1
 
     def test_related_ordered_by_weight_desc(self, fake_embedder):
@@ -109,6 +113,7 @@ class TestCommonRecallBoost:
         fake_embedder.register("q", basis(0))
 
         search_module.search("q", top_k=3)
+        assert feedback.flush_feedback(timeout=1.0)
 
         # 三对边各 +0.1（每对仅一次）
         def weight(x, y):
@@ -133,9 +138,11 @@ class TestCommonRecallBoost:
         fake_embedder.register("q", basis(0))
 
         search_module.search("q", top_k=3)
+        assert feedback.flush_feedback(timeout=1.0)
         assert _weight(a, b) == pytest.approx(0.4, abs=1e-6)   # 第一次 +0.1
 
         search_module.search("q", top_k=3)
+        assert feedback.flush_feedback(timeout=1.0)
         assert _weight(a, b) == pytest.approx(0.5, abs=1e-6)   # 第二次再 +0.1
 
     def test_no_boost_for_unrelated_non_co_recalled(self, fake_embedder):
@@ -162,11 +169,14 @@ def _weight(x: int, y: int) -> float | None:
 # ═══════════════════════════════════════════════
 
 class TestSearchBoundaries:
-    def test_embedding_failure_returns_error(self, fake_embedder):
+    def test_embedding_failure_returns_explicit_degraded_empty(self, fake_embedder):
         fake_embedder.register("q", None)   # 模拟向量生成失败
         result = search_module.search("q", top_k=3)
         assert result["top_matches"] == []
-        assert "error" in result
+        assert result["degraded"] is True
+        assert result["mode"] == "lexical_fallback"
+        assert result["result_state"] == "degraded_empty"
+        assert "error" not in result
 
     def test_result_shape(self, fake_embedder):
         a = _seed("A", basis(0))
@@ -178,6 +188,201 @@ class TestSearchBoundaries:
         # 关键字段齐全
         for key in ("story_id", "title", "content", "keywords", "similarity", "related"):
             assert key in m
+
+
+# ═══════════════════════════════════════════════
+#  快路径缓存与 index_version
+# ═══════════════════════════════════════════════
+
+class TestFastPathCache:
+    def test_result_and_vector_cache_are_invalidated_by_index_version(
+        self, fake_embedder
+    ):
+        first = _seed("first", with_cos(0, 0.8))
+        fake_embedder.register("q", basis(0))
+
+        initial = search_module.search("q", top_k=2)
+        cached = search_module.search("q", top_k=2)
+
+        assert initial["mode"] == "vector"
+        assert cached["mode"] == "cache"
+        assert cached["index_version"] == initial["index_version"]
+        assert fake_embedder.calls == ["q"]
+
+        second = _seed("second", basis(0))
+        refreshed = search_module.search("q", top_k=2)
+
+        assert refreshed["mode"] == "vector"
+        assert refreshed["index_version"] > initial["index_version"]
+        assert refreshed["top_matches"][0]["story_id"] == second
+        assert first in [item["story_id"] for item in refreshed["top_matches"]]
+        # index_version 同时使 query vector cache 失效。
+        assert fake_embedder.calls == ["q", "q"]
+
+    def test_top_k_result_miss_can_reuse_query_vector_cache(self, fake_embedder):
+        _seed("A", basis(0))
+        _seed("B", with_cos(0, 0.9))
+        fake_embedder.register("q", basis(0))
+
+        search_module.search("q", top_k=1)
+        result = search_module.search("q", top_k=2)
+
+        assert result["mode"] == "vector"
+        assert result["query_vector_cache_hit"] is True
+        assert fake_embedder.calls == ["q"]
+
+    def test_feedback_writes_do_not_invalidate_retrieval_cache(self, fake_embedder):
+        story_id = _seed("A", basis(0))
+        fake_embedder.register("q", basis(0))
+        before = store.get_index_version()
+
+        search_module.search("q")
+        assert feedback.flush_feedback(timeout=1.0)
+
+        assert store.get_story(story_id)["access_count"] == 1
+        assert store.get_index_version() == before
+        assert search_module.search("q")["mode"] == "cache"
+
+    def test_fast_path_never_calls_generative_llm(self, fake_embedder, fake_llm):
+        _seed("A", basis(0))
+        fake_embedder.register("q", basis(0))
+
+        search_module.search("q")
+
+        assert fake_llm.calls == {}
+
+    def test_first_query_uses_cold_budget_then_switches_to_warm_budget(
+        self, monkeypatch
+    ):
+        _seed("A", basis(0))
+        monkeypatch.setattr(config, "QUERY_COLD_TIMEOUT_SECONDS", 0.4)
+        monkeypatch.setattr(config, "QUERY_WARM_TIMEOUT_SECONDS", 0.2)
+        observed = []
+
+        def capture_embed(text, **kwargs):
+            observed.append(kwargs["timeout_seconds"])
+            return basis(0)
+
+        monkeypatch.setattr(embeddings, "embed", capture_embed)
+
+        search_module.search("cold-query")
+        search_module.search("warm-query")
+
+        assert observed == [0.4, 0.2]
+
+
+# ═══════════════════════════════════════════════
+#  词法降级、硬超时与异步反馈
+# ═══════════════════════════════════════════════
+
+class TestLexicalFallback:
+    def test_embedding_unavailable_returns_fts_keyword_results(self, fake_embedder):
+        story_id = store.add_story(
+            "SQLite 锁冲突排查",
+            "WAL 模式下先检查 busy timeout 与长事务。",
+            ["sqlite", "database locked"],
+            basis(0),
+        )
+        fake_embedder.register("SQLite 锁冲突", None)
+
+        result = search_module.search("SQLite 锁冲突")
+
+        assert result["mode"] == "lexical_fallback"
+        assert result["degraded"] is True
+        assert result["degraded_reason"] == "embedding_unavailable"
+        assert result["result_state"] == "degraded_results"
+        assert result["fallback_status"] == "ok"
+        assert result["top_matches"][0]["story_id"] == story_id
+        assert result["top_matches"][0]["retrieval_source"] == "lexical"
+
+    def test_normal_empty_and_degraded_empty_are_distinguishable(self, fake_embedder):
+        _seed("unrelated", basis(0))
+        fake_embedder.register("normal-empty", basis(5))
+        fake_embedder.register("degraded-empty", None)
+
+        normal = search_module.search("normal-empty")
+        degraded = search_module.search("degraded-empty")
+
+        assert normal["result_state"] == "no_match"
+        assert normal["degraded"] is False
+        assert degraded["result_state"] == "degraded_empty"
+        assert degraded["degraded"] is True
+
+    def test_story_update_is_visible_to_fts_fallback(self, fake_embedder):
+        story_id = _seed("old title", basis(0))
+        store.update_story(story_id, title="new searchable phrase")
+        fake_embedder.register("new searchable phrase", None)
+
+        result = search_module.search("new searchable phrase")
+
+        assert [item["story_id"] for item in result["top_matches"]] == [story_id]
+
+    def test_warm_embedding_hard_timeout_falls_back_without_waiting_for_worker(
+        self, monkeypatch
+    ):
+        story_id = store.add_story(
+            "timeout fallback", "recover through keywords", ["timeout"], basis(0)
+        )
+        embeddings.mark_model_used()
+        monkeypatch.setattr(config, "QUERY_WARM_TIMEOUT_SECONDS", 0.02)
+        monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 0.05)
+
+        def slow_embed(*args, **kwargs):
+            time.sleep(0.2)
+            return basis(0)
+
+        monkeypatch.setattr(embeddings, "embed", slow_embed)
+        started = time.perf_counter()
+        result = search_module.search("timeout fallback")
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.12
+        assert result["degraded_reason"] == "embedding_timeout"
+        assert result["top_matches"][0]["story_id"] == story_id
+
+    def test_fallback_has_its_own_hard_timeout(self, fake_embedder, monkeypatch):
+        fake_embedder.register("q", None)
+        monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 0.02)
+
+        def slow_fallback(*args, **kwargs):
+            time.sleep(0.2)
+            return []
+
+        monkeypatch.setattr(store, "search_by_lexical", slow_fallback)
+        started = time.perf_counter()
+        result = search_module.search("q")
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.12
+        assert result["fallback_status"] == "timeout"
+        assert result["result_state"] == "degraded_unavailable"
+
+    def test_feedback_write_does_not_block_query(
+        self, fake_embedder, monkeypatch
+    ):
+        story_id = _seed("A", basis(0))
+        fake_embedder.register("q", basis(0))
+        entered = threading.Event()
+        release = threading.Event()
+        original = store.apply_recall_feedback
+
+        def blocked_feedback(story_ids, *, db_path=None):
+            entered.set()
+            release.wait(timeout=1.0)
+            original(story_ids, db_path=db_path)
+
+        monkeypatch.setattr(store, "apply_recall_feedback", blocked_feedback)
+        started = time.perf_counter()
+        result = search_module.search("q")
+        elapsed = time.perf_counter() - started
+
+        assert result["top_matches"][0]["story_id"] == story_id
+        assert elapsed < 0.1
+        assert entered.wait(timeout=0.5)
+        assert store.get_story(story_id)["access_count"] == 0
+        release.set()
+        assert feedback.flush_feedback(timeout=1.0)
+        assert store.get_story(story_id)["access_count"] == 1
 
 
 # ═══════════════════════════════════════════════

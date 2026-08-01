@@ -7,18 +7,25 @@ from __future__ import annotations
 import pytest
 
 from ._helpers import FakeEmbedder, FakeLLM, config, embeddings_mod, llm_mod, store
+from storybook import feedback, query_cache
 
 
 @pytest.fixture(autouse=True)
 def tmp_db(tmp_path, monkeypatch):
     """每个测试一个隔离的临时数据库（autouse）：重定向 ``config.DB_PATH`` 到 tmp_path。"""
+    assert feedback.flush_feedback(timeout=2.0)
+    query_cache.clear()
+    embeddings_mod.mark_model_cold()
     db_path = tmp_path / "test_memory.db"
     monkeypatch.setattr(config, "DB_PATH", db_path)
     monkeypatch.setattr(
         config, "PERFORMANCE_LOG_PATH", tmp_path / "query_performance.jsonl"
     )
     store.init_db()
-    return db_path
+    yield db_path
+    assert feedback.flush_feedback(timeout=2.0)
+    query_cache.clear()
+    embeddings_mod.mark_model_cold()
 
 
 @pytest.fixture
