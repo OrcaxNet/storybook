@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 
 import pytest
@@ -92,6 +93,173 @@ class TestContextEnvelopePersistence:
         assert envelope["workspace"]["repo_fingerprint"].startswith("sha256:")
         assert envelope["runtime"]["remote_host_hash"].startswith("hmac-sha256:")
         assert envelope["workspace"]["project_label"] == "payments-api"
+
+    def test_canonical_sensitive_slots_are_sanitized_before_persistence(self):
+        session_id = store.add_session(
+            "json",
+            "raw",
+            context={
+                "session": {"external_session_hash": "raw-session-123"},
+                "workspace": {
+                    "repo_fingerprint": (
+                        "https://token@example.com/acme/payments-api.git"
+                    ),
+                },
+                "runtime": {"remote_host_hash": "prod-secret.internal"},
+            },
+        )
+
+        envelope = store.get_session_context(session_id)
+        encoded = json.dumps(envelope, ensure_ascii=False)
+        for secret in (
+            "raw-session-123",
+            "https://token@example.com/acme/payments-api.git",
+            "prod-secret.internal",
+        ):
+            assert secret not in encoded
+        assert envelope["session"]["external_session_hash"].startswith(
+            "hmac-sha256:"
+        )
+        assert envelope["workspace"]["repo_fingerprint"].startswith("sha256:")
+        assert envelope["runtime"]["remote_host_hash"].startswith("hmac-sha256:")
+
+    def test_safe_canonical_hashes_are_not_hashed_again(self):
+        original = context_module.capture_context(
+            external_session_id="session-id",
+            repo_url="https://github.com/acme/payments.git",
+            remote_host="remote.internal",
+        )
+
+        normalized = context_module.normalize_envelope({
+            "session": {
+                "external_session_hash": original["session"]["external_session_hash"],
+            },
+            "workspace": {
+                "repo_fingerprint": original["workspace"]["repo_fingerprint"],
+            },
+            "runtime": {
+                "remote_host_hash": original["runtime"]["remote_host_hash"],
+            },
+        })
+
+        assert (
+            normalized["session"]["external_session_hash"]
+            == original["session"]["external_session_hash"]
+        )
+        assert (
+            normalized["workspace"]["repo_fingerprint"]
+            == original["workspace"]["repo_fingerprint"]
+        )
+        assert (
+            normalized["runtime"]["remote_host_hash"]
+            == original["runtime"]["remote_host_hash"]
+        )
+
+    def test_workspace_and_sensitive_alias_provenance_tracks_real_source(self):
+        captured = context_module.capture_context(
+            workspace_path="/Users/alice/private/payments-api",
+            project_label=None,
+        )
+        assert captured["workspace"]["project_label"] == "payments-api"
+        assert captured["provenance"]["workspace.project_label"] == "inferred"
+
+        normalized = context_module.normalize_envelope({
+            "workspace": {
+                "repo_url": "git@github.com:acme/payments.git",
+                "path": "/Users/alice/private/payments-api",
+            },
+            "runtime": {"remote_host": "remote.internal"},
+            "provenance": {
+                "workspace.repo_url": "reported",
+                "workspace.path": "reported",
+                "runtime.remote_host": "detected",
+            },
+        })
+
+        assert normalized["provenance"]["workspace.repo_fingerprint"] == "reported"
+        assert normalized["provenance"]["workspace.project_label"] == "inferred"
+        assert normalized["provenance"]["workspace.cwd_alias"] == "inferred"
+        assert normalized["provenance"]["workspace.id"] == "inferred"
+        assert normalized["provenance"]["runtime.remote_host_hash"] == "detected"
+
+    def test_equivalent_https_and_ssh_repo_urls_share_fingerprint(self):
+        https = context_module.repository_fingerprint(
+            "https://github.com/Acme/Payments.git"
+        )
+        scp_ssh = context_module.repository_fingerprint(
+            "git@github.com:Acme/Payments.git"
+        )
+        url_ssh = context_module.repository_fingerprint(
+            "ssh://git@github.com/Acme/Payments.git"
+        )
+
+        assert https == scp_ssh == url_ssh
+
+    def test_cursor_cache_directory_is_not_fabricated_as_workspace(self, tmp_path):
+        cache_dir = tmp_path / "workspaceStorage" / "opaque-cache-id"
+        cache_dir.mkdir(parents=True)
+        vscdb = cache_dir / "state.vscdb"
+        db = sqlite3.connect(vscdb)
+        try:
+            db.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+            db.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                (
+                    "workbench.panel.aichat.view",
+                    json.dumps({"messages": [{"text": "hello"}]}),
+                ),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        sessions = collector._extract_from_vscdb(vscdb)
+
+        assert len(sessions) == 1
+        workspace = sessions[0]["context"]["workspace"]
+        assert workspace == {
+            "id": None,
+            "repo_fingerprint": None,
+            "project_label": None,
+            "cwd_alias": None,
+            "branch": None,
+        }
+        for field in workspace:
+            assert (
+                sessions[0]["context"]["provenance"][f"workspace.{field}"]
+                == "unknown"
+            )
+
+    def test_cursor_uses_workspace_metadata_when_real_evidence_exists(self, tmp_path):
+        cache_dir = tmp_path / "workspaceStorage" / "opaque-cache-id"
+        cache_dir.mkdir(parents=True)
+        (cache_dir / "workspace.json").write_text(
+            json.dumps({"folder": "file:///Users/alice/private/payments-api"}),
+            encoding="utf-8",
+        )
+        vscdb = cache_dir / "state.vscdb"
+        db = sqlite3.connect(vscdb)
+        try:
+            db.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)")
+            db.execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+                (
+                    "workbench.panel.aichat.view",
+                    json.dumps({"messages": [{"text": "hello"}]}),
+                ),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        context = collector._extract_from_vscdb(vscdb)[0]["context"]
+
+        assert context["workspace"]["id"] is not None
+        assert context["workspace"]["repo_fingerprint"].startswith("hmac-sha256:")
+        assert context["workspace"]["project_label"] == "payments-api"
+        assert context["provenance"]["workspace.repo_fingerprint"] == "detected"
+        assert context["provenance"]["workspace.project_label"] == "inferred"
+        assert "/Users/alice/private/payments-api" not in json.dumps(context)
 
     def test_claude_adapter_reports_context_without_raw_external_id(self, tmp_path):
         log = tmp_path / "session-raw-id.jsonl"

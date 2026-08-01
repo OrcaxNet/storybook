@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from . import config
 
@@ -53,6 +54,10 @@ _FIELD_ALIASES = {
     "runtime_kind": "runtime.kind",
 }
 _SAFE_ALIAS_RE = re.compile(r"[^\w .@+-]+", re.UNICODE)
+_CANONICAL_HASH_RE = re.compile(
+    r"^(?P<algorithm>hmac-sha256|sha256):(?P<digest>[0-9a-f]{64})$",
+    re.IGNORECASE,
+)
 
 
 def utc_now() -> str:
@@ -167,17 +172,67 @@ def local_hash(value: Any, namespace: str) -> str | None:
     return f"hmac-sha256:{digest}"
 
 
+def _canonical_digest(value: Any, algorithms: set[str]) -> str | None:
+    """Return a normalized supported digest, or ``None`` for unsafe input."""
+
+    if not isinstance(value, str):
+        return None
+    match = _CANONICAL_HASH_RE.fullmatch(value.strip())
+    if not match or match.group("algorithm").lower() not in algorithms:
+        return None
+    return f"{match.group('algorithm').lower()}:{match.group('digest').lower()}"
+
+
+def _canonical_local_hash(value: Any, namespace: str) -> str | None:
+    if value in (None, ""):
+        return None
+    existing = _canonical_digest(value, {"hmac-sha256"})
+    return existing or local_hash(value, namespace)
+
+
 def repository_fingerprint(repo_url: Any) -> str | None:
     """Hash a normalized repository URL without retaining credentials or URL."""
 
     if repo_url in (None, ""):
         return None
-    raw = str(repo_url).strip().lower().rstrip("/")
-    raw = re.sub(r"^[a-z][a-z0-9+.-]*://", "", raw)
-    raw = raw.split("@", 1)[-1]
-    if raw.endswith(".git"):
-        raw = raw[:-4]
-    return "sha256:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    existing = _canonical_digest(repo_url, {"sha256"})
+    if existing:
+        return existing
+
+    raw = str(repo_url).strip()
+    if "://" in raw:
+        parsed = urlsplit(raw)
+        host = (parsed.hostname or "").lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port:
+            host = f"{host}:{port}"
+        identity = host + unquote(parsed.path)
+    else:
+        without_suffix = raw.split("#", 1)[0].split("?", 1)[0]
+        scp_style = re.fullmatch(
+            r"(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)",
+            without_suffix,
+        )
+        if scp_style:
+            identity = f"{scp_style.group('host')}/{scp_style.group('path')}"
+        else:
+            identity = without_suffix.split("@", 1)[-1]
+
+    identity = unquote(identity).replace("\\", "/").strip().lower()
+    identity = re.sub(r"/+", "/", identity).rstrip("/")
+    if identity.endswith(".git"):
+        identity = identity[:-4]
+    return "sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _canonical_workspace_fingerprint(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    existing = _canonical_digest(value, {"sha256", "hmac-sha256"})
+    return existing or repository_fingerprint(value)
 
 
 def external_session_hash(external_session_id: Any) -> str | None:
@@ -297,6 +352,9 @@ def capture_context(
     captured = _normalise_timestamp(captured_at) or utc_now()
     envelope = _empty_envelope(config.PROFILE_ID, captured)
     prov = provenance if provenance in PROVENANCE_VALUES else "reported"
+    remote_host_supplied = remote_host is not None
+    container_id_supplied = container_id is not None
+    shell_supplied = shell is not None
 
     tool_type = tool_type if tool_type in TOOL_TYPES else "other"
     integration_mode = (
@@ -379,13 +437,11 @@ def capture_context(
     reported_fields = (
         "tool.type", "tool.version", "tool.integration_mode",
         "session.external_session_hash", "session.started_at", "session.locale",
-        "workspace.project_label", "workspace.branch",
+        "workspace.branch",
     )
     detected_fields = (
         "tool.installation_id", "device.id", "device.os_family",
         "device.os_version", "device.arch", "runtime.kind",
-        "runtime.remote_host_hash", "runtime.container_id_hash", "runtime.shell",
-        "runtime.versions", "workspace.id", "workspace.repo_fingerprint",
     )
     for field in reported_fields:
         if _get(envelope, field) not in (None, "", {}):
@@ -396,9 +452,26 @@ def capture_context(
                 "detected" if field != "runtime.kind" or detected_runtime else prov
             )
     if alias:
-        envelope["provenance"]["workspace.cwd_alias"] = (
-            prov if project_label else "inferred"
+        alias_provenance = prov if project_label else "inferred"
+        envelope["provenance"]["workspace.project_label"] = alias_provenance
+        envelope["provenance"]["workspace.cwd_alias"] = alias_provenance
+    if workspace_fingerprint:
+        envelope["provenance"]["workspace.repo_fingerprint"] = prov
+        envelope["provenance"]["workspace.id"] = "inferred"
+    if envelope["runtime"]["remote_host_hash"]:
+        envelope["provenance"]["runtime.remote_host_hash"] = (
+            prov if remote_host_supplied else "detected"
         )
+    if envelope["runtime"]["container_id_hash"]:
+        envelope["provenance"]["runtime.container_id_hash"] = (
+            prov if container_id_supplied else "detected"
+        )
+    if envelope["runtime"]["shell"]:
+        envelope["provenance"]["runtime.shell"] = (
+            prov if shell_supplied else "detected"
+        )
+    if envelope["runtime"]["versions"]:
+        envelope["provenance"]["runtime.versions"] = prov
     envelope["provenance"]["device.display_name"] = (
         "inferred" if display_name else "unknown"
     )
@@ -443,6 +516,14 @@ def normalize_envelope(
             raw = incoming[key]
             if field.endswith(".id") or field == "tool.installation_id":
                 cleaned = _uuid_or_none(raw)
+            elif field == "session.external_session_hash":
+                cleaned = _canonical_local_hash(raw, "external-session")
+            elif field == "workspace.repo_fingerprint":
+                cleaned = _canonical_workspace_fingerprint(raw)
+            elif field == "runtime.remote_host_hash":
+                cleaned = _canonical_local_hash(raw, "remote-host")
+            elif field == "runtime.container_id_hash":
+                cleaned = _canonical_local_hash(raw, "container-id")
             elif field in ("session.started_at",):
                 cleaned = _normalise_timestamp(raw)
             elif field == "runtime.kind":
@@ -470,11 +551,23 @@ def normalize_envelope(
         "workspace_id": ("workspace", "id"),
         "session_id": ("session", "id"),
         "external_session_hash": ("session", "external_session_hash"),
+        "repo_fingerprint": ("workspace", "repo_fingerprint"),
+        "remote_host_hash": ("runtime", "remote_host_hash"),
+        "container_id_hash": ("runtime", "container_id_hash"),
     }
     for key, (group, field_name) in flattened.items():
         if key not in value:
             continue
-        cleaned = _uuid_or_none(value[key]) if key.endswith("_id") else str(value[key])
+        if key.endswith("_id"):
+            cleaned = _uuid_or_none(value[key])
+        elif key == "external_session_hash":
+            cleaned = _canonical_local_hash(value[key], "external-session")
+        elif key == "repo_fingerprint":
+            cleaned = _canonical_workspace_fingerprint(value[key])
+        elif key == "remote_host_hash":
+            cleaned = _canonical_local_hash(value[key], "remote-host")
+        else:
+            cleaned = _canonical_local_hash(value[key], "container-id")
         base[group][field_name] = cleaned
         dotted = f"{group}.{field_name}"
         base["provenance"][dotted] = _provenance_for(
@@ -489,27 +582,69 @@ def normalize_envelope(
         base["session"]["external_session_hash"] = external_session_hash(
             session_in["external_session_id"]
         )
-        base["provenance"]["session.external_session_hash"] = "reported"
+        base["provenance"]["session.external_session_hash"] = _provenance_for(
+            supplied_provenance,
+            "session.external_session_id",
+            base["session"]["external_session_hash"],
+            default="reported",
+        )
     if workspace_in.get("repo_url"):
         base["workspace"]["repo_fingerprint"] = repository_fingerprint(
             workspace_in["repo_url"]
         )
+        base["provenance"]["workspace.repo_fingerprint"] = _provenance_for(
+            supplied_provenance,
+            "workspace.repo_url",
+            base["workspace"]["repo_fingerprint"],
+            default="reported",
+        )
     if workspace_in.get("path") or workspace_in.get("cwd"):
         raw_path = workspace_in.get("path") or workspace_in.get("cwd")
-        base["workspace"]["repo_fingerprint"] = (
-            base["workspace"]["repo_fingerprint"] or workspace_path_hash(raw_path)
-        )
+        if not base["workspace"]["repo_fingerprint"]:
+            base["workspace"]["repo_fingerprint"] = workspace_path_hash(raw_path)
+            raw_path_field = (
+                "workspace.path" if workspace_in.get("path") else "workspace.cwd"
+            )
+            base["provenance"]["workspace.repo_fingerprint"] = _provenance_for(
+                supplied_provenance,
+                raw_path_field,
+                base["workspace"]["repo_fingerprint"],
+                default="reported",
+            )
         alias = _safe_alias(raw_path)
-        base["workspace"]["project_label"] = base["workspace"]["project_label"] or alias
-        base["workspace"]["cwd_alias"] = base["workspace"]["cwd_alias"] or alias
+        if not base["workspace"]["project_label"] and alias:
+            base["workspace"]["project_label"] = alias
+            base["provenance"]["workspace.project_label"] = "inferred"
+        if not base["workspace"]["cwd_alias"] and alias:
+            base["workspace"]["cwd_alias"] = alias
+            base["provenance"]["workspace.cwd_alias"] = "inferred"
     if runtime_in.get("remote_host"):
         base["runtime"]["remote_host_hash"] = local_hash(
             runtime_in["remote_host"], "remote-host"
+        )
+        base["provenance"]["runtime.remote_host_hash"] = _provenance_for(
+            supplied_provenance,
+            "runtime.remote_host",
+            base["runtime"]["remote_host_hash"],
+            default="reported",
         )
     if runtime_in.get("container_id"):
         base["runtime"]["container_id_hash"] = local_hash(
             runtime_in["container_id"], "container-id"
         )
+        base["provenance"]["runtime.container_id_hash"] = _provenance_for(
+            supplied_provenance,
+            "runtime.container_id",
+            base["runtime"]["container_id_hash"],
+            default="reported",
+        )
+
+    if base["workspace"]["repo_fingerprint"] and not base["workspace"]["id"]:
+        base["workspace"]["id"] = str(uuid.uuid5(
+            uuid.UUID(base["profile_id"]),
+            base["workspace"]["repo_fingerprint"],
+        ))
+        base["provenance"]["workspace.id"] = "inferred"
 
     if session_id:
         base["session"]["id"] = _uuid_or_none(session_id)

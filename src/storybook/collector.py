@@ -6,6 +6,7 @@ import logging
 import sqlite3
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 from . import config
 from . import store
@@ -66,7 +67,8 @@ def _extract_from_vscdb(vscdb_path: Path) -> list[dict]:
                 adapter_context = context_module.capture_context(
                     tool_type="cursor",
                     integration_mode="log_import",
-                    workspace_path=vscdb_path.parent,
+                    workspace_path=_cursor_workspace_path(vscdb_path),
+                    provenance="detected",
                 )
                 for conv in _parse_cursor_conversation(
                     data, row["key"], adapter_context=adapter_context
@@ -81,6 +83,29 @@ def _extract_from_vscdb(vscdb_path: Path) -> list[dict]:
         db.close()
 
     return sessions
+
+
+def _cursor_workspace_path(vscdb_path: Path) -> str | None:
+    """Read real workspace evidence without treating the opaque cache key as a path."""
+
+    metadata_path = vscdb_path.with_name("workspace.json")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+
+    raw_uri = metadata.get("folder") or metadata.get("workspace")
+    if not isinstance(raw_uri, str):
+        return None
+    parsed = urlsplit(raw_uri)
+    if parsed.scheme.lower() != "file":
+        return None
+    path = unquote(parsed.path)
+    if parsed.netloc and parsed.netloc not in ("", "localhost"):
+        path = f"//{parsed.netloc}{path}"
+    return path or None
 
 
 def _parse_cursor_conversation(
