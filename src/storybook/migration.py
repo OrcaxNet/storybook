@@ -1,13 +1,12 @@
 """Safe v1 project database migration into a Profile-owned v2 generation.
 
 Inspection, dry-run, backup and conversion never mutate the source.  At a
-successful cut-over, a SQLite ``BEGIN IMMEDIATE`` transaction stages durable
-deny-write triggers on each retiring generation.  It commits every retiring
-fence and target unfence before changing the Profile pointer; ambiguous prepare
-commits are compensated back to their prior states while the registry still
-names the old authority.  OS-read-only sources use a stable read transaction
-because new writers cannot open them.  Conversion always happens in an isolated
-generation.
+successful cut-over, SQLite ``BEGIN IMMEDIATE`` transactions stage durable
+deny-write triggers on each retiring generation while retaining the target's
+fence.  Retiring fences commit before the Profile pointer changes; the target
+unfence commits only after the registry CAS is known durable.  OS-read-only
+sources use a stable read transaction because new writers cannot open them.
+Conversion always happens in an isolated generation.
 """
 from __future__ import annotations
 
@@ -308,6 +307,47 @@ def _restore_generation_fence(
         if db.in_transaction:
             db.rollback()
         raise
+
+
+def _fence_activation_target(path: Path) -> None:
+    """Persistently fence a newly built target before its path is exposed."""
+
+    with _cutover_guard(
+        path,
+        busy_code="SB_MIGRATION_TARGET_BUSY",
+        label="待激活目标世代",
+    ) as db:
+        if _generation_is_fenced(db):
+            return
+        if not _stage_generation_fence(db):
+            raise MigrationError(
+                "SB_MIGRATION_TARGET_READ_ONLY",
+                "待激活目标世代不可写，无法建立切换前 fencing",
+            )
+        db.commit()
+
+
+def _commit_target_activation(db: sqlite3.Connection) -> None:
+    """Commit target unfencing, recovering a single ambiguous commit result."""
+
+    last_error: Exception | None = None
+    for _attempt in range(2):
+        try:
+            _commit_guard(db)
+        except Exception as exc:
+            last_error = exc
+            if not db.in_transaction and not _generation_is_fenced(db):
+                return
+            continue
+        if not db.in_transaction and not _generation_is_fenced(db):
+            return
+    if not db.in_transaction and not _generation_is_fenced(db):
+        return
+    raise MigrationError(
+        "SB_MIGRATION_TARGET_ACTIVATION_FAILED",
+        "Profile 指针已切换，但目标数据库世代未能解除 fencing",
+        hint="停止写入并重试同一命令以恢复目标世代",
+    ) from last_error
 
 
 def _hash_database(path: Path) -> str:
@@ -818,20 +858,21 @@ class MigrationManager:
                 Callable[[sqlite3.Connection], None],
             ]
         ],
-        target_path: Path | None = None,
+        target_path: Path,
         prepare_target: Callable[[], None] | None = None,
     ) -> None:
-        """Prepare database generations, then atomically move the pointer.
+        """Fence retiring generations, move the pointer, then open the target.
 
         Each retiring database keeps a ``BEGIN IMMEDIATE`` transaction open
-        while deny-write triggers are staged.  Every retiring fence and target
-        unfence is committed before the registry CAS, leaving no fallible
-        SQLite commit after the pointer becomes durable.  If any prepare commit
-        has an ambiguous outcome, its prior fence state is restored while the
-        registry still names the old authority.  A reactivated target is held
-        under its own write guard in the same preparation window.
+        while deny-write triggers are staged.  The target must already be
+        persistently fenced and remains under its own write guard until the
+        registry CAS result is known.  A CAS failure rolls the staged target
+        unfence back before waiting writers resume; a durable CAS commits the
+        unfence before releasing them.
         """
 
+        if prepare_target is not None:
+            prepare_target()
         with ExitStack() as stack:
             retiring_guards: list[tuple[sqlite3.Connection, bool]] = []
             seen: set[Path] = set()
@@ -852,40 +893,48 @@ class MigrationManager:
                 _stage_generation_fence(db)
                 retiring_guards.append((db, was_fenced))
 
-            target_guard: sqlite3.Connection | None = None
-            target_was_fenced = False
-            if target_path is not None:
-                resolved_target = target_path.expanduser().resolve(strict=True)
-                if resolved_target in seen:
-                    raise MigrationError(
-                        "SB_MIGRATION_GENERATION_CONFLICT",
-                        "目标数据库世代同时被标记为待退役世代",
-                    )
-                target_guard = stack.enter_context(
-                    _cutover_guard(
-                        resolved_target,
-                        busy_code="SB_MIGRATION_TARGET_BUSY",
-                        label="待激活目标世代",
-                    )
+            resolved_target = target_path.expanduser().resolve(strict=True)
+            if resolved_target in seen:
+                raise MigrationError(
+                    "SB_MIGRATION_GENERATION_CONFLICT",
+                    "目标数据库世代同时被标记为待退役世代",
                 )
-                target_was_fenced = _generation_is_fenced(target_guard)
-                _stage_generation_unfence(target_guard)
+            target_guard = stack.enter_context(
+                _cutover_guard(
+                    resolved_target,
+                    busy_code="SB_MIGRATION_TARGET_BUSY",
+                    label="待激活目标世代",
+                )
+            )
+            target_was_fenced = _generation_is_fenced(target_guard)
+            if not target_was_fenced:
+                raise MigrationError(
+                    "SB_MIGRATION_TARGET_NOT_FENCED",
+                    "待激活目标世代未处于持久 fencing 状态",
+                    hint="停止写入并重新生成目标世代",
+                )
+            _stage_generation_unfence(target_guard)
 
-            prepared = [*retiring_guards]
-            if target_guard is not None:
-                prepared.append((target_guard, target_was_fenced))
+            prepared = [*retiring_guards, (target_guard, target_was_fenced)]
             try:
-                if prepare_target is not None:
-                    prepare_target()
                 for db, _was_fenced in retiring_guards:
                     _commit_guard(db)
-                if target_guard is not None:
-                    _commit_guard(target_guard)
                 self.registry.set_profile_database(
                     profile.id,
                     target_ref,
                     expected_database_ref=profile.database_ref,
                 )
+                current = self.registry.peek_active_profile()
+                if (
+                    current is None
+                    or current.id != profile.id
+                    or current.database_ref != target_ref
+                ):
+                    raise MigrationError(
+                        "SB_MIGRATION_REGISTRY_CAS_INCOMPLETE",
+                        "Profile registry CAS 返回后未指向目标世代",
+                    )
+                _commit_target_activation(target_guard)
             except Exception as exc:
                 current = self.registry.peek_active_profile()
                 if (
@@ -893,9 +942,17 @@ class MigrationManager:
                     and current.id == profile.id
                     and current.database_ref == target_ref
                 ):
-                    # An atomic registry write may report an error after its
-                    # replace became durable.  All database prepares preceded
-                    # it, so this is already a consistent completed switch.
+                    # The registry replace is durable.  Keep the target guard
+                    # until its staged unfence is also durable, so queued
+                    # writers cannot observe an uncertain authority.
+                    try:
+                        _commit_target_activation(target_guard)
+                    except Exception as recovery_exc:
+                        raise MigrationError(
+                            "SB_MIGRATION_SWITCH_RECOVERY_FAILED",
+                            "registry 已切换，但目标世代无法解除 fencing",
+                            hint="停止写入并重试同一命令恢复目标世代",
+                        ) from recovery_exc
                     if self.registry is config.PROFILE_REGISTRY:
                         config.refresh_profile(profile.id)
                     return
@@ -958,17 +1015,6 @@ class MigrationManager:
                 "Profile 已切换，但目标数据库世代不存在",
                 hint="停止写入并从迁移备份恢复",
             )
-        target_db = _read_only(target_path)
-        try:
-            if _generation_is_fenced(target_db):
-                raise MigrationError(
-                    "SB_MIGRATION_SWITCH_STATE_INVALID",
-                    "当前活动数据库世代仍处于 fencing 状态",
-                    hint="停止写入并检查目标世代 fencing 触发器",
-                )
-        finally:
-            target_db.close()
-
         target_resolved = target_path.resolve()
         seen: set[Path] = set()
         for retiring_path in retiring_paths:
@@ -988,6 +1034,21 @@ class MigrationManager:
                     )
             finally:
                 retired_db.close()
+
+        target_db = _read_only(target_path)
+        try:
+            target_fenced = _generation_is_fenced(target_db)
+        finally:
+            target_db.close()
+        if target_fenced:
+            with _cutover_guard(
+                target_path,
+                busy_code="SB_MIGRATION_TARGET_BUSY",
+                label="当前活动目标世代",
+            ) as db:
+                if _generation_is_fenced(db):
+                    _stage_generation_unfence(db)
+                    _commit_target_activation(db)
 
         if self.registry is config.PROFILE_REGISTRY:
             config.refresh_profile(profile.id)
@@ -1249,6 +1310,7 @@ class MigrationManager:
                     history_db.close()
                 validation = _validate_transformed(backup, stage, profile.id)
                 _seal_sqlite(stage)
+                _fence_activation_target(stage)
                 now = _timestamp(_utc_now())
                 manifest = {
                     "migration_id": migration_id,
@@ -1308,6 +1370,7 @@ class MigrationManager:
                     profile=profile,
                     target_ref=plan["generation_ref"],
                     retiring=retiring,
+                    target_path=destination,
                     prepare_target=prepare_destination,
                 )
                 self._persist_switched_manifest(
@@ -1394,6 +1457,7 @@ class MigrationManager:
             rollback_tmp = generation_dir / f".rollback.{uuid.uuid4().hex}.tmp.db"
             try:
                 _copy_read_only_database(backup, rollback_tmp)
+                _fence_activation_target(rollback_tmp)
                 os.replace(rollback_tmp, rollback_db)
                 _private_file(rollback_db)
             finally:

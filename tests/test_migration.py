@@ -164,6 +164,75 @@ def _inject_manifest_transition_failure(
     monkeypatch.setattr(migration, "_atomic_json", fail_selected_transition)
 
 
+def _prepare_generation_switch_case(
+    scenario: str,
+    *,
+    tmp_path: Path,
+    migration_profile: ProfileRegistry,
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    profile_root = migration_profile.active_paths().root
+    if scenario == "cutover":
+        plan = manager.plan(source)
+        return (
+            manager,
+            lambda: manager.run(source),
+            profile_root / plan["generation_ref"],
+            plan["generation_ref"],
+            "applied",
+        )
+
+    applied = manager.run(source)
+    if scenario == "rollback":
+        return (
+            manager,
+            lambda: manager.rollback(applied["migration_id"]),
+            profile_root / applied["rollback_ref"],
+            applied["rollback_ref"],
+            "rolled_back",
+        )
+
+    manager.rollback(applied["migration_id"])
+    return (
+        manager,
+        lambda: manager.run(source),
+        profile_root / applied["generation_ref"],
+        applied["generation_ref"],
+        "reapplied",
+    )
+
+
+def _start_target_writer(target_path: Path):
+    started = threading.Event()
+    acquired = threading.Event()
+    finished = threading.Event()
+    result: dict[str, object] = {}
+
+    def write() -> None:
+        writer = sqlite3.connect(target_path, timeout=5)
+        try:
+            started.set()
+            writer.execute("BEGIN IMMEDIATE")
+            acquired.set()
+            writer.execute(
+                "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+            )
+            writer.commit()
+            result["committed"] = True
+        except sqlite3.DatabaseError as exc:
+            writer.rollback()
+            result["error"] = str(exc)
+        finally:
+            writer.close()
+            finished.set()
+
+    thread = threading.Thread(target=write)
+    thread.start()
+    assert started.wait(timeout=5)
+    return thread, acquired, finished, result
+
+
 def test_dry_run_is_zero_write_and_reports_stable_plan(
     tmp_path, migration_profile
 ):
@@ -556,6 +625,85 @@ def test_cutover_commit_failure_restores_old_authority(
         writer.close()
 
 
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_cutover_target_commit_failure_converges_to_new_authority(
+    tmp_path, migration_profile, monkeypatch, failure_mode
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    _inject_commit_failure(
+        monkeypatch,
+        failure_index=2,
+        failure_mode=failure_mode,
+    )
+
+    applied = manager.run(source)
+
+    assert applied["status"] == "applied"
+    assert migration_profile.active_profile().database_ref == applied["generation_ref"]
+    assert config.DB_PATH == migration_profile.active_paths().database
+    assert manager.status()["migrations"][0]["status"] == "activated"
+    store.add_session("post-target-commit-recovery", "new authority")
+    assert store.count_sessions() == 3
+    retired = sqlite3.connect(source)
+    try:
+        with pytest.raises(
+            sqlite3.DatabaseError, match="SB_MIGRATION_GENERATION_FENCED"
+        ):
+            retired.execute(
+                "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+            )
+    finally:
+        retired.rollback()
+        retired.close()
+
+
+def test_persistent_target_commit_failure_is_repaired_by_idempotent_retry(
+    tmp_path, migration_profile, monkeypatch
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    real_commit = migration._commit_guard
+    calls = 0
+
+    def fail_target_commits(db: sqlite3.Connection) -> None:
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise OSError("injected persistent target commit failure")
+        real_commit(db)
+
+    monkeypatch.setattr(migration, "_commit_guard", fail_target_commits)
+
+    with pytest.raises(migration.MigrationError) as exc_info:
+        manager.run(source)
+
+    assert exc_info.value.code == "SB_MIGRATION_SWITCH_RECOVERY_FAILED"
+    active = migration_profile.active_profile()
+    target_path = migration_profile.paths_for(active).database
+    assert active.database_ref.startswith("migrations/")
+    assert manager.status()["migrations"][0]["status"] == "validated"
+    fenced = sqlite3.connect(target_path)
+    try:
+        with pytest.raises(
+            sqlite3.DatabaseError, match="SB_MIGRATION_GENERATION_FENCED"
+        ):
+            fenced.execute(
+                "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+            )
+    finally:
+        fenced.rollback()
+        fenced.close()
+
+    monkeypatch.setattr(migration, "_commit_guard", real_commit)
+    repeated = manager.run(source)
+
+    assert repeated["status"] == "already_applied"
+    assert manager.status()["migrations"][0]["status"] == "activated"
+    store.add_session("target-activation-recovered", "new authority")
+    assert store.count_sessions() == 3
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX read-only permission bits")
 def test_read_only_source_uses_hash_cas_without_mutation(
     tmp_path, migration_profile
@@ -798,6 +946,36 @@ def test_rollback_commit_failure_restores_active_v2(
         failure_mode=failure_mode,
     )
 
+    if failure_index == 2:
+        rolled_back = manager.rollback(applied["migration_id"])
+        assert rolled_back["status"] == "rolled_back"
+        assert (
+            migration_profile.active_profile().database_ref
+            == applied["rollback_ref"]
+        )
+        assert config.DB_PATH == migration_profile.active_paths().database
+        assert manager.status()["migrations"][0]["status"] == "rolled_back"
+        target = sqlite3.connect(config.DB_PATH)
+        try:
+            target.execute(
+                "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+            )
+            target.commit()
+        finally:
+            target.close()
+        retired = sqlite3.connect(active_v2)
+        try:
+            with pytest.raises(
+                sqlite3.DatabaseError, match="SB_MIGRATION_GENERATION_FENCED"
+            ):
+                retired.execute(
+                    "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+                )
+        finally:
+            retired.rollback()
+            retired.close()
+        return
+
     with pytest.raises(migration.MigrationError) as exc_info:
         manager.rollback(applied["migration_id"])
 
@@ -919,6 +1097,30 @@ def test_reapply_commit_failure_restores_rollback_authority(
         failure_mode=failure_mode,
     )
 
+    if failure_index == 3:
+        reapplied = manager.run(source)
+        assert reapplied["status"] == "reapplied"
+        assert (
+            migration_profile.active_profile().database_ref
+            == applied["generation_ref"]
+        )
+        assert config.DB_PATH == target_v2
+        assert manager.status()["migrations"][0]["status"] == "activated"
+        store.add_session("reapply-target-commit-recovery", "new authority")
+        assert store.count_sessions() == 3
+        retired = sqlite3.connect(rollback_db)
+        try:
+            with pytest.raises(
+                sqlite3.DatabaseError, match="SB_MIGRATION_GENERATION_FENCED"
+            ):
+                retired.execute(
+                    "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+                )
+        finally:
+            retired.rollback()
+            retired.close()
+        return
+
     with pytest.raises(migration.MigrationError) as exc_info:
         manager.run(source)
 
@@ -947,6 +1149,113 @@ def test_reapply_commit_failure_restores_rollback_authority(
     finally:
         retired_target.rollback()
         retired_target.close()
+
+
+@pytest.mark.parametrize("scenario", ["cutover", "rollback", "reapply"])
+def test_target_writer_cannot_commit_when_registry_cas_fails_before_replace(
+    tmp_path, migration_profile, monkeypatch, scenario
+):
+    manager, invoke, target_path, _target_ref, _status = (
+        _prepare_generation_switch_case(
+            scenario,
+            tmp_path=tmp_path,
+            migration_profile=migration_profile,
+        )
+    )
+    old_profile = migration_profile.active_profile()
+    old_database = config.DB_PATH
+    writer_state: dict[str, object] = {}
+
+    def fail_before_replace(*args, **kwargs):
+        thread, acquired, finished, result = _start_target_writer(target_path)
+        writer_state.update({
+            "thread": thread,
+            "acquired": acquired,
+            "finished": finished,
+            "result": result,
+        })
+        if acquired.wait(timeout=0.2):
+            assert finished.wait(timeout=5)
+        raise OSError("injected registry failure before atomic replace")
+
+    monkeypatch.setattr(
+        migration_profile, "set_profile_database", fail_before_replace
+    )
+
+    with pytest.raises(migration.MigrationError) as exc_info:
+        invoke()
+
+    assert exc_info.value.code == "SB_MIGRATION_SWITCH_PREPARE_FAILED"
+    thread = writer_state["thread"]
+    assert isinstance(thread, threading.Thread)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    result = writer_state["result"]
+    assert isinstance(result, dict)
+    assert result.get("committed") is not True
+    assert "SB_MIGRATION_GENERATION_FENCED" in str(result.get("error"))
+    assert migration_profile.active_profile().database_ref == old_profile.database_ref
+    assert config.DB_PATH == old_database
+    target = sqlite3.connect(target_path)
+    try:
+        assert target.execute(
+            "SELECT access_count FROM stories WHERE id = 1"
+        ).fetchone()[0] == 0
+    finally:
+        target.close()
+    assert manager.status()["database_ref"] == old_profile.database_ref
+
+
+@pytest.mark.parametrize("scenario", ["cutover", "rollback", "reapply"])
+def test_target_writer_commits_after_durable_registry_cas_reports_error(
+    tmp_path, migration_profile, monkeypatch, scenario
+):
+    manager, invoke, target_path, target_ref, expected_status = (
+        _prepare_generation_switch_case(
+            scenario,
+            tmp_path=tmp_path,
+            migration_profile=migration_profile,
+        )
+    )
+    real_switch = migration_profile.set_profile_database
+    writer_state: dict[str, object] = {}
+
+    def switch_then_report_error(*args, **kwargs):
+        real_switch(*args, **kwargs)
+        thread, acquired, finished, result = _start_target_writer(target_path)
+        writer_state.update({
+            "thread": thread,
+            "acquired": acquired,
+            "finished": finished,
+            "result": result,
+        })
+        raise OSError("injected registry error after atomic replace")
+
+    monkeypatch.setattr(
+        migration_profile, "set_profile_database", switch_then_report_error
+    )
+
+    switched = invoke()
+
+    assert switched["status"] == expected_status
+    thread = writer_state["thread"]
+    assert isinstance(thread, threading.Thread)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    result = writer_state["result"]
+    assert isinstance(result, dict)
+    assert result.get("committed") is True
+    assert migration_profile.active_profile().database_ref == target_ref
+    assert config.DB_PATH == target_path
+    active = sqlite3.connect(config.DB_PATH)
+    try:
+        assert active.execute(
+            "SELECT access_count FROM stories WHERE id = 1"
+        ).fetchone()[0] == 1
+    finally:
+        active.close()
+    expected_manifest = "rolled_back" if scenario == "rollback" else "activated"
+    assert manager.status()["migrations"][0]["status"] == expected_manifest
 
 
 def test_cli_dry_run_and_status_json(tmp_path, migration_profile):
