@@ -274,6 +274,12 @@ storybook status --performance
 storybook status --performance --json
 ```
 
+`status --json` 同时返回当前 `profile`、Ollama `model`、setup 管理的
+`adapter`、`sync` 与计数字段。组件全部可用时 `status=ready`；Profile、模型或
+已配置 adapter 不可用时返回 `status=ready_degraded`，并通过稳定的
+`degraded_reasons`（例如 `ollama_unavailable`、`model_missing:embedding`、
+`adapter_unavailable:codex`）解释降级，不把可用的本地数据库误报为整体失败。
+
 完整性能基准复用 `data/retrieval_benchmark.json` 的人工 ground truth，并在隔离临时库中构造固定 seed 的 10k Story 数据集。默认跑 50 条固定查询、每条重复 20 次、并发 1 和 5，报告机器/模型状态/规模/重复次数、所有阶段的 p50/p95/p99，以及按 exact/synonym/cross_lang 分组的 recall@1/3/5 和 MRR。基准不会污染用户数据库，也不会把原始 query、Story 内容、绝对路径或仓库 URL 写入报告。
 
 ```bash

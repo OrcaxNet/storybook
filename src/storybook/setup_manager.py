@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import requests
 
-from . import config, embeddings, search, store
+from . import config, embeddings, health, search, store
 from .profiles import PlatformRoots, ProfileError
 from .setup_adapters import (
     AdapterContext,
@@ -333,6 +333,20 @@ class SetupManager:
         if not isinstance(adapter_states, dict):
             raise self._invalid_state("adapters 必须是 object")
         known = {adapter.name for adapter in self.adapters}
+        selected_adapters = state.get("selected_adapters")
+        if selected_adapters is not None:
+            if (
+                not isinstance(selected_adapters, list)
+                or not all(isinstance(name, str) for name in selected_adapters)
+                or len(selected_adapters) != len(set(selected_adapters))
+            ):
+                raise self._invalid_state("selected_adapters 必须是无重复 string array")
+            unknown_selected = set(selected_adapters) - known
+            if unknown_selected:
+                raise self._invalid_state(
+                    "selected_adapters 包含未知 adapter: "
+                    + ", ".join(sorted(unknown_selected))
+                )
         for name, adapter_state in adapter_states.items():
             if name not in known:
                 raise self._invalid_state(f"adapters.{name} 是未知 adapter")
@@ -609,6 +623,13 @@ class SetupManager:
                 "installed_at": existing_state.get("installed_at", _utc_now()),
                 "updated_at": _utc_now(),
                 "profile_id": config.PROFILE_ID,
+                # A partial re-run does not uninstall adapters managed by an
+                # earlier setup, so keep checking the full managed union.
+                "selected_adapters": sorted(
+                    set(existing_state.get("selected_adapters", ()))
+                    | set(adapter_states)
+                    | selected
+                ),
                 "launcher": {
                     "command": self.launcher.command,
                     "args": list(self.launcher.args),
@@ -655,6 +676,120 @@ class SetupManager:
             "legacy_databases": list(plan.legacy_databases),
             "degraded_reasons": degraded,
             "state_file": str(self.state_path),
+        }
+
+    def runtime_status(self) -> dict[str, Any]:
+        """Return a stable, live snapshot of Profile, model and adapter readiness.
+
+        The setup state records which adapters Storybook is expected to manage,
+        while model and adapter readiness are probed live so recovery does not
+        require running setup again.  Degraded reasons are stable machine-readable
+        codes; volatile exception text is deliberately excluded from the contract.
+        """
+
+        degraded_reasons: list[str] = []
+        profile = config.PROFILE_REGISTRY.peek_active_profile()
+        if profile is None:
+            profile_payload: dict[str, Any] = {
+                "status": "missing",
+                "id": None,
+                "display_name": None,
+                "mode": None,
+            }
+            sync_state = config.SYNC_STATE
+            degraded_reasons.append("profile_uninitialized")
+        else:
+            profile_payload = {
+                "status": "ready",
+                "id": profile.id,
+                "display_name": profile.display_name,
+                "mode": profile.mode,
+            }
+            sync_state = profile.sync_state
+
+        ollama_ok, tags, _ = health._check_ollama_reachable()
+        if not ollama_ok:
+            model_payload = {
+                "provider": "ollama",
+                "status": "unavailable",
+                "llm": {"name": config.LLM_MODEL, "status": "unavailable"},
+                "embedding": {
+                    "name": config.EMBED_MODEL,
+                    "status": "unavailable",
+                },
+            }
+            degraded_reasons.append("ollama_unavailable")
+        else:
+            llm_ready = health._model_pulled(tags, config.LLM_MODEL)
+            embedding_ready = health._model_pulled(tags, config.EMBED_MODEL)
+            model_payload = {
+                "provider": "ollama",
+                "status": "ready" if llm_ready and embedding_ready else "degraded",
+                "llm": {
+                    "name": config.LLM_MODEL,
+                    "status": "ready" if llm_ready else "missing",
+                },
+                "embedding": {
+                    "name": config.EMBED_MODEL,
+                    "status": "ready" if embedding_ready else "missing",
+                },
+            }
+            if not llm_ready:
+                degraded_reasons.append("model_missing:llm")
+            if not embedding_ready:
+                degraded_reasons.append("model_missing:embedding")
+
+        try:
+            state = self._load_state()
+        except SetupError:
+            # Status must remain the stable diagnostic entry point even when
+            # setup-state.json itself needs recovery.
+            state = None
+            degraded_reasons.append("setup_state_invalid")
+        adapter_by_name = {adapter.name: adapter for adapter in self.adapters}
+        if state is None:
+            selected_names: list[str] = []
+        else:
+            selected_names = list(
+                state.get("selected_adapters", state.get("adapters", {}).keys())
+            )
+        adapter_checks: list[dict[str, str]] = []
+        for name in sorted(selected_names):
+            adapter = adapter_by_name[name]
+            try:
+                ready, _ = adapter.verify(self.context)
+            except Exception:  # noqa: BLE001 -- invalid/missing config is degraded
+                ready = False
+            adapter_checks.append(
+                {"name": name, "status": "ready" if ready else "missing"}
+            )
+            if not ready:
+                degraded_reasons.append(f"adapter_unavailable:{name}")
+
+        adapter_payload = {
+            "status": (
+                "not_configured"
+                if not adapter_checks
+                else (
+                    "ready"
+                    if all(item["status"] == "ready" for item in adapter_checks)
+                    else "degraded"
+                )
+            ),
+            "checks": adapter_checks,
+        }
+        stable_reasons = list(dict.fromkeys(degraded_reasons))
+        return {
+            "status": "ready_degraded" if stable_reasons else "ready",
+            "profile": profile_payload,
+            "model": model_payload,
+            "adapter": adapter_payload,
+            "sync": {
+                "state": sync_state,
+                "enabled": sync_state != "local_only",
+            },
+            "sync_state": sync_state,
+            "degraded_reasons": stable_reasons,
         }
 
     @staticmethod

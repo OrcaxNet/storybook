@@ -951,7 +951,7 @@ def status(include_performance, as_json):
     store.init_db()
     stats_data = store.get_stats()
     payload = {
-        "status": "ready",
+        **SetupManager().runtime_status(),
         "stories": stats_data["stories"],
         "sessions": stats_data["sessions"],
         "pending": stats_data["pending"],
@@ -963,7 +963,24 @@ def status(include_performance, as_json):
         click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
-    click.echo("Overall        READY")
+    click.echo(f"Overall        {payload['status'].upper()}")
+    profile = payload["profile"]
+    click.echo(
+        f"Profile        {profile['display_name']} ({profile['status']})"
+    )
+    model = payload["model"]
+    click.echo(
+        f"Models         LLM {model['llm']['status']} · "
+        f"Embedding {model['embedding']['status']}"
+    )
+    adapter = payload["adapter"]
+    checks = ", ".join(
+        f"{item['name']}={item['status']}" for item in adapter["checks"]
+    ) or "none configured"
+    click.echo(f"Adapters       {checks}")
+    click.echo(f"Sync           {payload['sync_state']}")
+    for reason in payload["degraded_reasons"]:
+        click.echo(f"Degraded       {reason}")
     click.echo(f"Stories        {payload['stories']}")
     click.echo(f"Sessions       {payload['sessions']} ({payload['pending']} pending)")
     if include_performance:
