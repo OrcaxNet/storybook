@@ -512,7 +512,13 @@ def _assert_reapply_authority(
     """Reject reuse when the currently authoritative generation has drifted."""
 
     if profile.database_ref == manifest.get("rollback_ref"):
-        expected = manifest.get("rollback_baseline_hash") or manifest["source_hash"]
+        expected = manifest.get("rollback_baseline_hash")
+        if not expected or manifest.get("rollback_reapply_safe") is False:
+            raise MigrationError(
+                "SB_MIGRATION_AUTHORITY_BASELINE_UNKNOWN",
+                "rollback 权威库缺少可信的切换前基线，不能复用旧 v2 世代",
+                hint="保留当前 database_ref；从该权威库规划新的迁移",
+            )
         if _logical_hash(db) != expected:
             raise MigrationError(
                 "SB_MIGRATION_AUTHORITY_CHANGED",
@@ -604,6 +610,46 @@ def _read_manifest(path: Path) -> dict | None:
             "SB_MIGRATION_MANIFEST_INVALID", "迁移清单根节点必须是 object"
         )
     return payload
+
+
+def _persist_manifest_transition(
+    path: Path,
+    manifest: dict,
+    updates: dict,
+) -> None:
+    """Persist a post-switch audit state despite an ambiguous atomic write.
+
+    A storage call can report an error before or after ``os.replace`` became
+    visible.  Read back the complete desired payload first; if the old payload
+    is still authoritative, retry the idempotent replacement once while the
+    migration lock is held.  The in-memory manifest changes only after the
+    durable state has been observed.
+    """
+
+    desired = {**manifest, **updates}
+    last_error: Exception | None = None
+    for _attempt in range(2):
+        try:
+            _atomic_json(path, desired)
+        except Exception as exc:
+            last_error = exc
+            try:
+                observed = _read_manifest(path)
+            except MigrationError:
+                observed = None
+            if observed == desired:
+                manifest.clear()
+                manifest.update(desired)
+                return
+            continue
+        manifest.clear()
+        manifest.update(desired)
+        return
+    raise MigrationError(
+        "SB_MIGRATION_MANIFEST_RECOVERY_FAILED",
+        "数据库世代已安全切换，但迁移清单状态无法持久化",
+        hint="停止后续切换并重试同一命令以修复 manifest.json",
+    ) from last_error
 
 
 def _copy_read_only_database(source: Path, destination: Path) -> None:
@@ -882,6 +928,71 @@ class MigrationManager:
             if self.registry is config.PROFILE_REGISTRY:
                 config.refresh_profile(profile.id)
 
+    def _persist_switched_manifest(
+        self,
+        *,
+        profile: Profile,
+        target_ref: str,
+        retiring_paths: list[Path],
+        manifest_path: Path,
+        manifest: dict,
+        updates: dict,
+    ) -> None:
+        """Reconcile pointer/fences before recording a completed switch."""
+
+        current = self.registry.peek_active_profile()
+        if (
+            current is None
+            or current.id != profile.id
+            or current.database_ref != target_ref
+        ):
+            raise MigrationError(
+                "SB_MIGRATION_SWITCH_STATE_INVALID",
+                "迁移清单待写入状态与当前 Profile 数据库指针不一致",
+                hint="运行 migration status 审计当前权威世代",
+            )
+        target_path = self.registry.paths_for(current).database
+        if not target_path.is_file():
+            raise MigrationError(
+                "SB_MIGRATION_SWITCH_STATE_INVALID",
+                "Profile 已切换，但目标数据库世代不存在",
+                hint="停止写入并从迁移备份恢复",
+            )
+        target_db = _read_only(target_path)
+        try:
+            if _generation_is_fenced(target_db):
+                raise MigrationError(
+                    "SB_MIGRATION_SWITCH_STATE_INVALID",
+                    "当前活动数据库世代仍处于 fencing 状态",
+                    hint="停止写入并检查目标世代 fencing 触发器",
+                )
+        finally:
+            target_db.close()
+
+        target_resolved = target_path.resolve()
+        seen: set[Path] = set()
+        for retiring_path in retiring_paths:
+            resolved = retiring_path.expanduser().resolve(strict=True)
+            if resolved == target_resolved or resolved in seen:
+                continue
+            seen.add(resolved)
+            if not (resolved.stat().st_mode & 0o222):
+                continue
+            retired_db = _read_only(resolved)
+            try:
+                if not _generation_is_fenced(retired_db):
+                    raise MigrationError(
+                        "SB_MIGRATION_SWITCH_STATE_INVALID",
+                        "Profile 已切换，但仍有可写的退役数据库世代",
+                        hint="停止所有写入并恢复该世代的 fencing 触发器",
+                    )
+            finally:
+                retired_db.close()
+
+        if self.registry is config.PROFILE_REGISTRY:
+            config.refresh_profile(profile.id)
+        _persist_manifest_transition(manifest_path, manifest, updates)
+
     @staticmethod
     def _fence_without_switch(
         path: Path,
@@ -992,8 +1103,10 @@ class MigrationManager:
                             hint="保留当前 v2；先审计旧库独有写入",
                         )
 
+                source_path = Path(plan["source"])
+                reconciled_retiring = [source_path]
                 self._fence_without_switch(
-                    Path(plan["source"]),
+                    source_path,
                     busy_code="SB_MIGRATION_SOURCE_BUSY",
                     label="已退役旧源库",
                     validate=validate_retired_source,
@@ -1013,12 +1126,19 @@ class MigrationManager:
                                 label="已退役 Profile 世代",
                                 validate=lambda _db: None,
                             )
+                            reconciled_retiring.append(previous_path)
                 if existing and existing.get("status") != "activated":
-                    existing.update({
-                        "status": "activated",
-                        "activated_at": _timestamp(_utc_now()),
-                    })
-                    _atomic_json(manifest_path, existing)
+                    self._persist_switched_manifest(
+                        profile=profile,
+                        target_ref=plan["generation_ref"],
+                        retiring_paths=reconciled_retiring,
+                        manifest_path=manifest_path,
+                        manifest=existing,
+                        updates={
+                            "status": "activated",
+                            "activated_at": _timestamp(_utc_now()),
+                        },
+                    )
                 return {**plan, "dry_run": False, "status": "already_applied"}
             if existing and destination.is_file():
                 validation = _validate_transformed(
@@ -1063,11 +1183,17 @@ class MigrationManager:
                     retiring=retiring,
                     target_path=destination,
                 )
-                existing.update({
-                    "status": "activated",
-                    "activated_at": _timestamp(_utc_now()),
-                })
-                _atomic_json(manifest_path, existing)
+                self._persist_switched_manifest(
+                    profile=profile,
+                    target_ref=plan["generation_ref"],
+                    retiring_paths=[item[0] for item in retiring],
+                    manifest_path=manifest_path,
+                    manifest=existing,
+                    updates={
+                        "status": "activated",
+                        "activated_at": _timestamp(_utc_now()),
+                    },
+                )
                 return {
                     **plan, "dry_run": False, "status": "reapplied",
                     "validation": validation,
@@ -1184,11 +1310,17 @@ class MigrationManager:
                     retiring=retiring,
                     prepare_target=prepare_destination,
                 )
-                manifest.update({
-                    "status": "activated",
-                    "activated_at": now,
-                })
-                _atomic_json(manifest_path, manifest)
+                self._persist_switched_manifest(
+                    profile=profile,
+                    target_ref=plan["generation_ref"],
+                    retiring_paths=[item[0] for item in retiring],
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                    updates={
+                        "status": "activated",
+                        "activated_at": now,
+                    },
+                )
                 return {
                     **plan,
                     "dry_run": False,
@@ -1217,6 +1349,23 @@ class MigrationManager:
             rollback_ref = str(manifest["rollback_ref"])
             rollback_db = root.parent / rollback_ref
             if profile.database_ref == rollback_ref and rollback_db.is_file():
+                if manifest.get("status") != "rolled_back":
+                    updates = {
+                        "status": "rolled_back",
+                        "rolled_back_at": _timestamp(_utc_now()),
+                    }
+                    if not manifest.get("rollback_baseline_hash"):
+                        updates["rollback_reapply_safe"] = False
+                    self._persist_switched_manifest(
+                        profile=profile,
+                        target_ref=rollback_ref,
+                        retiring_paths=[
+                            root.parent / str(manifest["generation_ref"])
+                        ],
+                        manifest_path=manifest_path,
+                        manifest=manifest,
+                        updates=updates,
+                    )
                 return {
                     "migration_id": migration_id,
                     "status": "already_rolled_back",
@@ -1250,6 +1399,11 @@ class MigrationManager:
             finally:
                 rollback_tmp.unlink(missing_ok=True)
             rollback_baseline_hash = _hash_database(rollback_db)
+            manifest.update({
+                "rollback_baseline_hash": rollback_baseline_hash,
+                "rollback_reapply_safe": True,
+            })
+            _atomic_json(manifest_path, manifest)
             authority_path = self.registry.paths_for(profile).database
             self._switch_profile_generation(
                 profile=profile,
@@ -1262,12 +1416,18 @@ class MigrationManager:
                 )],
                 target_path=rollback_db,
             )
-            manifest.update({
-                "status": "rolled_back",
-                "rolled_back_at": _timestamp(_utc_now()),
-                "rollback_baseline_hash": rollback_baseline_hash,
-            })
-            _atomic_json(manifest_path, manifest)
+            self._persist_switched_manifest(
+                profile=profile,
+                target_ref=rollback_ref,
+                retiring_paths=[authority_path],
+                manifest_path=manifest_path,
+                manifest=manifest,
+                updates={
+                    "status": "rolled_back",
+                    "rolled_back_at": _timestamp(_utc_now()),
+                    "rollback_baseline_hash": rollback_baseline_hash,
+                },
+            )
             return {
                 "migration_id": migration_id,
                 "status": "rolled_back",

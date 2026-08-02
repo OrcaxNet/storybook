@@ -141,6 +141,29 @@ def _inject_commit_failure(
     monkeypatch.setattr(migration, "_commit_guard", fail_selected_commit)
 
 
+def _inject_manifest_transition_failure(
+    monkeypatch,
+    *,
+    status: str,
+    failure_mode: str,
+) -> None:
+    real_atomic_json = migration._atomic_json
+    failed = False
+
+    def fail_selected_transition(path: Path, payload: dict) -> None:
+        nonlocal failed
+        should_fail = not failed and payload.get("status") == status
+        if should_fail:
+            failed = True
+        if should_fail and failure_mode == "before":
+            raise OSError("injected manifest failure before atomic replace")
+        real_atomic_json(path, payload)
+        if should_fail and failure_mode == "after":
+            raise OSError("injected manifest failure after atomic replace")
+
+    monkeypatch.setattr(migration, "_atomic_json", fail_selected_transition)
+
+
 def test_dry_run_is_zero_write_and_reports_stable_plan(
     tmp_path, migration_profile
 ):
@@ -454,6 +477,53 @@ def test_registry_error_after_durable_pointer_is_recovered_as_success(
 
 
 @pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_cutover_manifest_failure_converges_to_activated(
+    tmp_path, migration_profile, monkeypatch, failure_mode
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    _inject_manifest_transition_failure(
+        monkeypatch,
+        status="activated",
+        failure_mode=failure_mode,
+    )
+
+    applied = manager.run(source)
+
+    assert applied["status"] == "applied"
+    assert migration_profile.active_profile().database_ref == applied["generation_ref"]
+    assert config.DB_PATH == migration_profile.paths_for(
+        migration_profile.active_profile()
+    ).database
+    assert manager.status()["migrations"][0]["status"] == "activated"
+
+
+def test_already_applied_repairs_stale_manifest(tmp_path, migration_profile):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    manifest_path = (
+        migration_profile.active_paths().root
+        / "migrations"
+        / applied["migration_id"]
+        / "manifest.json"
+    )
+    stale = migration._read_manifest(manifest_path)
+    assert stale is not None
+    stale["status"] = "validated"
+    stale.pop("activated_at", None)
+    migration._atomic_json(manifest_path, stale)
+
+    repeated = manager.run(source)
+
+    assert repeated["status"] == "already_applied"
+    repaired = migration._read_manifest(manifest_path)
+    assert repaired is not None
+    assert repaired["status"] == "activated"
+    assert "activated_at" in repaired
+
+
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
 def test_cutover_commit_failure_restores_old_authority(
     tmp_path, migration_profile, monkeypatch, failure_mode
 ):
@@ -526,6 +596,95 @@ def test_rollback_atomically_points_to_independent_v1_copy(
     assert manager.rollback(applied["migration_id"])["status"] == (
         "already_rolled_back"
     )
+
+
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_rollback_manifest_failure_converges_to_rolled_back(
+    tmp_path, migration_profile, monkeypatch, failure_mode
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    _inject_manifest_transition_failure(
+        monkeypatch,
+        status="rolled_back",
+        failure_mode=failure_mode,
+    )
+
+    rolled_back = manager.rollback(applied["migration_id"])
+
+    assert rolled_back["status"] == "rolled_back"
+    assert migration_profile.active_profile().database_ref == applied["rollback_ref"]
+    assert config.DB_PATH == migration_profile.paths_for(
+        migration_profile.active_profile()
+    ).database
+    assert manager.status()["migrations"][0]["status"] == "rolled_back"
+    assert manager.rollback(applied["migration_id"])["status"] == (
+        "already_rolled_back"
+    )
+
+
+def test_already_rolled_back_repairs_stale_manifest(
+    tmp_path, migration_profile
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    manager.rollback(applied["migration_id"])
+    manifest_path = (
+        migration_profile.active_paths().root
+        / "migrations"
+        / applied["migration_id"]
+        / "manifest.json"
+    )
+    stale = migration._read_manifest(manifest_path)
+    assert stale is not None
+    baseline_hash = stale["rollback_baseline_hash"]
+    stale["status"] = "activated"
+    stale.pop("rolled_back_at", None)
+    migration._atomic_json(manifest_path, stale)
+
+    repeated = manager.rollback(applied["migration_id"])
+
+    assert repeated["status"] == "already_rolled_back"
+    repaired = migration._read_manifest(manifest_path)
+    assert repaired is not None
+    assert repaired["status"] == "rolled_back"
+    assert "rolled_back_at" in repaired
+    assert repaired["rollback_baseline_hash"] == baseline_hash
+
+
+def test_already_rolled_back_without_baseline_disables_reapply(
+    tmp_path, migration_profile
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    manager.rollback(applied["migration_id"])
+    manifest_path = (
+        migration_profile.active_paths().root
+        / "migrations"
+        / applied["migration_id"]
+        / "manifest.json"
+    )
+    stale = migration._read_manifest(manifest_path)
+    assert stale is not None
+    stale["status"] = "activated"
+    stale.pop("rolled_back_at", None)
+    stale.pop("rollback_baseline_hash", None)
+    stale.pop("rollback_reapply_safe", None)
+    migration._atomic_json(manifest_path, stale)
+
+    repeated = manager.rollback(applied["migration_id"])
+
+    assert repeated["status"] == "already_rolled_back"
+    repaired = migration._read_manifest(manifest_path)
+    assert repaired is not None
+    assert repaired["status"] == "rolled_back"
+    assert repaired["rollback_reapply_safe"] is False
+    with pytest.raises(migration.MigrationError) as exc_info:
+        manager.run(source)
+    assert exc_info.value.code == "SB_MIGRATION_AUTHORITY_BASELINE_UNKNOWN"
 
 
 def test_rollback_rejects_active_v2_writer_without_switching(
@@ -708,6 +867,31 @@ def test_reapply_allows_unchanged_rollback_authority(
     assert store.count_sessions() == 2
     store.add_session("reapplied-writer", "new active v2 data")
     assert store.count_sessions() == 3
+
+
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_reapply_manifest_failure_converges_to_activated(
+    tmp_path, migration_profile, monkeypatch, failure_mode
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    manager.rollback(applied["migration_id"])
+    _inject_manifest_transition_failure(
+        monkeypatch,
+        status="activated",
+        failure_mode=failure_mode,
+    )
+
+    reapplied = manager.run(source)
+
+    assert reapplied["status"] == "reapplied"
+    assert migration_profile.active_profile().database_ref == applied["generation_ref"]
+    assert config.DB_PATH == migration_profile.paths_for(
+        migration_profile.active_profile()
+    ).database
+    assert manager.status()["migrations"][0]["status"] == "activated"
+    assert manager.run(source)["status"] == "already_applied"
 
 
 @pytest.mark.parametrize("failure_index", [1, 2, 3])
