@@ -35,7 +35,6 @@ def isolated_setup(tmp_path, monkeypatch):
         roots.config / "profiles.json", roots=roots, environ={"HOME": str(tmp_path)}
     )
     old_registry = config.PROFILE_REGISTRY
-    old_profile_id = config.PROFILE_ID
     config.PROFILE_REGISTRY = registry
     config.refresh_profile(create=False)
     manager = SetupManager(
@@ -68,7 +67,7 @@ def isolated_setup(tmp_path, monkeypatch):
         yield manager, roots
     finally:
         config.PROFILE_REGISTRY = old_registry
-        config.refresh_profile(old_profile_id)
+        config.refresh_profile(create=False)
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -558,6 +557,12 @@ def test_codex_semantically_configured_without_marker_is_not_rewritten(
     assert path.read_bytes() == before
     assert path.stat().st_mtime_ns == fixed_mtime_ns
     assert not (roots.state / "setup-backups").exists()
+    state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+    assert state["selected_adapters"] == ["codex"]
+
+    manager.execute(requested_agents=("cursor",), download_models=False)
+    state = json.loads(manager.state_path.read_text(encoding="utf-8"))
+    assert state["selected_adapters"] == ["codex", "cursor"]
 
 
 @pytest.mark.parametrize(
@@ -835,6 +840,100 @@ def test_model_unavailable_returns_degraded_not_failed(isolated_setup, monkeypat
 
     assert result["status"] == "degraded"
     assert result["degraded_reasons"] == ["Ollama unavailable"]
+
+
+def _invoke_runtime_status(manager, monkeypatch, *, reachable=True, models=None):
+    tags = {"models": [{"name": name} for name in (models or ())]}
+    monkeypatch.setattr(
+        "storybook.setup_manager.health._check_ollama_reachable",
+        lambda: (reachable, tags if reachable else None, "offline"),
+    )
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    result = CliRunner().invoke(cli, ["status", "--json"])
+    assert result.exit_code == 0, result.output
+    return json.loads(result.output)
+
+
+def test_status_reports_normal_ready_components(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    manager.execute(requested_agents=("codex",), download_models=False)
+
+    payload = _invoke_runtime_status(
+        manager,
+        monkeypatch,
+        models=(config.LLM_MODEL, config.EMBED_MODEL),
+    )
+
+    assert payload["status"] == "ready"
+    assert payload["profile"]["status"] == "ready"
+    assert payload["model"]["status"] == "ready"
+    assert payload["adapter"] == {
+        "status": "ready",
+        "checks": [{"name": "codex", "status": "ready"}],
+    }
+    assert payload["sync"] == {"state": "local_only", "enabled": False}
+    assert payload["degraded_reasons"] == []
+
+
+def test_status_reports_ollama_unavailable(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    manager.execute(requested_agents=("codex",), download_models=False)
+
+    payload = _invoke_runtime_status(manager, monkeypatch, reachable=False)
+
+    assert payload["status"] == "ready_degraded"
+    assert payload["model"]["status"] == "unavailable"
+    assert payload["degraded_reasons"] == ["ollama_unavailable"]
+
+
+def test_status_reports_missing_embedding_model(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    manager.execute(requested_agents=("codex",), download_models=False)
+
+    payload = _invoke_runtime_status(
+        manager, monkeypatch, models=(config.LLM_MODEL,)
+    )
+
+    assert payload["status"] == "ready_degraded"
+    assert payload["model"]["embedding"]["status"] == "missing"
+    assert payload["degraded_reasons"] == ["model_missing:embedding"]
+
+
+def test_status_reports_managed_adapter_missing(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    manager.execute(requested_agents=("codex",), download_models=False)
+    (manager.home / ".codex" / "config.toml").unlink()
+
+    payload = _invoke_runtime_status(
+        manager,
+        monkeypatch,
+        models=(config.LLM_MODEL, config.EMBED_MODEL),
+    )
+
+    assert payload["status"] == "ready_degraded"
+    assert payload["adapter"] == {
+        "status": "degraded",
+        "checks": [{"name": "codex", "status": "missing"}],
+    }
+    assert payload["degraded_reasons"] == ["adapter_unavailable:codex"]
+
+
+def test_status_reports_invalid_setup_state_without_crashing(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    manager.state_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.state_path.write_text("{broken", encoding="utf-8")
+
+    payload = _invoke_runtime_status(
+        manager,
+        monkeypatch,
+        models=(config.LLM_MODEL, config.EMBED_MODEL),
+    )
+
+    assert payload["status"] == "ready_degraded"
+    assert payload["adapter"] == {"status": "not_configured", "checks": []}
+    assert payload["degraded_reasons"] == ["setup_state_invalid"]
 
 
 def test_noninteractive_purge_requires_second_confirmation():

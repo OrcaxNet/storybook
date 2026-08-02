@@ -31,7 +31,6 @@ def _roots(tmp_path: Path) -> PlatformRoots:
 @pytest.fixture
 def migration_profile(tmp_path):
     old_registry = config.PROFILE_REGISTRY
-    old_profile_id = config.PROFILE_ID
     registry = ProfileRegistry(
         tmp_path / "config" / "profiles.json", roots=_roots(tmp_path)
     )
@@ -41,7 +40,7 @@ def migration_profile(tmp_path):
         yield registry
     finally:
         config.PROFILE_REGISTRY = old_registry
-        config.refresh_profile(old_profile_id)
+        config.refresh_profile(create=False)
 
 
 def _legacy_db(path: Path) -> Path:

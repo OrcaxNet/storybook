@@ -246,7 +246,6 @@ class TestProfileCLI:
     @pytest.fixture
     def isolated_config(self, tmp_path):
         old_registry = config.PROFILE_REGISTRY
-        old_profile_id = config.PROFILE_ID
         registry = ProfileRegistry(
             tmp_path / "config" / "profiles.json", roots=_roots(tmp_path)
         )
@@ -256,7 +255,7 @@ class TestProfileCLI:
             yield registry
         finally:
             config.PROFILE_REGISTRY = old_registry
-            config.refresh_profile(old_profile_id)
+            config.refresh_profile(create=False)
 
     def test_show_and_sync_status_are_explicitly_local_only(self, isolated_config):
         runner = CliRunner()

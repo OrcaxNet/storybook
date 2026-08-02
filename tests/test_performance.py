@@ -61,7 +61,20 @@ class TestQueryDiagnostics:
         assert summary["fallback_ratio"] == 0.1
         assert summary["degraded_ratio"] == 0.2
 
-    def test_status_performance_json(self):
+    def test_status_performance_json(self, monkeypatch):
+        monkeypatch.setattr(
+            "storybook.setup_manager.health._check_ollama_reachable",
+            lambda: (
+                True,
+                {
+                    "models": [
+                        {"name": config.LLM_MODEL},
+                        {"name": config.EMBED_MODEL},
+                    ]
+                },
+                "",
+            ),
+        )
         performance.record_query_diagnostic(
             request_id="req",
             mode="vector",
@@ -73,7 +86,10 @@ class TestQueryDiagnostics:
 
         assert result.exit_code == 0, result.output
         payload = json.loads(result.output)
-        assert payload["status"] == "ready"
+        # The suite's autouse DB fixture intentionally avoids persisting a real
+        # Profile, so runtime status exposes that harness-only degraded state.
+        assert payload["status"] == "ready_degraded"
+        assert payload["degraded_reasons"] == ["profile_uninitialized"]
         assert payload["performance"]["sample_size"] == 1
         assert payload["performance"]["latency_ms"]["total"]["p95"] == 12.5
 
