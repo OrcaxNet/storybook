@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from datetime import UTC, datetime
 import hashlib
 from itertools import combinations
 from pathlib import Path
@@ -126,10 +127,17 @@ CREATE TABLE IF NOT EXISTS edges (
     target_id INTEGER NOT NULL,
     weight REAL DEFAULT 0.0,
     edge_type TEXT DEFAULT 'semantic',
+    directed INTEGER NOT NULL DEFAULT 0 CHECK(directed IN (0, 1)),
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL DEFAULT 1,
+    observations INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    last_reinforced_at TEXT,
+    deleted_at TEXT,
     FOREIGN KEY (source_id) REFERENCES stories(id),
     FOREIGN KEY (target_id) REFERENCES stories(id),
-    UNIQUE(source_id, target_id)
+    UNIQUE(source_id, target_id, edge_type)
 );
 
 -- 索引
@@ -284,6 +292,7 @@ def init_db():
     try:
         db.executescript(_SCHEMA)
         _ensure_identity_columns(db)
+        _ensure_memory_graph_schema(db)
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
         _ensure_memory_event_backfill(db)
@@ -449,6 +458,160 @@ def _ensure_identity_columns(db: sqlite3.Connection) -> None:
             f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_global_id "
             f"ON {table}(global_id)"
         )
+
+
+_MEMORY_EDGE_TABLE_SQL = """
+CREATE TABLE edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    global_id TEXT NOT NULL UNIQUE,
+    profile_id TEXT NOT NULL,
+    sync_state TEXT NOT NULL DEFAULT 'local_only'
+        CHECK(sync_state IN ('local_only', 'synced', 'pending', 'conflict', 'paused', 'error')),
+    source_id INTEGER NOT NULL,
+    target_id INTEGER NOT NULL,
+    weight REAL NOT NULL DEFAULT 0.0,
+    edge_type TEXT NOT NULL DEFAULT 'semantic',
+    directed INTEGER NOT NULL DEFAULT 0 CHECK(directed IN (0, 1)),
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL DEFAULT 1,
+    observations INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    last_reinforced_at TEXT,
+    deleted_at TEXT,
+    FOREIGN KEY (source_id) REFERENCES stories(id),
+    FOREIGN KEY (target_id) REFERENCES stories(id),
+    UNIQUE(source_id, target_id, edge_type)
+)
+"""
+
+
+def _ensure_memory_graph_schema(db: sqlite3.Connection) -> None:
+    """Idempotently migrate the v0.1 undirected edge table in place.
+
+    SQLite cannot replace ``UNIQUE(source_id, target_id)`` with a typed unique
+    key using ``ALTER TABLE``.  Rebuilding the small edge table is therefore the
+    only safe way to allow more than one memory relation between the same pair.
+    Story rows and edge global IDs are retained; legacy provenance is made
+    explicit instead of being guessed from the current machine or session.
+    """
+
+    columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(edges)").fetchall()
+    }
+    required = {
+        "directed", "provenance_json", "version", "observations", "updated_at",
+        "last_reinforced_at", "deleted_at",
+    }
+    table_row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='edges'"
+    ).fetchone()
+    compact_sql = re.sub(r"\s+", "", (table_row["sql"] or "").upper())
+    typed_unique = "UNIQUE(SOURCE_ID,TARGET_ID,EDGE_TYPE)" in compact_sql
+    if required.issubset(columns) and typed_unique:
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edges_active_source "
+            "ON edges(source_id, deleted_at, weight DESC)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edges_active_target "
+            "ON edges(target_id, deleted_at, weight DESC)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_edges_type_active "
+            "ON edges(edge_type, deleted_at)"
+        )
+        return
+
+    legacy_table = "edges_graph_legacy_v1"
+    if db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (legacy_table,),
+    ).fetchone():
+        raise RuntimeError("检测到未完成的 Memory Graph 边迁移，请先恢复数据库备份")
+
+    rows = db.execute(
+        """SELECT e.*, source.parent_id AS source_parent_id,
+                         target.parent_id AS target_parent_id
+           FROM edges e
+           LEFT JOIN stories source ON source.id = e.source_id
+           LEFT JOIN stories target ON target.id = e.target_id
+           ORDER BY e.id"""
+    ).fetchall()
+    db.execute("DROP INDEX IF EXISTS idx_edges_source")
+    db.execute("DROP INDEX IF EXISTS idx_edges_target")
+    db.execute("DROP INDEX IF EXISTS idx_edges_active_source")
+    db.execute("DROP INDEX IF EXISTS idx_edges_active_target")
+    db.execute("DROP INDEX IF EXISTS idx_edges_type_active")
+    db.execute(f"ALTER TABLE edges RENAME TO {legacy_table}")
+    db.execute(_MEMORY_EDGE_TABLE_SQL)
+
+    for row in rows:
+        keys = set(row.keys())
+        edge_type = _normalize_edge_type(row["edge_type"])
+        source_id, target_id = int(row["source_id"]), int(row["target_id"])
+        directed = (
+            bool(row["directed"])
+            if "directed" in keys
+            else edge_type in config.DIRECTED_EDGE_TYPES
+        )
+        # v0.1 normalised every relation as an undirected pair.  Parent/child is
+        # the one directed relation whose intended orientation can be recovered
+        # losslessly from ``stories.parent_id``.
+        if edge_type == "parent_child" and row["source_parent_id"] == target_id:
+            source_id, target_id = target_id, source_id
+        if not directed:
+            source_id, target_id = _edge_pair(source_id, target_id)
+
+        provenance = _json_load(
+            row["provenance_json"] if "provenance_json" in keys else None,
+            {},
+        )
+        if not isinstance(provenance, dict) or not provenance:
+            provenance = {
+                "source": "legacy_migration",
+                "original_edge_type": row["edge_type"] or "semantic",
+            }
+        created_at = (
+            row["created_at"] if "created_at" in keys and row["created_at"]
+            else datetime.now(UTC).isoformat()
+        )
+        db.execute(
+            """INSERT INTO edges (
+                   id, global_id, profile_id, sync_state, source_id, target_id,
+                   weight, edge_type, directed, provenance_json, version,
+                   observations, created_at, updated_at, last_reinforced_at,
+                   deleted_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                row["id"], row["global_id"], row["profile_id"],
+                row["sync_state"], source_id, target_id,
+                max(0.0, min(float(row["weight"] or 0.0), config.WEIGHT_MAX)),
+                edge_type, int(directed),
+                json.dumps(provenance, ensure_ascii=False, sort_keys=True),
+                int(row["version"] if "version" in keys else 1),
+                int(row["observations"] if "observations" in keys else 0),
+                created_at,
+                row["updated_at"] if "updated_at" in keys else created_at,
+                row["last_reinforced_at"] if "last_reinforced_at" in keys else None,
+                row["deleted_at"] if "deleted_at" in keys else None,
+            ),
+        )
+
+    db.execute(f"DROP TABLE {legacy_table}")
+    db.execute("CREATE INDEX idx_edges_source ON edges(source_id)")
+    db.execute("CREATE INDEX idx_edges_target ON edges(target_id)")
+    db.execute(
+        "CREATE INDEX idx_edges_active_source "
+        "ON edges(source_id, deleted_at, weight DESC)"
+    )
+    db.execute(
+        "CREATE INDEX idx_edges_active_target "
+        "ON edges(target_id, deleted_at, weight DESC)"
+    )
+    db.execute(
+        "CREATE INDEX idx_edges_type_active ON edges(edge_type, deleted_at)"
+    )
 
 
 def _ensure_context_columns(db: sqlite3.Connection) -> None:
@@ -2075,6 +2238,10 @@ def apply_recall_feedback(
 
     查询线程通过后台队列调用本函数；这里刻意不推进 ``index_version``，避免
     纯反馈写使查询结果缓存每次都失效。
+
+    新 schema 会为每对 Story 维护独立 ``co_recall`` 边，并继续强化已有
+    语义/层级边以保持 v0.1 的学习语义。写失败由上层队列吞掉，不会
+    变成查询失败。
     """
 
     unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
@@ -2088,15 +2255,47 @@ def apply_recall_feedback(
             [(story_id,) for story_id in unique_ids],
         )
         for source_id, target_id in combinations(sorted(unique_ids), 2):
+            now = datetime.now(UTC).isoformat()
             db.execute(
                 """UPDATE edges
-                   SET weight = MIN(weight + ?, ?)
-                   WHERE source_id = ? AND target_id = ?""",
+                   SET weight = MIN(weight + ?, ?),
+                       observations = observations + 1,
+                       version = version + 1,
+                       last_reinforced_at = ?, updated_at = ?
+                   WHERE source_id = ? AND target_id = ?
+                     AND edge_type != 'co_recall' AND deleted_at IS NULL""",
                 (
                     config.WEIGHT_INCREMENT,
                     config.WEIGHT_MAX,
+                    now,
+                    now,
                     source_id,
                     target_id,
+                ),
+            )
+            db.execute(
+                """INSERT INTO edges (
+                       global_id, profile_id, sync_state, source_id, target_id,
+                       weight, edge_type, directed, provenance_json, version,
+                       observations, last_reinforced_at, updated_at
+                   ) VALUES (?, ?, 'local_only', ?, ?, ?, 'co_recall', 0, ?, 1, 1, ?, ?)
+                   ON CONFLICT(source_id, target_id, edge_type) DO UPDATE SET
+                       weight = MIN(edges.weight + excluded.weight, ?),
+                       observations = edges.observations + 1,
+                       version = edges.version + 1,
+                       last_reinforced_at = excluded.last_reinforced_at,
+                       updated_at = excluded.updated_at,
+                       deleted_at = NULL""",
+                (
+                    _new_global_id(), config.PROFILE_ID, source_id, target_id,
+                    min(config.WEIGHT_INCREMENT, config.WEIGHT_MAX),
+                    json.dumps(
+                        {"source": "recall_feedback", "method": "co_occurrence"},
+                        sort_keys=True,
+                    ),
+                    now,
+                    now,
+                    config.WEIGHT_MAX,
                 ),
             )
         db.commit()
@@ -2123,105 +2322,253 @@ def _edge_pair(a: int, b: int) -> tuple[int, int]:
     return (a, b) if a <= b else (b, a)
 
 
-def add_or_update_edge(source_id: int, target_id: int, weight: float,
-                       edge_type: str = "semantic"):
-    """添加或更新一条关联边（无向，方向无关）。已存在则取 max(weight)。"""
-    source_id, target_id = _edge_pair(source_id, target_id)
+def _normalize_edge_type(edge_type: str | None, *, strict: bool = False) -> str:
+    normalized = (edge_type or "semantic").strip().lower()
+    allowed = set(config.MEMORY_EDGE_TYPES) | {"sibling"}
+    if normalized in allowed:
+        return normalized
+    if strict:
+        raise ValueError(
+            f"不支持的 edge_type: {edge_type}; "
+            f"允许值为 {', '.join(config.MEMORY_EDGE_TYPES)}"
+        )
+    return "semantic"
+
+
+def _edge_is_directed(edge_type: str) -> bool:
+    return edge_type in config.DIRECTED_EDGE_TYPES
+
+
+def _canonical_edge_endpoints(
+    source_id: int, target_id: int, *, directed: bool
+) -> tuple[int, int]:
+    source_id, target_id = int(source_id), int(target_id)
+    return (source_id, target_id) if directed else _edge_pair(source_id, target_id)
+
+
+def _edge_provenance(value: dict | None, *, edge_type: str) -> dict:
+    if value is not None and not isinstance(value, dict):
+        raise ValueError("provenance 必须是 JSON object")
+    provenance = dict(value or {})
+    provenance.setdefault("source", "storybook")
+    provenance.setdefault("relation", edge_type)
+    return provenance
+
+
+def _edge_row_to_dict(row: sqlite3.Row | dict) -> dict:
+    result = dict(row)
+    result["directed"] = bool(result.get("directed"))
+    result["provenance"] = _json_load(result.pop("provenance_json", None), {})
+    return result
+
+
+def add_or_update_edge(
+    source_id: int,
+    target_id: int,
+    weight: float,
+    edge_type: str = "semantic",
+    *,
+    provenance: dict | None = None,
+    directed: bool | None = None,
+) -> int:
+    """添加或更新一条有类型、可解释的 Memory Graph 边。
+
+    标准方向语义：``temporal`` 旧→新，``causal`` 因→果，
+    ``parent_child`` 父→子，``supersedes`` 新→旧。其余类型无向并对
+    端点排序。同一 Story 对可同时拥有多种边；同类型重复写取较大
+    权重，且保留 provenance/version 审计信息。
+    """
+
+    edge_type = _normalize_edge_type(edge_type, strict=True)
+    expected_direction = _edge_is_directed(edge_type)
+    if directed is not None and bool(directed) != expected_direction:
+        raise ValueError(f"{edge_type} 的 directed 必须为 {expected_direction}")
+    directed = expected_direction
+    source_id, target_id = _canonical_edge_endpoints(
+        source_id, target_id, directed=directed
+    )
+    weight = max(0.0, min(float(weight), config.WEIGHT_MAX))
+    new_provenance = _edge_provenance(provenance, edge_type=edge_type)
     db = get_db()
     try:
         existing = db.execute(
-            "SELECT * FROM edges WHERE source_id = ? AND target_id = ?",
-            (source_id, target_id)
+            """SELECT * FROM edges
+               WHERE source_id = ? AND target_id = ? AND edge_type = ?""",
+            (source_id, target_id, edge_type),
         ).fetchone()
         changed = False
         if existing:
-            new_weight = min(max(existing["weight"], weight), config.WEIGHT_MAX)
-            if new_weight != existing["weight"]:
+            new_weight = min(max(float(existing["weight"]), weight), config.WEIGHT_MAX)
+            old_provenance = _json_load(existing["provenance_json"], {})
+            merged_provenance = dict(old_provenance)
+            if provenance is not None:
+                merged_provenance.update(new_provenance)
+            revived = existing["deleted_at"] is not None
+            changed = (
+                new_weight != existing["weight"]
+                or merged_provenance != old_provenance
+                or revived
+            )
+            if changed:
                 db.execute(
-                    "UPDATE edges SET weight = ? WHERE source_id = ? AND target_id = ?",
-                    (new_weight, source_id, target_id)
+                    """UPDATE edges
+                       SET weight = ?, provenance_json = ?, directed = ?,
+                           version = version + 1, updated_at = datetime('now'),
+                           deleted_at = NULL
+                       WHERE id = ?""",
+                    (
+                        new_weight,
+                        json.dumps(
+                            merged_provenance, ensure_ascii=False, sort_keys=True
+                        ),
+                        int(directed),
+                        existing["id"],
+                    ),
                 )
-                changed = True
+            edge_id = int(existing["id"])
         else:
-            db.execute(
+            cursor = db.execute(
                 """INSERT INTO edges (
                        global_id, profile_id, sync_state,
-                       source_id, target_id, weight, edge_type
-                   ) VALUES (?, ?, 'local_only', ?, ?, ?, ?)""",
+                       source_id, target_id, weight, edge_type, directed,
+                       provenance_json
+                   ) VALUES (?, ?, 'local_only', ?, ?, ?, ?, ?, ?)""",
                 (
                     _new_global_id(), config.PROFILE_ID,
-                    source_id, target_id, weight, edge_type,
-                )
+                    source_id, target_id, weight, edge_type, int(directed),
+                    json.dumps(new_provenance, ensure_ascii=False, sort_keys=True),
+                ),
             )
+            edge_id = int(cursor.lastrowid)
             changed = True
         if changed:
             _bump_index_version(db)
         db.commit()
+        return edge_id
     finally:
         db.close()
 
 
-def increment_edge_weight(source_id: int, target_id: int, delta: float = None):
-    """共同调用时提升权重（无向，方向无关）。"""
+def increment_edge_weight(
+    source_id: int,
+    target_id: int,
+    delta: float = None,
+    *,
+    edge_type: str | None = None,
+) -> None:
+    """提升一条已有边权重，不凭空创建关系。
+
+    未指定类型时优先兼容旧的 ``semantic`` 边，否则选取权重最高
+    的现有关系。共现反馈的专用语义由 ``apply_recall_feedback``
+    维护。
+    """
     if delta is None:
         delta = config.WEIGHT_INCREMENT
-    source_id, target_id = _edge_pair(source_id, target_id)
+    pair = _edge_pair(int(source_id), int(target_id))
+    normalized_type = (
+        _normalize_edge_type(edge_type, strict=True) if edge_type else None
+    )
     db = get_db()
     try:
         row = db.execute(
-            "SELECT weight FROM edges WHERE source_id = ? AND target_id = ?",
-            (source_id, target_id)
+            """SELECT * FROM edges
+               WHERE deleted_at IS NULL
+                 AND ((source_id = ? AND target_id = ?)
+                   OR (source_id = ? AND target_id = ?))
+                 AND (? IS NULL OR edge_type = ?)
+               ORDER BY CASE WHEN edge_type = 'semantic' THEN 0 ELSE 1 END,
+                        weight DESC, id
+               LIMIT 1""",
+            (
+                pair[0], pair[1], pair[1], pair[0],
+                normalized_type, normalized_type,
+            ),
         ).fetchone()
         if row:
-            new_weight = min(row["weight"] + delta, config.WEIGHT_MAX)
+            new_weight = max(
+                0.0, min(float(row["weight"]) + float(delta), config.WEIGHT_MAX)
+            )
             db.execute(
-                "UPDATE edges SET weight = ? WHERE source_id = ? AND target_id = ?",
-                (new_weight, source_id, target_id)
+                """UPDATE edges SET weight = ?, version = version + 1,
+                                     updated_at = datetime('now')
+                   WHERE id = ?""",
+                (new_weight, row["id"]),
             )
             db.commit()
     finally:
         db.close()
 
 
-def get_edges(story_id: int) -> list[dict]:
-    """获取 story 的所有关联边（双向），按权重降序"""
+def delete_edge(
+    source_id: int, target_id: int, edge_type: str | None = None
+) -> int:
+    """软删除匹配边并返回受影响行数；历史仍可审计。"""
+
+    pair = _edge_pair(int(source_id), int(target_id))
+    normalized_type = (
+        _normalize_edge_type(edge_type, strict=True) if edge_type else None
+    )
+    db = get_db()
+    try:
+        cursor = db.execute(
+            """UPDATE edges
+               SET deleted_at = datetime('now'), updated_at = datetime('now'),
+                   version = version + 1
+               WHERE deleted_at IS NULL
+                 AND ((source_id = ? AND target_id = ?)
+                   OR (source_id = ? AND target_id = ?))
+                 AND (? IS NULL OR edge_type = ?)""",
+            (
+                pair[0], pair[1], pair[1], pair[0],
+                normalized_type, normalized_type,
+            ),
+        )
+        if cursor.rowcount:
+            _bump_index_version(db)
+        db.commit()
+        return max(0, cursor.rowcount)
+    finally:
+        db.close()
+
+
+def get_edges(story_id: int, *, include_deleted: bool = False) -> list[dict]:
+    """获取 Story 的入/出/无向边，按权重降序。"""
+
     db = get_db()
     try:
         rows = db.execute(
-            """SELECT e.*, CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END AS related_id
+            """SELECT e.*,
+                      CASE WHEN e.source_id = ? THEN e.target_id
+                           ELSE e.source_id END AS related_id,
+                      CASE WHEN e.directed = 0 THEN 'undirected'
+                           WHEN e.source_id = ? THEN 'outbound'
+                           ELSE 'inbound' END AS direction
                FROM edges e
-               WHERE e.source_id = ? OR e.target_id = ?
-               ORDER BY e.weight DESC""",
-            (story_id, story_id, story_id)
+               WHERE (e.source_id = ? OR e.target_id = ?)
+                 AND (? OR e.deleted_at IS NULL)
+               ORDER BY e.weight DESC, e.id""",
+            (story_id, story_id, story_id, story_id, int(include_deleted)),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_edge_row_to_dict(row) for row in rows]
     finally:
         db.close()
 
 
 def get_related_stories(story_id: int, limit: int = 5) -> list[dict]:
-    """获取关联 story 列表（含 story 详情），按权重降序"""
-    db = get_db()
-    try:
-        rows = db.execute(
-            """SELECT s.*, e.weight, e.edge_type
-               FROM edges e
-               JOIN stories s ON s.id = CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
-               WHERE (e.source_id = ? OR e.target_id = ?)
-                 AND s.deleted_at IS NULL
-               ORDER BY e.weight DESC
-               LIMIT ?""",
-            (story_id, story_id, story_id, limit)
-        ).fetchall()
-        return [_row_to_story(r) for r in rows]
-    finally:
-        db.close()
+    """获取去重后的相关 Story，保留最强边的解释。"""
+
+    return get_related_stories_batch([story_id], limit=limit).get(story_id, [])
 
 
 def get_related_stories_batch(
     story_ids: list[int], limit: int = 5
 ) -> dict[int, list[dict]]:
-    """在一个只读连接中批量读取多条 Story 的关联项。"""
+    """在一个只读连接中批量读取多条 Story 的关联项。
+
+    同一 Story 对可同时有多种边；兼容的 ``related`` 视图按目标
+    Story 去重，仅展示最强的一条。完整多边路径由 Graph RAG 解释
+    字段返回。
+    """
 
     unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
     related_by_story = {story_id: [] for story_id in unique_ids}
@@ -2231,18 +2578,266 @@ def get_related_stories_batch(
     try:
         for story_id in unique_ids:
             rows = db.execute(
-                """SELECT s.*, e.weight, e.edge_type
+                """SELECT s.*, e.weight, e.edge_type, e.directed,
+                          e.provenance_json, e.version AS edge_version,
+                          CASE WHEN e.directed = 0 THEN 'undirected'
+                               WHEN e.source_id = ? THEN 'outbound'
+                               ELSE 'inbound' END AS edge_direction
                    FROM edges e
                    JOIN stories s ON s.id = CASE
                        WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
                    WHERE (e.source_id = ? OR e.target_id = ?)
+                     AND e.deleted_at IS NULL
                      AND s.deleted_at IS NULL
-                   ORDER BY e.weight DESC
-                   LIMIT ?""",
-                (story_id, story_id, story_id, limit),
+                     AND s.embedding_status != 'archived'
+                   ORDER BY e.weight DESC, e.id""",
+                (story_id, story_id, story_id, story_id),
             ).fetchall()
-            related_by_story[story_id] = [_row_to_story(row) for row in rows]
+            seen: set[int] = set()
+            related = []
+            for row in rows:
+                item = _row_to_story(row)
+                if item["id"] in seen:
+                    continue
+                seen.add(item["id"])
+                item["directed"] = bool(item.get("directed"))
+                item["edge_provenance"] = _json_load(
+                    item.pop("provenance_json", None), {}
+                )
+                related.append(item)
+                if len(related) >= max(0, int(limit)):
+                    break
+            related_by_story[story_id] = related
         return related_by_story
+    finally:
+        db.close()
+
+
+def get_graph_neighbors_batch(
+    story_ids: list[int],
+    *,
+    fan_out: int,
+    allowed_edge_types: set[str] | frozenset[str] | None = None,
+) -> dict[int, dict]:
+    """为一层图扩散读取已通过方向/路径策略的有界邻接快照。
+
+    fan-out 必须在方向和路径类型过滤之后执行：否则不可遍历的
+    高权入边会占满 LIMIT，使合法出边饥饿。返回值为
+    ``{story_id: {items, policy_suppressed, fan_out_truncated}}``。
+    """
+
+    unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
+    output = {
+        story_id: {
+            "items": [],
+            "policy_suppressed": 0,
+            "fan_out_truncated": False,
+        }
+        for story_id in unique_ids
+    }
+    fan_out = max(0, int(fan_out))
+    if not unique_ids or fan_out == 0:
+        return output
+    allowed = sorted(
+        set(config.GRAPH_EDGE_TYPE_FACTORS)
+        if allowed_edge_types is None else set(allowed_edge_types)
+    )
+    db = get_db(load_vector_extension=False)
+    try:
+        for story_id in unique_ids:
+            type_clause = (
+                f"e.edge_type IN ({','.join('?' for _ in allowed)})"
+                if allowed else "0"
+            )
+            direction_clause = """(
+                e.directed = 0
+                OR e.edge_type = 'parent_child'
+                OR (e.edge_type = 'supersedes' AND e.target_id = ?)
+                OR (
+                    e.directed = 1
+                    AND e.edge_type NOT IN ('parent_child', 'supersedes')
+                    AND e.source_id = ?
+                )
+            )"""
+            counts = db.execute(
+                f"""SELECT COUNT(*) AS total,
+                           COALESCE(SUM(CASE
+                               WHEN {direction_clause} AND {type_clause}
+                               THEN 1 ELSE 0 END), 0) AS eligible
+                    FROM edges e
+                    JOIN stories s ON s.id = CASE
+                        WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
+                    WHERE (e.source_id = ? OR e.target_id = ?)
+                      AND e.deleted_at IS NULL
+                      AND s.deleted_at IS NULL
+                      AND s.embedding_status != 'archived'""",
+                (
+                    story_id, story_id, *allowed,
+                    story_id, story_id, story_id,
+                ),
+            ).fetchone()
+            eligible_count = int(counts["eligible"] or 0)
+            output[story_id]["policy_suppressed"] = max(
+                0, int(counts["total"] or 0) - eligible_count
+            )
+            output[story_id]["fan_out_truncated"] = eligible_count > fan_out
+            if eligible_count == 0:
+                continue
+            rows = db.execute(
+                f"""SELECT e.*, s.id AS story_id, s.title, s.abstract, s.content,
+                          s.keywords, s.applicability_json,
+                          s.environment_summary_json,
+                          (SELECT COUNT(*) FROM edges degree
+                           WHERE degree.deleted_at IS NULL
+                             AND (degree.source_id = s.id OR degree.target_id = s.id)
+                          ) AS degree
+                   FROM edges e
+                   JOIN stories s ON s.id = CASE
+                       WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END
+                   WHERE (e.source_id = ? OR e.target_id = ?)
+                     AND e.deleted_at IS NULL
+                     AND s.deleted_at IS NULL
+                     AND s.embedding_status != 'archived'
+                     AND {direction_clause}
+                     AND {type_clause}
+                   ORDER BY e.weight DESC, e.id
+                   LIMIT ?""",
+                (
+                    story_id, story_id, story_id,
+                    story_id, story_id,
+                    *allowed,
+                    fan_out,
+                ),
+            ).fetchall()
+            items = []
+            for row in rows:
+                direction = (
+                    "undirected" if not row["directed"]
+                    else "outbound" if row["source_id"] == story_id
+                    else "inbound"
+                )
+                summary, truncated = story_v2.recall_summary(dict(row))
+                items.append({
+                    "story_id": int(row["story_id"]),
+                    "title": row["title"],
+                    "abstract": summary,
+                    "content": summary,
+                    "truncated": truncated,
+                    "keywords": _json_load(row["keywords"], []),
+                    "applicability": context_module.normalize_applicability(
+                        row["applicability_json"]
+                    ),
+                    "environments": context_module.merge_environments(
+                        row["environment_summary_json"], []
+                    ),
+                    "degree": int(row["degree"] or 0),
+                    "edge": {
+                        "id": int(row["id"]),
+                        "global_id": row["global_id"],
+                        "source_id": int(row["source_id"]),
+                        "target_id": int(row["target_id"]),
+                        "edge_type": row["edge_type"],
+                        "weight": float(row["weight"]),
+                        "directed": bool(row["directed"]),
+                        "traversal": direction,
+                        "provenance": _json_load(row["provenance_json"], {}),
+                        "version": int(row["version"]),
+                        "created_at": row["created_at"],
+                        "updated_at": row["updated_at"],
+                    },
+                })
+            output[story_id]["items"] = items
+        return output
+    finally:
+        db.close()
+
+
+def get_superseded_story_ids(story_ids: list[int]) -> set[int]:
+    """返回默认应被新版 Story 抑制的旧 Story ID。"""
+
+    unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
+    if not unique_ids:
+        return set()
+    placeholders = ",".join("?" for _ in unique_ids)
+    db = get_db(load_vector_extension=False)
+    try:
+        rows = db.execute(
+            f"""SELECT e.target_id
+                 FROM edges e
+                 JOIN stories replacement ON replacement.id = e.source_id
+                 WHERE e.edge_type = 'supersedes' AND e.deleted_at IS NULL
+                   AND e.target_id IN ({placeholders})
+                   AND replacement.embedding_status != 'archived'""",
+            unique_ids,
+        ).fetchall()
+        return {int(row["target_id"]) for row in rows}
+    finally:
+        db.close()
+
+
+def decay_co_recall_edges(
+    *,
+    now: datetime | None = None,
+    half_life_days: float | None = None,
+    min_weight: float | None = None,
+    db_path: str | Path | None = None,
+) -> dict:
+    """对共现边做半衰期衰减，低于下限时软删除。"""
+
+    now = now or datetime.now(UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    half_life_days = (
+        config.GRAPH_CO_RECALL_HALF_LIFE_DAYS
+        if half_life_days is None else float(half_life_days)
+    )
+    min_weight = (
+        config.GRAPH_CO_RECALL_MIN_WEIGHT
+        if min_weight is None else float(min_weight)
+    )
+    if half_life_days <= 0:
+        raise ValueError("half_life_days 必须大于 0")
+    db = get_db(db_path, load_vector_extension=False)
+    decayed = deleted = 0
+    try:
+        rows = db.execute(
+            """SELECT * FROM edges
+               WHERE edge_type = 'co_recall' AND deleted_at IS NULL"""
+        ).fetchall()
+        for row in rows:
+            raw_timestamp = (
+                row["last_reinforced_at"] or row["updated_at"] or row["created_at"]
+            )
+            try:
+                timestamp = datetime.fromisoformat(
+                    str(raw_timestamp).replace("Z", "+00:00")
+                )
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=UTC)
+            except (TypeError, ValueError):
+                timestamp = now
+            age_days = max(0.0, (now - timestamp).total_seconds() / 86400.0)
+            new_weight = float(row["weight"]) * (0.5 ** (age_days / half_life_days))
+            if new_weight >= float(row["weight"]) - 1e-12:
+                continue
+            if new_weight < min_weight:
+                db.execute(
+                    """UPDATE edges SET deleted_at = ?, updated_at = ?,
+                                         version = version + 1
+                       WHERE id = ?""",
+                    (now.isoformat(), now.isoformat(), row["id"]),
+                )
+                deleted += 1
+            else:
+                db.execute(
+                    """UPDATE edges SET weight = ?, updated_at = ?,
+                                         version = version + 1
+                       WHERE id = ?""",
+                    (new_weight, now.isoformat(), row["id"]),
+                )
+                decayed += 1
+        db.commit()
+        return {"decayed": decayed, "deleted": deleted, "examined": len(rows)}
     finally:
         db.close()
 
@@ -2525,7 +3120,9 @@ def get_stats() -> dict:
             "tombstones": db.execute(
                 "SELECT COUNT(*) FROM memory_tombstones"
             ).fetchone()[0],
-            "edges": db.execute("SELECT COUNT(*) FROM edges").fetchone()[0],
+            "edges": db.execute(
+                "SELECT COUNT(*) FROM edges WHERE deleted_at IS NULL"
+            ).fetchone()[0],
             "root_stories": db.execute(
                 """SELECT COUNT(*) FROM stories
                    WHERE parent_id IS NULL AND deleted_at IS NULL"""
@@ -2540,6 +3137,13 @@ def get_stats() -> dict:
                 "mode": config.PROFILE_MODE,
             },
             "sync_state": config.SYNC_STATE,
+        }
+        stats["edge_types"] = {
+            row["edge_type"]: row["count"]
+            for row in db.execute(
+                """SELECT edge_type, COUNT(*) AS count FROM edges
+                   WHERE deleted_at IS NULL GROUP BY edge_type ORDER BY edge_type"""
+            ).fetchall()
         }
         return stats
     finally:

@@ -10,7 +10,8 @@ import uuid
 from collections.abc import Callable
 from typing import TypeVar
 
-from . import config, embeddings, feedback, performance, query_cache, store
+from . import config, embeddings, feedback, graph as graph_module, performance
+from . import query_cache, store
 from . import context as context_module
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ def search(
     *,
     context: dict | None = None,
     scope: str = "profile",
+    graph_enabled: bool | None = None,
     record_diagnostics: bool = True,
 ) -> dict:
     """
@@ -35,6 +37,10 @@ def search(
     返回: {query, keywords, top_matches: [{story, similarity, related: [...]}]}
     """
     top_k = max(1, top_k or config.TOP_K_SEARCH)
+    graph_enabled = (
+        config.GRAPH_DEFAULT_ENABLED if graph_enabled is None
+        else bool(graph_enabled)
+    )
     if scope not in ("profile", "strict"):
         raise ValueError("scope 必须是 profile 或 strict")
     current_context = (
@@ -91,8 +97,9 @@ def search(
     # the existing fast result cache for context-free profile searches only;
     # the query-vector cache remains safe and shared for every variant.
     result_cache_enabled = current_context is None and scope == "profile"
+    result_cache_query = f"{normalized_query}\x1fgraph={int(graph_enabled)}"
     cached = (
-        query_cache.get_result(identity, normalized_query, top_k)
+        query_cache.get_result(identity, result_cache_query, top_k)
         if result_cache_enabled else None
     )
     latency["cache"] = performance.elapsed_ms(cache_started)
@@ -147,6 +154,7 @@ def search(
             query_vector_cache_hit=query_vector_cache_hit,
             current_context=current_context,
             scope=scope,
+            graph_enabled=graph_enabled,
         )
 
     # ── Step 2: 向量检索 ──
@@ -167,6 +175,7 @@ def search(
             query_vector_cache_hit=query_vector_cache_hit,
             current_context=current_context,
             scope=scope,
+            graph_enabled=graph_enabled,
         )
     latency["vector"] = performance.elapsed_ms(vector_started)
 
@@ -187,20 +196,33 @@ def search(
             "query_vector_cache_hit": query_vector_cache_hit,
             "feedback_queued": True,
             "strict_filtered": strict_filtered,
+            "graph_enabled": graph_enabled,
+            "truncated": False,
+            "truncated_reasons": [],
+            "graph_trace": _empty_graph_trace(matches),
         }
         if result_cache_enabled:
             query_cache.set_result(
-                identity, normalized_query, top_k, _cacheable_result(result)
+                identity, result_cache_query, top_k, _cacheable_result(result)
             )
         return finish(result, mode="vector")
 
-    # ── Step 3: 关联激活 ──
+    # ── Step 3: 受预算 Memory Graph 扩散与去重排序 ──
     graph_started = performance.now()
-    top_matches = _attach_related(matches, retrieval_source="vector")
+    matches, graph_info, graph_strict_filtered = _graph_rerank(
+        matches,
+        top_k=top_k,
+        retrieval_source="vector",
+        graph_enabled=graph_enabled,
+        current_context=current_context,
+        scope=scope,
+    )
+    strict_filtered += graph_strict_filtered
+    top_matches = _attach_related(matches)
     latency["graph"] = performance.elapsed_ms(graph_started)
 
     feedback_queued = feedback.enqueue_recall_feedback(
-        [match["story_id"] for match in matches]
+        [match["story_id"] for match in top_matches]
     )
 
     result = {
@@ -211,10 +233,14 @@ def search(
         "query_vector_cache_hit": query_vector_cache_hit,
         "feedback_queued": feedback_queued,
         "strict_filtered": strict_filtered,
+        "graph_enabled": graph_enabled,
+        "truncated": graph_info["truncated"],
+        "truncated_reasons": graph_info["truncated_reasons"],
+        "graph_trace": graph_info["trace"],
     }
     if result_cache_enabled:
         query_cache.set_result(
-            identity, normalized_query, top_k, _cacheable_result(result)
+            identity, result_cache_query, top_k, _cacheable_result(result)
         )
 
     return finish(result, mode="vector")
@@ -231,17 +257,25 @@ def _lexical_fallback(
     query_vector_cache_hit: bool,
     current_context: dict | None,
     scope: str,
+    graph_enabled: bool,
 ) -> dict:
     fallback_started = performance.now()
     call_status, fallback_output = _call_with_deadline(
         lambda: _run_lexical_fallback(
-            normalized_query, top_k, current_context=current_context, scope=scope
+            normalized_query,
+            top_k,
+            current_context=current_context,
+            scope=scope,
+            graph_enabled=graph_enabled,
         ),
         config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
 
     if call_status == "ok":
-        matches, top_matches, fallback_ms, graph_ms, strict_filtered = fallback_output
+        (
+            matches, top_matches, fallback_ms, graph_ms, strict_filtered,
+            graph_info,
+        ) = fallback_output
         latency["fallback"] = fallback_ms
         latency["graph"] = graph_ms
         feedback_queued = feedback.enqueue_recall_feedback(
@@ -256,6 +290,11 @@ def _lexical_fallback(
         result_state = "degraded_unavailable"
         fallback_status = call_status
         strict_filtered = 0
+        graph_info = {
+            "truncated": False,
+            "truncated_reasons": [],
+            "trace": _empty_graph_trace([]),
+        }
 
     return finish(
         {
@@ -267,6 +306,10 @@ def _lexical_fallback(
             "fallback_status": fallback_status,
             "query_vector_cache_hit": query_vector_cache_hit,
             "feedback_queued": feedback_queued,
+            "graph_enabled": graph_enabled,
+            "truncated": graph_info["truncated"],
+            "truncated_reasons": graph_info["truncated_reasons"],
+            "graph_trace": graph_info["trace"],
         },
         mode="lexical_fallback",
         degraded=True,
@@ -280,7 +323,8 @@ def _run_lexical_fallback(
     *,
     current_context: dict | None,
     scope: str,
-) -> tuple[list[dict], list[dict], float, float, int]:
+    graph_enabled: bool,
+) -> tuple[list[dict], list[dict], float, float, int, dict]:
     """在同一个 500ms deadline 内完成词法检索与关联读取。"""
 
     fallback_started = time.perf_counter()
@@ -294,9 +338,20 @@ def _run_lexical_fallback(
         matches, current_context=current_context, scope=scope, top_k=top_k
     )
     graph_started = time.perf_counter()
-    top_matches = _attach_related(matches, retrieval_source="lexical")
+    matches, graph_info, graph_strict_filtered = _graph_rerank(
+        matches,
+        top_k=top_k,
+        retrieval_source="lexical",
+        graph_enabled=graph_enabled,
+        current_context=current_context,
+        scope=scope,
+    )
+    strict_filtered += graph_strict_filtered
+    top_matches = _attach_related(matches)
     graph_ms = round((time.perf_counter() - graph_started) * 1000, 3)
-    return matches, top_matches, fallback_ms, graph_ms, strict_filtered
+    return (
+        matches, top_matches, fallback_ms, graph_ms, strict_filtered, graph_info,
+    )
 
 
 def _environment_rerank(
@@ -368,14 +423,128 @@ def _environment_rank_score(
     return round(max(0.0, similarity - penalty), 8)
 
 
-def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]:
+def _graph_rerank(
+    matches: list[dict],
+    *,
+    top_k: int,
+    retrieval_source: str,
+    graph_enabled: bool,
+    current_context: dict | None,
+    scope: str,
+) -> tuple[list[dict], dict, int]:
+    """Merge direct seeds with deduplicated graph candidates."""
+
+    direct = []
+    for match in matches:
+        item = dict(match)
+        item.update({
+            "retrieval_source": retrieval_source,
+            "seed_story_id": item["story_id"],
+            "graph_path": [],
+            "score_components": {
+                "direct_similarity": item["similarity"],
+                "environment_score": item.get("environment_score", 0.0),
+                "graph_score": 0.0,
+                "final_score": item.get("score", item["similarity"]),
+            },
+        })
+        direct.append(item)
+    if not graph_enabled:
+        return direct[:top_k], {
+            "truncated": False,
+            "truncated_reasons": [],
+            "trace": _empty_graph_trace(direct, status="disabled"),
+        }, 0
+
+    try:
+        expansion = graph_module.expand(direct)
+    except Exception:  # noqa: BLE001 -- graph failure must preserve direct recall
+        logger.warning("Memory Graph 扩散失败，已回退直接检索")
+        trace = _empty_graph_trace(direct, status="degraded")
+        trace["degraded_reason"] = "graph_unavailable"
+        return direct[:top_k], {
+            "truncated": False,
+            "truncated_reasons": [],
+            "trace": trace,
+        }, 0
+
+    strict_filtered = 0
+    graph_matches = []
+    for candidate in expansion["matches"]:
+        fit = context_module.evaluate_story_context(
+            current_context,
+            candidate.get("environments"),
+            candidate.get("applicability"),
+        )
+        if scope == "strict" and fit["strict_excluded"]:
+            strict_filtered += 1
+            continue
+        candidate.update(fit)
+        base_score = candidate["graph_score"]
+        candidate["score"] = _environment_rank_score(
+            base_score,
+            fit["environment_score"],
+            has_context=current_context is not None,
+        )
+        candidate["score_components"].update({
+            "environment_score": fit["environment_score"],
+            "final_score": candidate["score"],
+        })
+        graph_matches.append(candidate)
+
+    suppressed = set(expansion["suppressed_story_ids"])
+    best: dict[int, dict] = {}
+    for item in [*direct, *graph_matches]:
+        story_id = int(item["story_id"])
+        if story_id in suppressed:
+            continue
+        existing = best.get(story_id)
+        if existing is None or item["score"] > existing["score"]:
+            best[story_id] = item
+    ranked = sorted(
+        best.values(),
+        key=lambda item: (
+            item["score"],
+            item.get("similarity", 0.0),
+            -int(item["story_id"]),
+        ),
+        reverse=True,
+    )[:top_k]
+    trace = dict(expansion["trace"])
+    trace["status"] = "ok"
+    trace["returned_story_ids"] = [item["story_id"] for item in ranked]
+    return ranked, {
+        "truncated": expansion["truncated"],
+        "truncated_reasons": expansion["truncated_reasons"],
+        "trace": trace,
+    }, strict_filtered
+
+
+def _empty_graph_trace(
+    matches: list[dict], *, status: str = "not_run"
+) -> dict:
+    return {
+        "status": status,
+        "seed_story_ids": [item["story_id"] for item in matches],
+        "expanded_candidates": 0,
+        "paths_considered": 0,
+        "tokens_used": 0,
+        "cycles_suppressed": 0,
+        "path_policy_suppressed": 0,
+        "superseded_suppressed": 0,
+        "elapsed_ms": 0.0,
+        "budgets": {},
+    }
+
+
+def _attach_related(matches: list[dict]) -> list[dict]:
     related_by_story = store.get_related_stories_batch(
         [match["story_id"] for match in matches], limit=5
     )
     top_matches = []
     for match in matches:
         related = related_by_story.get(match["story_id"], [])
-        top_matches.append({
+        rendered = {
             "story_id": match["story_id"],
             "title": match["title"],
             "abstract": match.get("abstract", match["content"]),
@@ -389,7 +558,10 @@ def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]
             "environments": match.get("environments", []),
             "applicability": match.get("applicability", {}),
             "warnings": match.get("warnings", []),
-            "retrieval_source": retrieval_source,
+            "retrieval_source": match.get("retrieval_source", "vector"),
+            "seed_story_id": match.get("seed_story_id", match["story_id"]),
+            "graph_path": match.get("graph_path", []),
+            "score_components": match.get("score_components", {}),
             "related": [
                 {
                     "story_id": item["id"],
@@ -401,10 +573,15 @@ def _attach_related(matches: list[dict], *, retrieval_source: str) -> list[dict]
                     ),
                     "weight": item.get("weight", 0),
                     "edge_type": item.get("edge_type", "semantic"),
+                    "directed": bool(item.get("directed")),
+                    "direction": item.get("edge_direction", "undirected"),
+                    "provenance": item.get("edge_provenance", {}),
+                    "version": item.get("edge_version", 1),
                 }
                 for item in related
             ],
-        })
+        }
+        top_matches.append(rendered)
     return top_matches
 
 
