@@ -232,6 +232,9 @@ storybook eval all                              # 跑全部五轮评测（默认
 storybook eval retrieval                        # 仅检索评测
 storybook eval all --report data/eval_reports/baseline.json   # 落盘 JSON 报告，便于阈值调整前后对比
 python scripts/eval.py retrieval                # 等价独立脚本（未做 editable 安装时用）
+python scripts/generate_eval_transforms.py --variant ambiguous --timeout 30 \
+  --output data/eval_reports/query-only-transforms.json
+storybook eval strategy --transform-cache data/eval_reports/query-only-transforms.json
 ```
 
 五轮评测：
@@ -243,7 +246,7 @@ python scripts/eval.py retrieval                # 等价独立脚本（未做 ed
    （duplicate 应并入、distinct 应新建），输出 `SIM_THRESHOLD_HIGH` 阈值敏感性曲线。隔离度量 0.85/0.92 阈值，排除 LLM 关键词质量波动。
 3. **split** — 真实 embedding + 确定性 LLM 桩，度量分裂路径结构正确性（父向量移除、父子边 1.0、子向量入索引、子 story 可检索）。
 4. **ablation** — 比较 legacy、默认 `title+abstract+applicability`、全文单向量、title/abstract/applicability 分字段多向量；按 exact/synonym/cross-tool/cross-language 报告 recall@3/MRR 与索引/查询时延。
-5. **strategy** — 累积比较 direct-vector、hybrid、+graph、+rewrite、+HyDE、+reranker；按 exact/synonym/cross-language/cross-tool/ambiguous 报告 recall@3/MRR/p95。只有 hard-query 质量提升、overall 非劣与 fast/deep 时延门槛同时通过的策略才标记 `eligible_for_default=true`。
+5. **strategy** — 比较 direct-vector、hybrid、+graph、raw-query `+reranker` 控制组、+rewrite、+HyDE、+reranker；按 exact/synonym/cross-language/cross-tool/ambiguous 报告 recall@3/MRR/p95。Transformation provider 只能收到原始 query、策略名和 timeout，`topic_id` 只在排序完成后计分；预生成文件按 query SHA-256 索引并拒绝 `topic_id`/目标 Story 字段。报告分别标记 `live_generated`、`query_only_pre_generated`、`oracle_upper_bound`，oracle 永不参与默认选型，预生成质量证据也必须有独立在线时延证据。只有 hard-query 质量提升、overall 非劣、ground-truth 隔离和 fast/deep 在线时延门槛全部通过的策略才标记 `eligible_for_default=true`。
 
 Story v2 固定报告（2026-08-02，`data/eval_reports/story-v2-ablation-2026-08-02.json`）：四种表示在 24 topic × 4 分组上 recall@3/MRR 均为 100%；默认表示相对 legacy 为 `0.00pp`，通过“下降不超过 2pp”门槛。默认单向量索引均值 84.4ms/story，明显低于全文 205.2ms 与多向量 223.7ms；多向量检索 p95 0.94ms，高于默认 0.34ms，因此选择默认表示。
 
@@ -254,9 +257,9 @@ python -m storybook.graph_eval --stories 10000 --repeats 200 \
   --output data/eval_reports/memory-graph.json
 ```
 
-自适应检索固定报告（2026-08-02，`data/eval_reports/adaptive-retrieval-2026-08-02.json`）使用 24 topic × 5 分组。ambiguous 组模拟“只记得 outcome/指标、不记得问题名与工具”的经历召回：direct-vector hard recall@3 为 `87.5%`、overall 为 `90%`；`hybrid + graph + rewrite/HyDE` 的 hard/overall recall@3 均为 `100%`（hard `+12.5pp`），MRR `0.8875 → 0.9958`，本机离线累计 p95 `343.4ms`，同时通过质量、overall 非劣与 Deep ≤5s 门禁。本地 reranker 在该基准未产生额外质量收益，因而未优先于 HyDE 栈。
+自适应检索固定报告（2026-08-02，`data/eval_reports/adaptive-retrieval-2026-08-02.json`）使用 24 topic × 5 分组，并引用 query-only 生成物 `data/eval_reports/flo152-query-only-transforms-2026-08-02.json`。ambiguous 组模拟“只记得 outcome/指标、不记得问题名与工具”的经历召回：direct-vector hard recall@3 为 `87.5%`、overall 为 `90%`；不使用任何 transformation 的 `hybrid_graph_reranker` hard/overall recall@3 为 `97.92%/98.33%`（hard `+10.42pp`），MRR `0.8875 → 0.9841`，p95 `99.7ms`，因此是唯一默认候选。reranker 只批量读取有界 top-N 的本地 detail 作为内部打分文本，响应前移除，不默认展开原始证据。24 条 ambiguous query 的 query-only 预生成 rewrite/HyDE 可把 hard/overall recall@3 提升到 `100%/100%`，但本机生成耗时约 10–20s，报告将 `online_latency_evidence=false`，所以这些策略即使离线检索 p95 ≤525ms 也不能默认启用。报告明确记录 artifact SHA、模型、prompt 版本、24 次 cache hit/96 次未触发、ground-truth generation fields 为空；oracle upper bound 未使用且始终无默认资格。
 
-10k Story 固定性能报告为 `data/perf_reports/flo152-warm.json`：并发 1/5 的 cache lane p95 `4.806/3.855ms`，vector/hybrid lane p95 `120.265/552.935ms`，recall@3/MRR 均为 `100%/1.0`。`data/perf_reports/flo152-deep-smoke.json` 是 6 查询×1、并发 1 的 Deep smoke：总 p95 `4.307s`、recall@3 `100%`；本机 9B LLM 在短生成 deadline 内会超时，并与 embedding 模型发生内存换入竞争，响应因此明确降级到 Fast/lexical 结果。该 smoke 证明总预算与 fallback，不把它冒充为生成式质量证据；rewrite/HyDE 的质量选择以离线消融及自动化故障注入为准。
+10k Story 固定性能报告为 `data/perf_reports/flo152-warm.json`：并发 1/5 的 cache lane p95 `3.323/4.197ms`，vector/hybrid lane p95 `123.418/480.637ms`，recall@3/MRR 均为 `100%/1.0`。`data/perf_reports/flo152-deep-smoke.json` 是 6 查询×1、并发 1 的 Deep smoke：总 p95 `4.547s`、recall@3 `100%`、degraded ratio `100%`、lexical fallback ratio `16.67%`；本机 9B LLM 在短生成 deadline 内会超时，并与 embedding 模型发生内存换入竞争，响应因此明确降级到 Fast/lexical 结果。该 smoke 证明总预算与 fallback，不把它冒充为生成式质量或成功时延证据；rewrite/HyDE 目前保留为 gated/显式能力，不能在这台机器上默认启用。
 
 当前基线（2026-07-19，`data/eval_reports/baseline-2026-07-19.json`）：recall@3 = 100% ✅ 达标；
 合并正确率 85.7%（`dup-docker-dns` sim 0.83 落在 0.85 阈值下方被误判为 create，阈值敏感性显示 0.82 可达 100%）；

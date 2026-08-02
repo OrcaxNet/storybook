@@ -40,6 +40,9 @@ class TestFastHybrid:
         assert fake_llm.calls == {}
         match = result["top_matches"][0]
         assert match["story_id"] == story_id
+        assert "_rerank_text" not in match
+        assert result["rerank_trace"]["detail_status"] == "ok"
+        assert result["rerank_trace"]["details_hydrated"] == 1
         assert match["retrieval_source"] == "hybrid"
         assert {path["source"] for path in match["source_paths"]} == {
             "vector", "lexical"
@@ -220,6 +223,31 @@ class TestDeepAndReranker:
         assert second["rerank_trace"]["status"] == "timeout"
         assert third["rerank_trace"]["status"] == "circuit_open"
         assert third["degraded_reason"] == "reranker_circuit_open"
+
+    def test_local_reranker_uses_bounded_candidate_detail(self):
+        rows = [
+            {
+                "story_id": 1,
+                "title": "generic title",
+                "abstract": "generic abstract",
+                "content": "unrelated outcome",
+                "score": 0.80,
+            },
+            {
+                "story_id": 2,
+                "title": "another generic title",
+                "abstract": "another generic abstract",
+                "content": "memory dropped from 2GB to 50MB",
+                "score": 0.79,
+            },
+        ]
+
+        reranked = adaptive._local_rerank(
+            "I remember only the outcome: memory dropped from 2GB to 50MB", rows
+        )
+
+        assert reranked[0]["story_id"] == 2
+        assert reranked[0]["score_components"]["rerank_overlap"] > 0
 
 
 class TestTransformationParser:

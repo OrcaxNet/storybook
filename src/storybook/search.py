@@ -393,11 +393,16 @@ def search(
 
     # ── Step 6: bounded local reranker with timeout/circuit fallback ──
     rerank_started = performance.now()
+    matches, rerank_detail_trace = _hydrate_rerank_details(
+        matches, enabled=rerank_enabled
+    )
     matches, rerank_trace = adaptive.rerank(
         normalized_query,
         matches,
         enabled=rerank_enabled,
     )
+    rerank_trace.update(rerank_detail_trace)
+    matches = _strip_rerank_details(matches)
     latency["rerank"] = performance.elapsed_ms(rerank_started)
     if rerank_trace.get("degraded_reason"):
         degraded_reasons.append(rerank_trace["degraded_reason"])
@@ -721,9 +726,14 @@ def _run_lexical_fallback(
         ),
     )
     strict_filtered += graph_strict_filtered
+    matches, rerank_detail_trace = _hydrate_rerank_details(
+        matches, enabled=rerank_enabled
+    )
     matches, rerank_trace = adaptive.rerank(
         normalized_query, matches, enabled=rerank_enabled
     )
+    rerank_trace.update(rerank_detail_trace)
+    matches = _strip_rerank_details(matches)
     matches = matches[:top_k]
     top_matches = _attach_related(matches)
     graph_ms = round((time.perf_counter() - graph_started) * 1000, 3)
@@ -738,6 +748,49 @@ def _run_lexical_fallback(
         matches, top_matches, fallback_ms, graph_ms, strict_filtered, graph_info,
         rerank_trace, degraded_reasons,
     )
+
+
+def _hydrate_rerank_details(
+    matches: list[dict], *, enabled: bool | None
+) -> tuple[list[dict], dict]:
+    """Attach full detail to only the bounded local reranker prefix."""
+
+    use_reranker = config.RERANK_ENABLED if enabled is None else bool(enabled)
+    top_n = min(len(matches), max(0, config.RERANK_TOP_N))
+    trace = {"detail_status": "not_run", "details_hydrated": 0}
+    if not use_reranker or top_n == 0:
+        return matches, trace
+    try:
+        details = store.get_story_rerank_texts([
+            item["story_id"] for item in matches[:top_n]
+        ])
+    except Exception as exc:
+        logger.warning("reranker detail hydration failed: %s", exc)
+        trace["detail_status"] = "unavailable"
+        return matches, trace
+    hydrated = []
+    for position, item in enumerate(matches):
+        candidate = dict(item)
+        if position < top_n and details.get(int(item["story_id"])):
+            candidate["_rerank_text"] = details[int(item["story_id"])]
+            trace["details_hydrated"] += 1
+        hydrated.append(candidate)
+    trace["detail_status"] = "ok"
+    return hydrated, trace
+
+
+def _strip_rerank_details(matches: list[dict]) -> list[dict]:
+    """Guarantee internal full-detail scoring text never reaches recall output."""
+
+    stripped = []
+    for item in matches:
+        if "_rerank_text" not in item:
+            stripped.append(item)
+            continue
+        candidate = dict(item)
+        candidate.pop("_rerank_text", None)
+        stripped.append(candidate)
+    return stripped
 
 
 def _environment_rerank(

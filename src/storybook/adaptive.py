@@ -441,22 +441,38 @@ def _record_rerank_failure() -> None:
 def _local_rerank(query: str, matches: list[dict]) -> list[dict]:
     """Deterministic local relevance pass with no model or network calls."""
 
-    query_terms = _terms(query)
-    ranked = []
-    for position, original in enumerate(matches):
-        item = dict(original)
+    query_terms = _terms(_rerank_query_focus(query))
+    prepared = []
+    document_frequency: dict[str, int] = {}
+    for original in matches:
         document = " ".join((
-            str(item.get("title") or ""),
-            str(item.get("abstract") or item.get("content") or ""),
-            " ".join(str(keyword) for keyword in item.get("keywords", [])),
+            str(original.get("title") or ""),
+            str(original.get("abstract") or ""),
+            str(original.get("_rerank_text") or original.get("content") or ""),
+            " ".join(str(keyword) for keyword in original.get("keywords", [])),
         ))
         document_terms = _terms(document)
+        prepared.append((original, document_terms))
+        for term in query_terms & document_terms:
+            document_frequency[term] = document_frequency.get(term, 0) + 1
+    population = max(1, len(matches))
+    term_weights = {
+        term: 1.0 + math.log((population + 1) / (document_frequency.get(term, 0) + 1))
+        for term in query_terms
+    }
+    total_query_weight = sum(term_weights.values())
+
+    ranked = []
+    for position, (original, document_terms) in enumerate(prepared):
+        item = dict(original)
+        item.pop("_rerank_text", None)
         overlap = (
-            len(query_terms & document_terms) / len(query_terms)
-            if query_terms else 0.0
+            sum(term_weights[term] for term in query_terms & document_terms)
+            / total_query_weight
+            if total_query_weight else 0.0
         )
         base_score = float(item.get("score", item.get("similarity", 0.0)))
-        rerank_score = 0.9 * base_score + 0.1 * overlap
+        rerank_score = 0.5 * base_score + 0.5 * overlap
         item["score"] = round(max(0.0, min(1.0, rerank_score)), 8)
         components = item.setdefault("score_components", {})
         components.update({
@@ -470,6 +486,21 @@ def _local_rerank(query: str, matches: list[dict]) -> list[dict]:
         key=lambda pair: (pair[0]["score"], -pair[1]), reverse=True
     )
     return [item for item, _ in ranked]
+
+
+def _rerank_query_focus(query: str) -> str:
+    """Drop explicit recall boilerplate while retaining the remembered clue."""
+
+    text = normalize_query(query)
+    prefix, separator, suffix = text.rpartition("：")
+    if not separator:
+        prefix, separator, suffix = text.rpartition(":")
+    recall_markers = ("只记得", "记不清", "结果或指标", "remember only")
+    if separator and suffix and any(
+        marker in prefix.casefold() for marker in recall_markers
+    ):
+        return suffix.strip()
+    return text
 
 
 def _terms(text: str) -> set[str]:

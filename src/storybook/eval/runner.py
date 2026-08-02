@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 import re
 import tempfile
@@ -37,10 +39,16 @@ RETRIEVAL_STRATEGIES = (
     "direct_vector",
     "hybrid",
     "hybrid_graph",
+    "hybrid_graph_reranker",
     "hybrid_graph_rewrite",
     "hybrid_graph_hyde",
     "hybrid_graph_hyde_reranker",
 )
+TRANSFORM_EVIDENCE_SOURCES = frozenset({
+    "live_generated",
+    "query_only_pre_generated",
+    "oracle_upper_bound",
+})
 
 
 # ═══════════════════════════════════════════════
@@ -538,20 +546,95 @@ def _strategy_query_pairs(bench: bm.Benchmark) -> list[dict]:
     return pairs
 
 
+def pre_generated_transform_provider(path: Path | str):
+    """Load a query-keyed transform artifact that cannot address ground truth."""
+
+    raw_bytes = Path(path).read_bytes()
+    artifact = json.loads(raw_bytes.decode("utf-8"))
+    if artifact.get("source") != "query_only_pre_generated":
+        raise ValueError("transform artifact source must be query_only_pre_generated")
+    expected_inputs = [
+        "raw_query", "requested_transformations", "timeout_seconds"
+    ]
+    if artifact.get("generation_inputs") != expected_inputs:
+        raise ValueError("transform artifact must declare the query-only input contract")
+    entries = artifact.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("transform artifact entries must be a list")
+
+    cache = {}
+    forbidden = {"topic_id", "target_story", "title", "problem_desc", "content"}
+    for entry in entries:
+        if not isinstance(entry, dict) or forbidden & set(entry):
+            raise ValueError("transform artifact entry contains ground-truth fields")
+        query = adaptive.normalize_query(entry.get("query"))
+        digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        if not query or entry.get("query_sha256") != digest:
+            raise ValueError("transform artifact query hash mismatch")
+        cache[digest] = entry.get("output")
+
+    stats = {"cache_hits": 0, "cache_misses": 0}
+
+    def provider(query, transformations, *, timeout_seconds):
+        del transformations, timeout_seconds
+        digest = hashlib.sha256(
+            adaptive.normalize_query(query).encode("utf-8")
+        ).hexdigest()
+        if digest not in cache:
+            stats["cache_misses"] += 1
+            return None
+        stats["cache_hits"] += 1
+        output = cache[digest]
+        return dict(output) if isinstance(output, dict) else None
+
+    provider.evidence_metadata = {
+        "generator": str(artifact.get("generator") or "unknown"),
+        "prompt_version": str(artifact.get("prompt_version") or "unknown"),
+        "artifact_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "entry_count": len(cache),
+        "stats": stats,
+    }
+    return provider
+
+
 def run_retrieval_strategy_ablation(
     db_path: Optional[Path] = None,
     benchmark_path: Path | str = None,
+    *,
+    transform_provider=None,
+    transform_source: str = "live_generated",
 ) -> dict:
     """Compare cumulative direct/hybrid/graph/rewrite/HyDE/rerank stacks.
 
-    Rewrite and HyDE inputs are deterministic curated labels derived from the
-    benchmark topic.  This makes the offline comparison reproducible and keeps
-    LLM availability out of the quality gate; live auto-gating and timeout
-    behavior are covered by search integration tests.
+    Ground truth is deliberately unavailable to the transformation provider:
+    ``topic_id`` is used only after ranking, to score the returned story ids.
+    The default provider is the production query transformer and receives only
+    the raw query, requested transformation names, and its timeout budget.
+
+    ``query_only_pre_generated`` is supported for reproducible offline output,
+    while ``oracle_upper_bound`` is explicitly excluded from default selection.
+    Callers supplying either source must also inject the corresponding provider.
     """
 
+    if transform_source not in TRANSFORM_EVIDENCE_SOURCES:
+        raise ValueError(
+            "transform_source must be live_generated, "
+            "query_only_pre_generated, or oracle_upper_bound"
+        )
+    if transform_provider is None:
+        if transform_source != "live_generated":
+            raise ValueError(
+                f"{transform_source} requires an explicit transform_provider"
+            )
+
+        def transform_provider(query, transformations, *, timeout_seconds):
+            return llm_mod.transform_search_query(
+                query,
+                transformations,
+                timeout_seconds=timeout_seconds,
+            )
+
     bench = bm.load_benchmark(benchmark_path)
-    topics = {topic.id: topic for topic in bench.topics}
     pairs = _strategy_query_pairs(bench)
     rows_by_strategy: dict[str, list[dict]] = {
         strategy: [] for strategy in RETRIEVAL_STRATEGIES
@@ -560,6 +643,10 @@ def run_retrieval_strategy_ablation(
         strategy: [] for strategy in RETRIEVAL_STRATEGIES
     }
     embed_failures = 0
+    transform_attempts = 0
+    transform_successes = 0
+    transform_failures = 0
+    generated_counts = {"rewrite": 0, "multi_query": 0, "hyde": 0}
 
     with _isolated_db(db_path):
         topic_to_sid: dict[str, int] = {}
@@ -604,7 +691,6 @@ def run_retrieval_strategy_ablation(
             target_sid = topic_to_sid.get(pair["topic_id"])
             if target_sid is None:
                 continue
-            topic = topics[pair["topic_id"]]
             started = time.perf_counter()
             vector_rows, lexical_rows = retrieve(pair["query"])
             direct_rows = vector_rows
@@ -625,47 +711,100 @@ def run_retrieval_strategy_ablation(
             )
             graph_ms = (time.perf_counter() - started) * 1000.0
 
-            rewrite_vector, rewrite_lexical = retrieve(topic.problem_desc)
-            rewrite_ranking = adaptive.fuse_rankings(
-                rewrite_vector, rewrite_lexical, limit=candidate_limit
+            graph_rerank_input, _ = search_mod._hydrate_rerank_details(
+                graph_rows, enabled=True
             )
+            graph_reranked_rows, _ = adaptive.rerank(
+                pair["query"], graph_rerank_input, enabled=True
+            )
+            graph_reranked_rows = search_mod._strip_rerank_details(
+                graph_reranked_rows
+            )
+            graph_rerank_ms = (time.perf_counter() - started) * 1000.0
+
+            transform_attempts += 1
+            try:
+                generated = transform_provider(
+                    pair["query"],
+                    list(adaptive.VALID_TRANSFORMS),
+                    timeout_seconds=config.QUERY_DEEP_TRANSFORM_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning("strategy transformation failed: %s", exc)
+                generated = None
+            generated = _normalize_strategy_transformations(
+                pair["query"], generated
+            )
+            if any((
+                generated["rewrite"],
+                generated["queries"],
+                generated["hypothetical_document"],
+            )):
+                transform_successes += 1
+            else:
+                transform_failures += 1
+
+            rewrite_rankings = []
+            rewrite_inputs = []
+            if generated["rewrite"]:
+                rewrite_inputs.append(("rewrite", generated["rewrite"]))
+                generated_counts["rewrite"] += 1
+            for transformed_query in generated["queries"]:
+                rewrite_inputs.append(("multi_query", transformed_query))
+                generated_counts["multi_query"] += 1
+            for query_index, (kind, transformed_query) in enumerate(rewrite_inputs):
+                transformed_vector, transformed_lexical = retrieve(transformed_query)
+                rewrite_rankings.append({
+                    "transform": kind,
+                    "query_index": query_index,
+                    "matches": adaptive.fuse_rankings(
+                        transformed_vector,
+                        transformed_lexical,
+                        limit=candidate_limit,
+                    ),
+                })
             rewrite_rows = adaptive.merge_transformed_rankings(
                 graph_rows,
-                [{
-                    "transform": "rewrite",
-                    "query_index": 0,
-                    "matches": rewrite_ranking,
-                }],
+                rewrite_rankings,
                 mode="deep",
                 limit=candidate_limit,
             )
             rewrite_ms = (time.perf_counter() - started) * 1000.0
 
-            hyde_text = " ".join((
-                topic.title, topic.problem_desc, topic.content
-            ))
-            hyde_vector, hyde_lexical = retrieve(hyde_text)
-            hyde_ranking = adaptive.fuse_rankings(
-                hyde_vector, hyde_lexical, limit=candidate_limit
-            )
+            hyde_rankings = []
+            if generated["hypothetical_document"]:
+                generated_counts["hyde"] += 1
+                hyde_vector, hyde_lexical = retrieve(
+                    generated["hypothetical_document"]
+                )
+                hyde_rankings.append({
+                    "transform": "hyde",
+                    "query_index": len(rewrite_inputs),
+                    "matches": adaptive.fuse_rankings(
+                        hyde_vector, hyde_lexical, limit=candidate_limit
+                    ),
+                })
             hyde_rows = adaptive.merge_transformed_rankings(
                 rewrite_rows,
-                [{
-                    "transform": "hyde",
-                    "query_index": 1,
-                    "matches": hyde_ranking,
-                }],
+                hyde_rankings,
                 mode="deep",
                 limit=candidate_limit,
             )
             hyde_ms = (time.perf_counter() - started) * 1000.0
 
-            reranked_rows = adaptive._local_rerank(pair["query"], hyde_rows)
+            rerank_input, _ = search_mod._hydrate_rerank_details(
+                hyde_rows, enabled=True
+            )
+            reranked_rows, _ = adaptive.rerank(
+                pair["query"], rerank_input, enabled=True
+            )
+            reranked_rows = search_mod._strip_rerank_details(reranked_rows)
             rerank_ms = (time.perf_counter() - started) * 1000.0
             outputs = {
                 "direct_vector": direct_rows,
                 "hybrid": hybrid_rows,
                 "hybrid_graph": graph_rows,
+                "hybrid_graph_reranker": graph_reranked_rows,
                 "hybrid_graph_rewrite": rewrite_rows,
                 "hybrid_graph_hyde": hyde_rows,
                 "hybrid_graph_hyde_reranker": reranked_rows,
@@ -674,6 +813,7 @@ def run_retrieval_strategy_ablation(
                 "direct_vector": direct_ms,
                 "hybrid": hybrid_ms,
                 "hybrid_graph": graph_ms,
+                "hybrid_graph_reranker": graph_rerank_ms,
                 "hybrid_graph_rewrite": rewrite_ms,
                 "hybrid_graph_hyde": hyde_ms,
                 "hybrid_graph_hyde_reranker": rerank_ms,
@@ -734,15 +874,31 @@ def run_retrieval_strategy_ablation(
             } else 1_000.0
         )
         latency_pass = row["latency_ms"]["p95"] <= latency_limit
+        uses_transform = strategy in {
+            "hybrid_graph_rewrite", "hybrid_graph_hyde",
+            "hybrid_graph_hyde_reranker",
+        }
+        ground_truth_isolation = not (
+            uses_transform and transform_source == "oracle_upper_bound"
+        )
+        online_latency_evidence = not uses_transform or (
+            transform_source == "live_generated"
+        )
+        row["evidence_source"] = (
+            transform_source if uses_transform else "raw_query_only"
+        )
         # The baseline is reference-only; every new default must demonstrate
         # the issue's hard-query quality gain as well as non-regression/latency.
         row["gates"] = {
             "hard_quality_gain": quality_gain,
             "overall_non_regression": overall_non_regression,
             "latency": latency_pass,
+            "ground_truth_isolation": ground_truth_isolation,
+            "online_latency_evidence": online_latency_evidence,
             "eligible_for_default": (
                 strategy != "direct_vector"
                 and quality_gain and overall_non_regression and latency_pass
+                and ground_truth_isolation and online_latency_evidence
             ),
         }
         if row["gates"]["eligible_for_default"]:
@@ -756,6 +912,8 @@ def run_retrieval_strategy_ablation(
         ),
         default="direct_vector",
     )
+    provider_metadata = getattr(transform_provider, "evidence_metadata", {})
+    provider_stats = provider_metadata.get("stats", {})
     return {
         "benchmark_version": bench.version,
         "embedding_model": config.EMBED_MODEL,
@@ -770,6 +928,36 @@ def run_retrieval_strategy_ablation(
         "selected_default": selected,
         "passes_default_gate": selected != "direct_vector",
         "embed_failures": embed_failures,
+        "transformation_provenance": {
+            "source": transform_source,
+            "generator": (
+                provider_metadata.get("generator")
+                or (
+                    config.LLM_MODEL
+                    if transform_source == "live_generated" else "injected_provider"
+                )
+            ),
+            "generation_inputs": [
+                "raw_query", "requested_transformations", "timeout_seconds"
+            ],
+            "ground_truth_fields_used_for_generation": [],
+            "ground_truth_usage": "topic_id is used only for post-ranking scoring",
+            "pre_generated_outputs": (
+                transform_source == "query_only_pre_generated"
+            ),
+            "oracle_upper_bound": transform_source == "oracle_upper_bound",
+            "oracle_eligible_for_default": False,
+            "online_latency_evidence": transform_source == "live_generated",
+            "prompt_version": provider_metadata.get("prompt_version"),
+            "artifact_sha256": provider_metadata.get("artifact_sha256"),
+            "artifact_entry_count": provider_metadata.get("entry_count"),
+            "artifact_cache_hits": provider_stats.get("cache_hits"),
+            "artifact_cache_misses": provider_stats.get("cache_misses"),
+            "attempts": transform_attempts,
+            "successes": transform_successes,
+            "failures": transform_failures,
+            "generated_counts": generated_counts,
+        },
         "gate": {
             "hard_query": (
                 "recall@3 +10pp; when baseline >=90%, MRR +5pp"
@@ -778,10 +966,46 @@ def run_retrieval_strategy_ablation(
             "latency": "fast p95 <=1s; deep p95 <=5s",
         },
         "notes": [
-            "rewrite/HyDE are deterministic curated benchmark transforms",
-            "generation latency is measured separately by live performance runs",
+            "transform generation receives the raw query only; labels and target "
+            "Story fields are unavailable until post-ranking scoring",
+            "live generation latency is included in rewrite/HyDE cumulative latency",
+            "pre-generated query-only evidence is labelled; oracle evidence can "
+            "never select a default",
             "graph quality has a dedicated typed-path benchmark in graph_eval",
         ],
+    }
+
+
+def _normalize_strategy_transformations(query: str, generated) -> dict:
+    """Bound provider output without consulting benchmark labels or target data."""
+
+    if not isinstance(generated, dict):
+        generated = {}
+
+    def bounded(value, limit=1200):
+        if not isinstance(value, str):
+            return ""
+        return adaptive.normalize_query(value)[:limit]
+
+    raw_query = adaptive.normalize_query(query)
+    rewrite = bounded(generated.get("rewrite"), 600)
+    if rewrite == raw_query:
+        rewrite = ""
+    queries = []
+    values = generated.get("queries", [])
+    if isinstance(values, list):
+        for value in values:
+            candidate = bounded(value, 600)
+            if candidate and candidate != raw_query and candidate not in queries:
+                queries.append(candidate)
+            if len(queries) >= max(1, config.QUERY_MULTI_QUERY_LIMIT):
+                break
+    return {
+        "rewrite": rewrite,
+        "queries": queries,
+        "hypothetical_document": bounded(
+            generated.get("hypothetical_document"), 1200
+        ),
     }
 
 
@@ -1082,6 +1306,9 @@ def run_all(
     db_path: Optional[Path] = None,
     parts: tuple = ("retrieval", "processing", "split", "ablation", "strategy"),
     benchmark_path: Path | str = None,
+    *,
+    transform_provider=None,
+    transform_source: str = "live_generated",
 ) -> EvalReport:
     """跑指定子评测集合，返回 EvalReport。"""
     report = EvalReport(meta={"parts": list(parts)})
@@ -1102,6 +1329,8 @@ def run_all(
         report.strategy = run_retrieval_strategy_ablation(
             db_path=db_path,
             benchmark_path=benchmark_path,
+            transform_provider=transform_provider,
+            transform_source=transform_source,
         )
     return report
 
@@ -1217,6 +1446,14 @@ def format_report(report: EvalReport) -> str:
         lines.append("─" * 64)
         lines.append("⑤ 自适应检索策略消融")
         lines.append("─" * 64)
+        provenance = strategy_report["transformation_provenance"]
+        lines.append(
+            f"  transformation evidence: {provenance['source']} | "
+            f"ground truth: scoring-only | "
+            f"online latency={'yes' if provenance['online_latency_evidence'] else 'no'} | "
+            f"oracle={'yes' if provenance['oracle_upper_bound'] else 'no'} | "
+            f"success={provenance['successes']}/{provenance['attempts']}"
+        )
         for name in RETRIEVAL_STRATEGIES:
             row = strategy_report["strategies"][name]
             gates = row["gates"]

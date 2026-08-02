@@ -1058,7 +1058,9 @@ def main():
               help="把完整 JSON 报告写入该路径")
 @click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
               help="自定义 benchmark 数据集 JSON（默认 data/retrieval_benchmark.json）")
-def eval(part, report, benchmark_path):
+@click.option("--transform-cache", type=click.Path(exists=True, dir_okay=False),
+              help="query-only 预生成 transformation JSON；仅用于可复现质量证据")
+def eval(part, report, benchmark_path, transform_cache):
     """📐 检索、加工、分裂与 Story v2 embedding 表示消融
 
     PART 取值：retrieval / processing / split / ablation / strategy / all（默认 all）。
@@ -1082,7 +1084,19 @@ def eval(part, report, benchmark_path):
 
     bp = benchmark_path
     try:
-        rep = eval_module.run_all(parts=parts, benchmark_path=bp)
+        transform_provider = None
+        transform_source = "live_generated"
+        if transform_cache:
+            transform_provider = eval_module.pre_generated_transform_provider(
+                transform_cache
+            )
+            transform_source = "query_only_pre_generated"
+        rep = eval_module.run_all(
+            parts=parts,
+            benchmark_path=bp,
+            transform_provider=transform_provider,
+            transform_source=transform_source,
+        )
     except Exception as ex:
         click.echo(f"❌ 评测失败: {ex}")
         raise

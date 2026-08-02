@@ -27,6 +27,10 @@ def main() -> int:
                         ])
     parser.add_argument("--report", "-r", help="把完整 JSON 报告写入该路径")
     parser.add_argument("--benchmark", help="自定义 benchmark JSON 路径")
+    parser.add_argument(
+        "--transform-cache",
+        help="query-only 预生成 transformation JSON；仅用于可复现质量证据",
+    )
     args = parser.parse_args()
 
     parts = (
@@ -34,7 +38,19 @@ def main() -> int:
     ) if args.part == "all" else (args.part,)
     print(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
 
-    rep = eval_module.run_all(parts=parts, benchmark_path=args.benchmark)
+    transform_provider = None
+    transform_source = "live_generated"
+    if args.transform_cache:
+        transform_provider = eval_module.pre_generated_transform_provider(
+            args.transform_cache
+        )
+        transform_source = "query_only_pre_generated"
+    rep = eval_module.run_all(
+        parts=parts,
+        benchmark_path=args.benchmark,
+        transform_provider=transform_provider,
+        transform_source=transform_source,
+    )
     rep.meta["embed_mode"] = "ollama"
     rep.meta["part"] = args.part
     print(eval_module.format_report(rep))
