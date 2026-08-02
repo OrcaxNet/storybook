@@ -401,11 +401,12 @@ def search(
         matches,
         enabled=rerank_enabled,
     )
-    rerank_trace.update(rerank_detail_trace)
+    rerank_trace, rerank_reasons = _merge_rerank_traces(
+        rerank_trace, rerank_detail_trace
+    )
     matches = _strip_rerank_details(matches)
     latency["rerank"] = performance.elapsed_ms(rerank_started)
-    if rerank_trace.get("degraded_reason"):
-        degraded_reasons.append(rerank_trace["degraded_reason"])
+    degraded_reasons.extend(rerank_reasons)
     matches = matches[:top_k]
     top_matches = _attach_related(matches)
 
@@ -732,7 +733,9 @@ def _run_lexical_fallback(
     matches, rerank_trace = adaptive.rerank(
         normalized_query, matches, enabled=rerank_enabled
     )
-    rerank_trace.update(rerank_detail_trace)
+    rerank_trace, rerank_reasons = _merge_rerank_traces(
+        rerank_trace, rerank_detail_trace
+    )
     matches = _strip_rerank_details(matches)
     matches = matches[:top_k]
     top_matches = _attach_related(matches)
@@ -742,8 +745,7 @@ def _run_lexical_fallback(
         degraded_reasons.append(
             graph_info["trace"].get("degraded_reason", "graph_unavailable")
         )
-    if rerank_trace.get("degraded_reason"):
-        degraded_reasons.append(rerank_trace["degraded_reason"])
+    degraded_reasons.extend(rerank_reasons)
     return (
         matches, top_matches, fallback_ms, graph_ms, strict_filtered, graph_info,
         rerank_trace, degraded_reasons,
@@ -757,16 +759,30 @@ def _hydrate_rerank_details(
 
     use_reranker = config.RERANK_ENABLED if enabled is None else bool(enabled)
     top_n = min(len(matches), max(0, config.RERANK_TOP_N))
-    trace = {"detail_status": "not_run", "details_hydrated": 0}
+    trace = {
+        "detail_status": "not_run",
+        "detail_degraded_reason": None,
+        "details_hydrated": 0,
+    }
     if not use_reranker or top_n == 0:
         return matches, trace
-    try:
-        details = store.get_story_rerank_texts([
+    status, details = adaptive.call_with_deadline(
+        lambda: store.get_story_rerank_texts([
             item["story_id"] for item in matches[:top_n]
-        ])
-    except Exception as exc:
-        logger.warning("reranker detail hydration failed: %s", exc)
-        trace["detail_status"] = "unavailable"
+        ]),
+        config.RERANK_TIMEOUT_SECONDS,
+    )
+    if status != "ok" or not isinstance(details, dict):
+        detail_status = "timeout" if status == "timeout" else "unavailable"
+        trace.update({
+            "detail_status": detail_status,
+            "detail_degraded_reason": (
+                "reranker_detail_timeout"
+                if detail_status == "timeout"
+                else "reranker_detail_unavailable"
+            ),
+        })
+        logger.warning("reranker detail hydration %s", detail_status)
         return matches, trace
     hydrated = []
     for position, item in enumerate(matches):
@@ -777,6 +793,25 @@ def _hydrate_rerank_details(
         hydrated.append(candidate)
     trace["detail_status"] = "ok"
     return hydrated, trace
+
+
+def _merge_rerank_traces(
+    rerank_trace: dict, detail_trace: dict
+) -> tuple[dict, list[str]]:
+    """Expose core and detail failures through one stable degradation contract."""
+
+    merged = dict(rerank_trace)
+    core_reason = merged.get("degraded_reason")
+    merged.update(detail_trace)
+    reasons = list(dict.fromkeys(
+        reason for reason in (
+            core_reason,
+            detail_trace.get("detail_degraded_reason"),
+        ) if reason
+    ))
+    merged["degraded_reason"] = reasons[0] if reasons else None
+    merged["degraded_reasons"] = reasons
+    return merged, reasons
 
 
 def _strip_rerank_details(matches: list[dict]) -> list[dict]:

@@ -55,6 +55,12 @@ class TestFastHybrid:
             "lexical", "fusion", "rerank", "total"
         } <= set(result["latency_ms"])
 
+        cached = search_module.search(
+            "SQLite lock", retrieval_mode="fast", graph_enabled=False
+        )
+        assert cached["mode"] == "cache"
+        assert "_rerank_text" not in cached["top_matches"][0]
+
     def test_result_cache_isolated_by_retrieval_mode(
         self, fake_embedder, fake_llm
     ):
@@ -222,7 +228,93 @@ class TestDeepAndReranker:
         assert first["rerank_trace"]["status"] == "timeout"
         assert second["rerank_trace"]["status"] == "timeout"
         assert third["rerank_trace"]["status"] == "circuit_open"
+        assert first["rerank_trace"]["degraded_reasons"] == [
+            "reranker_timeout"
+        ]
+        assert third["rerank_trace"]["detail_degraded_reason"] is None
         assert third["degraded_reason"] == "reranker_circuit_open"
+
+    def test_reranker_detail_failure_is_an_explicit_degradation(
+        self, fake_embedder, monkeypatch
+    ):
+        story_id = _seed("detail target", basis(0))
+        fake_embedder.register("detail query", basis(0))
+
+        def fail_details(*args, **kwargs):
+            raise RuntimeError("detail store unavailable")
+
+        monkeypatch.setattr(store, "get_story_rerank_texts", fail_details)
+
+        result = search_module.search("detail query", graph_enabled=False)
+
+        assert result["top_matches"][0]["story_id"] == story_id
+        assert "_rerank_text" not in result["top_matches"][0]
+        assert result["rerank_trace"]["status"] == "ok"
+        assert result["rerank_trace"]["detail_status"] == "unavailable"
+        assert result["rerank_trace"]["detail_degraded_reason"] == (
+            "reranker_detail_unavailable"
+        )
+        assert result["rerank_trace"]["degraded_reason"] == (
+            "reranker_detail_unavailable"
+        )
+        assert result["degraded"] is True
+        assert result["degraded_reason"] == "reranker_detail_unavailable"
+        assert result["result_state"] == "degraded_results"
+        assert "reranker_detail_unavailable" in result["degraded_reasons"]
+
+    def test_reranker_detail_timeout_is_an_explicit_degradation(
+        self, fake_embedder, monkeypatch
+    ):
+        story_id = _seed("slow detail target", basis(0))
+        fake_embedder.register("slow detail query", basis(0))
+        monkeypatch.setattr(config, "RERANK_TIMEOUT_SECONDS", 0.005)
+
+        def slow_details(*args, **kwargs):
+            time.sleep(0.05)
+            return {}
+
+        monkeypatch.setattr(store, "get_story_rerank_texts", slow_details)
+
+        result = search_module.search("slow detail query", graph_enabled=False)
+
+        assert result["top_matches"][0]["story_id"] == story_id
+        assert "_rerank_text" not in result["top_matches"][0]
+        assert result["rerank_trace"]["detail_status"] == "timeout"
+        assert result["rerank_trace"]["detail_degraded_reason"] == (
+            "reranker_detail_timeout"
+        )
+        assert result["rerank_trace"]["degraded_reason"] == (
+            "reranker_detail_timeout"
+        )
+        assert result["degraded"] is True
+        assert result["degraded_reason"] == "reranker_detail_timeout"
+        assert result["result_state"] == "degraded_results"
+        assert "reranker_detail_timeout" in result["degraded_reasons"]
+
+    def test_lexical_fallback_reports_reranker_detail_failure(
+        self, fake_embedder, monkeypatch
+    ):
+        story_id = _seed(
+            "lexical detail query", basis(0), keywords=["lexical", "detail"]
+        )
+        fake_embedder.register("lexical detail query", None)
+
+        def fail_details(*args, **kwargs):
+            raise RuntimeError("detail store unavailable")
+
+        monkeypatch.setattr(store, "get_story_rerank_texts", fail_details)
+
+        result = search_module.search(
+            "lexical detail query", graph_enabled=False
+        )
+
+        assert result["mode"] == "lexical_fallback"
+        assert result["top_matches"][0]["story_id"] == story_id
+        assert "_rerank_text" not in result["top_matches"][0]
+        assert result["rerank_trace"]["detail_status"] == "unavailable"
+        assert "reranker_detail_unavailable" in result["degraded_reasons"]
+        assert result["degraded"] is True
+        assert result["result_state"] == "degraded_results"
 
     def test_local_reranker_uses_bounded_candidate_detail(self):
         rows = [
