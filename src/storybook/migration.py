@@ -2,10 +2,11 @@
 
 Inspection, dry-run, backup and conversion never mutate the source.  At a
 successful cut-over, a SQLite ``BEGIN IMMEDIATE`` transaction stages durable
-deny-write triggers on each retiring generation, changes the Profile pointer,
-then commits those triggers before queued writers resume.  Failed cut-overs
-roll that DDL back.  OS-read-only sources use a stable read transaction because
-new writers cannot open them.  Conversion always happens in an isolated
+deny-write triggers on each retiring generation.  It commits every retiring
+fence and target unfence before changing the Profile pointer; ambiguous prepare
+commits are compensated back to their prior states while the registry still
+names the old authority.  OS-read-only sources use a stable read transaction
+because new writers cannot open them.  Conversion always happens in an isolated
 generation.
 """
 from __future__ import annotations
@@ -141,9 +142,10 @@ def _cutover_guard(
 
     ``BEGIN IMMEDIATE`` changes no user data but takes SQLite's single-writer
     slot.  Callers may stage persistent fencing triggers in this transaction,
-    switch the registry, then commit before releasing queued writers.  A
-    genuinely read-only file falls back to a read transaction; its OS
-    permissions already prevent a new writer from opening it.
+    commit that database preparation, and change the registry only after every
+    generation is ready.  A genuinely read-only file falls back to a read
+    transaction; its OS permissions already prevent a new writer from opening
+    it.
     """
 
     resolved = path.expanduser().resolve(strict=True)
@@ -196,18 +198,8 @@ def _fence_trigger_name(table: str, operation: str) -> str:
     return f"{GENERATION_FENCE_PREFIX}{table_key}_{operation.casefold()}"
 
 
-def _stage_generation_fence(db: sqlite3.Connection) -> bool:
-    """Stage durable deny-write triggers in the guard's open transaction.
-
-    The DDL stays invisible while ``BEGIN IMMEDIATE`` holds queued writers.
-    Callers switch the Profile registry first and then commit the guard, so a
-    writer that opened the retiring generation before cut-over resumes only
-    after the triggers are visible and receives a stable fencing error.
-    """
-
-    if not _guard_is_writable(db):
-        return False
-    tables = [
+def _fenceable_tables(db: sqlite3.Connection) -> list[str]:
+    return [
         str(row[0])
         for row in db.execute(
             """SELECT name FROM sqlite_master
@@ -217,7 +209,45 @@ def _stage_generation_fence(db: sqlite3.Connection) -> bool:
                ORDER BY name"""
         )
     ]
-    for table in tables:
+
+
+def _generation_is_fenced(db: sqlite3.Connection) -> bool:
+    existing = {
+        str(row[0])
+        for row in db.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type = 'trigger' AND name LIKE ?""",
+            (f"{GENERATION_FENCE_PREFIX}%",),
+        )
+    }
+    if not existing:
+        return False
+    expected = {
+        _fence_trigger_name(table, operation)
+        for table in _fenceable_tables(db)
+        for operation in ("INSERT", "UPDATE", "DELETE")
+    }
+    if existing != expected:
+        raise MigrationError(
+            "SB_MIGRATION_FENCE_INCOMPLETE",
+            "数据库世代的持久 fencing 触发器不完整",
+            hint="停止写入并从只读备份恢复该世代后重试",
+        )
+    return True
+
+
+def _stage_generation_fence(db: sqlite3.Connection) -> bool:
+    """Stage durable deny-write triggers in the guard's open transaction.
+
+    The DDL stays invisible while ``BEGIN IMMEDIATE`` holds queued writers.
+    Callers commit the guard before the Profile registry CAS, so a writer that
+    opened the retiring generation before cut-over resumes only after the
+    triggers are visible and receives a stable fencing error.
+    """
+
+    if not _guard_is_writable(db):
+        return False
+    for table in _fenceable_tables(db):
         quoted_table = _quoted_identifier(table)
         for operation in ("INSERT", "UPDATE", "DELETE"):
             trigger = _quoted_identifier(_fence_trigger_name(table, operation))
@@ -253,6 +283,31 @@ def _stage_generation_unfence(db: sqlite3.Connection) -> bool:
 def _commit_guard(db: sqlite3.Connection) -> None:
     if db.in_transaction:
         db.commit()
+
+
+def _restore_generation_fence(
+    db: sqlite3.Connection,
+    *,
+    was_fenced: bool,
+) -> None:
+    """Compensate an ambiguous prepare commit back to its prior state."""
+
+    if db.in_transaction:
+        db.rollback()
+    if not _guard_is_writable(db) or _generation_is_fenced(db) == was_fenced:
+        return
+    db.execute("PRAGMA busy_timeout=5000")
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if was_fenced:
+            _stage_generation_fence(db)
+        else:
+            _stage_generation_unfence(db)
+        db.commit()
+    except BaseException:
+        if db.in_transaction:
+            db.rollback()
+        raise
 
 
 def _hash_database(path: Path) -> str:
@@ -720,18 +775,19 @@ class MigrationManager:
         target_path: Path | None = None,
         prepare_target: Callable[[], None] | None = None,
     ) -> None:
-        """Fence every retiring generation and atomically move the pointer.
+        """Prepare database generations, then atomically move the pointer.
 
         Each retiring database keeps a ``BEGIN IMMEDIATE`` transaction open
-        while deny-write triggers are staged.  The registry CAS happens before
-        those transactions commit, so connections already open or waiting on
-        an old generation can resume only after its fence is durable.  A
-        reactivated target is held under its own write guard and unfenced in
-        the same linearization window.
+        while deny-write triggers are staged.  Every retiring fence and target
+        unfence is committed before the registry CAS, leaving no fallible
+        SQLite commit after the pointer becomes durable.  If any prepare commit
+        has an ambiguous outcome, its prior fence state is restored while the
+        registry still names the old authority.  A reactivated target is held
+        under its own write guard in the same preparation window.
         """
 
         with ExitStack() as stack:
-            retiring_guards: list[sqlite3.Connection] = []
+            retiring_guards: list[tuple[sqlite3.Connection, bool]] = []
             seen: set[Path] = set()
             for path, busy_code, label, validate in retiring:
                 resolved = path.expanduser().resolve(strict=True)
@@ -746,10 +802,12 @@ class MigrationManager:
                     )
                 )
                 validate(db)
+                was_fenced = _generation_is_fenced(db)
                 _stage_generation_fence(db)
-                retiring_guards.append(db)
+                retiring_guards.append((db, was_fenced))
 
             target_guard: sqlite3.Connection | None = None
+            target_was_fenced = False
             if target_path is not None:
                 resolved_target = target_path.expanduser().resolve(strict=True)
                 if resolved_target in seen:
@@ -764,19 +822,63 @@ class MigrationManager:
                         label="待激活目标世代",
                     )
                 )
+                target_was_fenced = _generation_is_fenced(target_guard)
                 _stage_generation_unfence(target_guard)
 
-            if prepare_target is not None:
-                prepare_target()
-            self.registry.set_profile_database(
-                profile.id,
-                target_ref,
-                expected_database_ref=profile.database_ref,
-            )
-            for db in retiring_guards:
-                _commit_guard(db)
+            prepared = [*retiring_guards]
             if target_guard is not None:
-                _commit_guard(target_guard)
+                prepared.append((target_guard, target_was_fenced))
+            try:
+                if prepare_target is not None:
+                    prepare_target()
+                for db, _was_fenced in retiring_guards:
+                    _commit_guard(db)
+                if target_guard is not None:
+                    _commit_guard(target_guard)
+                self.registry.set_profile_database(
+                    profile.id,
+                    target_ref,
+                    expected_database_ref=profile.database_ref,
+                )
+            except Exception as exc:
+                current = self.registry.peek_active_profile()
+                if (
+                    current is not None
+                    and current.id == profile.id
+                    and current.database_ref == target_ref
+                ):
+                    # An atomic registry write may report an error after its
+                    # replace became durable.  All database prepares preceded
+                    # it, so this is already a consistent completed switch.
+                    if self.registry is config.PROFILE_REGISTRY:
+                        config.refresh_profile(profile.id)
+                    return
+
+                recovery_errors: list[str] = []
+                for db, was_fenced in reversed(prepared):
+                    try:
+                        _restore_generation_fence(
+                            db,
+                            was_fenced=was_fenced,
+                        )
+                    except Exception as recovery_exc:
+                        recovery_errors.append(str(recovery_exc))
+                if self.registry is config.PROFILE_REGISTRY:
+                    try:
+                        config.refresh_profile(profile.id)
+                    except Exception as recovery_exc:
+                        recovery_errors.append(str(recovery_exc))
+                if recovery_errors:
+                    raise MigrationError(
+                        "SB_MIGRATION_SWITCH_RECOVERY_FAILED",
+                        "数据库世代切换准备失败，且未能完整恢复切换前 fencing 状态",
+                        hint="停止所有写入并运行 migration status 后从备份恢复",
+                    ) from exc
+                raise MigrationError(
+                    "SB_MIGRATION_SWITCH_PREPARE_FAILED",
+                    "数据库世代切换准备未能持久化，已恢复原权威状态",
+                    hint="registry 未切换；排除存储故障后重试",
+                ) from exc
             if self.registry is config.PROFILE_REGISTRY:
                 config.refresh_profile(profile.id)
 

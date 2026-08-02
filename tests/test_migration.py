@@ -119,6 +119,28 @@ def _legacy_db(path: Path) -> Path:
     return path
 
 
+def _inject_commit_failure(
+    monkeypatch,
+    *,
+    failure_index: int,
+    failure_mode: str,
+) -> None:
+    real_commit = migration._commit_guard
+    calls = 0
+
+    def fail_selected_commit(db: sqlite3.Connection) -> None:
+        nonlocal calls
+        calls += 1
+        should_fail = calls == failure_index
+        if should_fail and failure_mode == "before":
+            raise OSError("injected commit failure before persistence")
+        real_commit(db)
+        if should_fail and failure_mode == "after":
+            raise OSError("injected commit failure after persistence")
+
+    monkeypatch.setattr(migration, "_commit_guard", fail_selected_commit)
+
+
 def test_dry_run_is_zero_write_and_reports_stable_plan(
     tmp_path, migration_profile
 ):
@@ -376,15 +398,87 @@ def test_fence_staging_rolls_back_when_registry_switch_fails(
 
     monkeypatch.setattr(migration_profile, "set_profile_database", fail_switch)
 
-    with pytest.raises(RuntimeError, match="injected registry failure"):
+    with pytest.raises(migration.MigrationError) as exc_info:
         migration.MigrationManager().run(source)
 
+    assert exc_info.value.code == "SB_MIGRATION_SWITCH_PREPARE_FAILED"
     assert migration_profile.active_profile().database_ref == original_ref
     writer = sqlite3.connect(source)
     try:
         writer.execute(
             """INSERT INTO sessions (source, raw_content, problem_desc)
                VALUES ('retryable-writer', 'raw-3', 'problem-3')"""
+        )
+        writer.commit()
+        assert writer.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
+    finally:
+        writer.close()
+
+
+def test_registry_error_after_durable_pointer_is_recovered_as_success(
+    tmp_path, migration_profile, monkeypatch
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    real_switch = migration_profile.set_profile_database
+
+    def switch_then_report_failure(*args, **kwargs):
+        real_switch(*args, **kwargs)
+        raise OSError("injected error after atomic registry replace")
+
+    monkeypatch.setattr(
+        migration_profile, "set_profile_database", switch_then_report_failure
+    )
+
+    applied = migration.MigrationManager().run(source)
+
+    assert applied["status"] == "applied"
+    assert migration_profile.active_profile().database_ref == applied["generation_ref"]
+    assert config.DB_PATH == migration_profile.paths_for(
+        migration_profile.active_profile()
+    ).database
+    assert migration.MigrationManager().status()["migrations"][0][
+        "status"
+    ] == "activated"
+    retired = sqlite3.connect(source)
+    try:
+        with pytest.raises(
+            sqlite3.DatabaseError, match="SB_MIGRATION_GENERATION_FENCED"
+        ):
+            retired.execute(
+                """INSERT INTO sessions (source, raw_content)
+                   VALUES ('ambiguous-registry', 'must fail')"""
+            )
+    finally:
+        retired.rollback()
+        retired.close()
+
+
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_cutover_commit_failure_restores_old_authority(
+    tmp_path, migration_profile, monkeypatch, failure_mode
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    original = migration_profile.active_profile()
+    original_path = migration_profile.paths_for(original).database
+    _inject_commit_failure(
+        monkeypatch,
+        failure_index=1,
+        failure_mode=failure_mode,
+    )
+
+    with pytest.raises(migration.MigrationError) as exc_info:
+        manager.run(source)
+
+    assert exc_info.value.code == "SB_MIGRATION_SWITCH_PREPARE_FAILED"
+    assert migration_profile.active_profile().database_ref == original.database_ref
+    assert config.DB_PATH == original_path
+    assert manager.status()["migrations"][0]["status"] == "validated"
+    writer = sqlite3.connect(source)
+    try:
+        writer.execute(
+            """INSERT INTO sessions (source, raw_content, problem_desc)
+               VALUES ('cutover-recovery', 'raw-3', 'problem-3')"""
         )
         writer.commit()
         assert writer.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
@@ -526,6 +620,48 @@ def test_waiting_v2_writer_is_fenced_after_successful_rollback(
         old_db.close()
 
 
+@pytest.mark.parametrize("failure_index", [1, 2])
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_rollback_commit_failure_restores_active_v2(
+    tmp_path,
+    migration_profile,
+    monkeypatch,
+    failure_index,
+    failure_mode,
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    active_v2 = config.DB_PATH
+    _inject_commit_failure(
+        monkeypatch,
+        failure_index=failure_index,
+        failure_mode=failure_mode,
+    )
+
+    with pytest.raises(migration.MigrationError) as exc_info:
+        manager.rollback(applied["migration_id"])
+
+    assert exc_info.value.code == "SB_MIGRATION_SWITCH_PREPARE_FAILED"
+    assert (
+        migration_profile.active_profile().database_ref
+        == applied["generation_ref"]
+    )
+    assert config.DB_PATH == active_v2
+    assert manager.status()["migrations"][0]["status"] == "activated"
+    writer = sqlite3.connect(active_v2)
+    try:
+        writer.execute(
+            "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+        )
+        writer.commit()
+        assert writer.execute(
+            "SELECT access_count FROM stories WHERE id = 1"
+        ).fetchone()[0] == 1
+    finally:
+        writer.close()
+
+
 def test_reapply_rejects_changes_written_after_rollback(
     tmp_path, migration_profile
 ):
@@ -572,6 +708,61 @@ def test_reapply_allows_unchanged_rollback_authority(
     assert store.count_sessions() == 2
     store.add_session("reapplied-writer", "new active v2 data")
     assert store.count_sessions() == 3
+
+
+@pytest.mark.parametrize("failure_index", [1, 2, 3])
+@pytest.mark.parametrize("failure_mode", ["before", "after"])
+def test_reapply_commit_failure_restores_rollback_authority(
+    tmp_path,
+    migration_profile,
+    monkeypatch,
+    failure_index,
+    failure_mode,
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    manager.rollback(applied["migration_id"])
+    rollback_ref = migration_profile.active_profile().database_ref
+    rollback_db = config.DB_PATH
+    target_v2 = (
+        migration_profile.paths_for(migration_profile.active_profile()).root
+        / applied["generation_ref"]
+    )
+    _inject_commit_failure(
+        monkeypatch,
+        failure_index=failure_index,
+        failure_mode=failure_mode,
+    )
+
+    with pytest.raises(migration.MigrationError) as exc_info:
+        manager.run(source)
+
+    assert exc_info.value.code == "SB_MIGRATION_SWITCH_PREPARE_FAILED"
+    assert migration_profile.active_profile().database_ref == rollback_ref
+    assert config.DB_PATH == rollback_db
+    assert manager.status()["migrations"][0]["status"] == "rolled_back"
+    writer = sqlite3.connect(rollback_db)
+    try:
+        writer.execute(
+            """INSERT INTO sessions (source, raw_content, problem_desc)
+               VALUES ('reapply-recovery', 'raw-3', 'problem-3')"""
+        )
+        writer.commit()
+        assert writer.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
+    finally:
+        writer.close()
+    retired_target = sqlite3.connect(target_v2)
+    try:
+        with pytest.raises(
+            sqlite3.DatabaseError, match="SB_MIGRATION_GENERATION_FENCED"
+        ):
+            retired_target.execute(
+                "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+            )
+    finally:
+        retired_target.rollback()
+        retired_target.close()
 
 
 def test_cli_dry_run_and_status_json(tmp_path, migration_profile):

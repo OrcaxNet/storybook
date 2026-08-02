@@ -160,11 +160,13 @@ Session、Story、edge 及关系必须逐项等量；已有 embedding 会进入 
 同步生成，`abstract_status=pending` 留给后续异步补全。所有检查通过后，才以一次原子
 registry CAS 切换 `database_ref`。切换前会在 SQLite 单写者边界内再次核对源库逻辑
 hash；backup 后的提交会使迁移明确失败，活动写事务也会阻止切换。对于可写的待退役
-世代，同一事务会预置持久拒写触发器，registry CAS 成功后先提交 fencing，再释放等待中
-的 writer；这些旧连接会收到 `SB_MIGRATION_GENERATION_FENCED`，不能在成功切换后向
-旧世代落入独有数据。只读源库使用稳定读事务做同一 CAS。rollback 对活动 v2 使用相同
-协议，副本另存基线 hash；若回滚后产生新写入，重复迁移会拒绝复用陈旧 v2 世代。因此
-失败不会改变旧库权威，也不会静默覆盖回滚后的权威数据。
+世代，同一事务会预置持久拒写触发器；所有退役 fence 与目标 unfence 先持久化，最后才
+执行 registry CAS，因此指针落盘后不再有可失败的 SQLite commit。任一 prepare commit
+失败或结果不确定时，会在旧指针仍有效时补偿恢复切换前状态。这些旧连接会收到
+`SB_MIGRATION_GENERATION_FENCED`，不能在成功切换后向旧世代落入独有数据。只读源库
+使用稳定读事务做同一 CAS。rollback 对活动 v2 使用相同协议，副本另存基线 hash；若
+回滚后产生新写入，重复迁移会拒绝复用陈旧 v2 世代。因此失败不会改变旧库权威，也不会
+静默覆盖回滚后的权威数据。
 
 ```bash
 storybook migration discover --json
