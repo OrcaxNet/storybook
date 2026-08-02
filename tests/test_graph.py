@@ -6,7 +6,13 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from storybook import config, feedback, search as search_module, store
+from storybook import (
+    config,
+    feedback,
+    graph as graph_module,
+    search as search_module,
+    store,
+)
 from ._helpers import basis
 
 
@@ -83,6 +89,51 @@ class TestTypedEdges:
 
 
 class TestGraphRecall:
+    def test_higher_score_path_replacement_respects_total_token_budget(self):
+        seed = _seed("s", basis(0))
+        intermediate = _seed("i", basis(1))
+        target = _seed("t", basis(2))
+        store.add_or_update_edge(seed, intermediate, 1.0, "causal")
+        store.add_or_update_edge(seed, target, 0.6, "causal")
+        store.add_or_update_edge(intermediate, target, 1.0, "causal")
+
+        result = graph_module.expand(
+            [{"story_id": seed, "score": 1.0}],
+            max_hops=2,
+            token_budget=200,
+        )
+
+        matches = {item["story_id"]: item for item in result["matches"]}
+        estimated_tokens = sum(
+            graph_module._estimate_candidate_tokens(item)
+            for item in result["matches"]
+        )
+        assert len(matches[target]["graph_path"]) == 1
+        assert estimated_tokens <= 200
+        assert result["trace"]["tokens_used"] == estimated_tokens
+        assert result["truncated"] is True
+        assert "token_budget" in result["truncated_reasons"]
+
+    def test_token_trace_excludes_superseded_graph_candidates(self):
+        seed = _seed("s", basis(0))
+        old = _seed("o", basis(1))
+        replacement = _seed("r", basis(2))
+        store.add_or_update_edge(seed, old, 1.0, "causal")
+        store.add_or_update_edge(seed, replacement, 0.9, "causal")
+        store.add_or_update_edge(replacement, old, 1.0, "supersedes")
+
+        result = graph_module.expand(
+            [{"story_id": seed, "score": 1.0}],
+            max_hops=1,
+            token_budget=1_000,
+        )
+
+        assert [item["story_id"] for item in result["matches"]] == [replacement]
+        assert result["trace"]["tokens_used"] == sum(
+            graph_module._estimate_candidate_tokens(item)
+            for item in result["matches"]
+        )
+
     def test_one_hop_causal_candidate_has_complete_explanation(self, fake_embedder):
         seed = _seed("seed", basis(0))
         outcome = _seed("outcome", basis(5))

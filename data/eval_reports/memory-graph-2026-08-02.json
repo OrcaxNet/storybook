@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-02T00:00:57.115205+00:00",
+  "generated_at": "2026-08-02T00:15:15.585509+00:00",
   "machine": {
     "os": "Darwin",
     "os_release": "25.3.0",
@@ -122,14 +122,14 @@
   },
   "performance": {
     "stories": 10000,
-    "repeats": 100,
+    "repeats": 200,
     "active_edges": 10063,
-    "database_bytes": 7770112,
+    "database_bytes": 7729152,
     "graph_ms": {
-      "p50": 2.067,
-      "p95": 2.415,
-      "p99": 5.469,
-      "max": 10.57
+      "p50": 2.116,
+      "p95": 3.03,
+      "p99": 5.547,
+      "max": 8.653
     },
     "budgets": {
       "max_hops": 2,
@@ -142,7 +142,7 @@
   "gates": {
     "associated_recall_at_5_lift_pp": 100.0,
     "overall_recall_at_3_regression_pp": 0.0,
-    "graph_ms_p95": 2.415,
+    "graph_ms_p95": 3.03,
     "quality_passed": true,
     "latency_passed": true
   },

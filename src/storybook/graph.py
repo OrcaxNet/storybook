@@ -86,7 +86,7 @@ def expand(
     if not seeds:
         return _result(
             candidates, seed_ids, started, reasons,
-            path_count=0, token_used=0, cycles_suppressed=0,
+            path_count=0, cycles_suppressed=0,
             path_policy_suppressed=0, budgets={
                 "max_hops": max_hops,
                 "max_paths": max_paths,
@@ -108,7 +108,7 @@ def expand(
         reasons.update(zero_budget_reasons)
         return _result(
             candidates, seed_ids, started, reasons,
-            path_count=0, token_used=0, cycles_suppressed=0,
+            path_count=0, cycles_suppressed=0,
             path_policy_suppressed=0, budgets={
                 "max_hops": max_hops,
                 "max_paths": max_paths,
@@ -246,13 +246,17 @@ def expand(
                 existing = candidates.get(neighbor_id)
                 if existing is not None and existing["graph_score"] >= score:
                     continue
-                if existing is None:
-                    candidate_tokens = _estimate_candidate_tokens(candidate)
-                    if token_used + candidate_tokens > token_budget:
-                        reasons.add("token_budget")
-                        stop = True
-                        break
-                    token_used += candidate_tokens
+                candidate_tokens = _estimate_candidate_tokens(candidate)
+                existing_tokens = (
+                    _estimate_candidate_tokens(existing)
+                    if existing is not None else 0
+                )
+                token_delta = candidate_tokens - existing_tokens
+                if token_used + token_delta > token_budget:
+                    reasons.add("token_budget")
+                    stop = True
+                    break
+                token_used += token_delta
                 candidates[neighbor_id] = candidate
             if stop:
                 break
@@ -267,7 +271,6 @@ def expand(
     return _result(
         candidates, seed_ids, started, reasons,
         path_count=path_count,
-        token_used=token_used,
         cycles_suppressed=cycles_suppressed,
         path_policy_suppressed=path_policy_suppressed,
         budgets={
@@ -287,7 +290,6 @@ def _result(
     reasons: set[str],
     *,
     path_count: int,
-    token_used: int,
     cycles_suppressed: int,
     path_policy_suppressed: int,
     budgets: dict,
@@ -299,6 +301,7 @@ def _result(
         if story_id not in superseded
     ]
     matches.sort(key=lambda item: item["graph_score"], reverse=True)
+    token_used = sum(_estimate_candidate_tokens(match) for match in matches)
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 3)
     return {
         "matches": matches,
