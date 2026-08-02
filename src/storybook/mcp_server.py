@@ -70,6 +70,10 @@ def _trim_related(related: list[dict]) -> list[dict]:
             "title": r.get("title"),
             "weight": r.get("weight", 0),
             "edge_type": r.get("edge_type", "semantic"),
+            "directed": bool(r.get("directed")),
+            "direction": r.get("direction", r.get("edge_direction", "undirected")),
+            "provenance": r.get("provenance", r.get("edge_provenance", {})),
+            "version": r.get("version", r.get("edge_version", 1)),
         })
     return trimmed
 
@@ -98,6 +102,9 @@ def _build_recall_result(result: dict) -> dict:
             "applicability": m.get("applicability", {}),
             "warnings": m.get("warnings", []),
             "retrieval_source": m.get("retrieval_source", "vector"),
+            "seed_story_id": m.get("seed_story_id", m["story_id"]),
+            "graph_path": m.get("graph_path", []),
+            "score_components": m.get("score_components", {}),
             "related": _trim_related(m.get("related", [])),
         })
     return {
@@ -115,6 +122,10 @@ def _build_recall_result(result: dict) -> dict:
         "latency_ms": result.get("latency_ms", {}),
         "scope": result.get("scope", "profile"),
         "strict_filtered": result.get("strict_filtered", 0),
+        "graph_enabled": bool(result.get("graph_enabled")),
+        "truncated": bool(result.get("truncated")),
+        "truncated_reasons": result.get("truncated_reasons", []),
+        "graph_trace": result.get("graph_trace", {}),
     }
 
 
@@ -127,6 +138,7 @@ def recall_memories(
     top_k: int = 3,
     context: dict | None = None,
     scope: str = "profile",
+    graph_enabled: bool | None = None,
 ) -> dict:
     """召回与查询相关的记忆（向量检索 + 关联激活）。
 
@@ -146,6 +158,7 @@ def recall_memories(
         top_k=top_k,
         context=context,
         scope=scope,
+        graph_enabled=graph_enabled,
     )
     return _build_recall_result(result)
 
@@ -243,6 +256,7 @@ def create_server():
         top_k: int = 3,
         context: dict | None = None,
         scope: str = "profile",
+        graph_enabled: bool | None = None,
     ) -> dict:
         """召回与当前任务/问题相关的记忆（向量检索 + 关联激活）。
 
@@ -256,8 +270,15 @@ def create_server():
             top_k: 最多返回的匹配记忆数，默认 3。
             context: 可选 ContextEnvelope；缺省时仅按 Profile 语义召回。
             scope: profile（默认软加权）或 strict（环境冲突硬过滤）。
+            graph_enabled: 是否启用受预算图扩散；缺省跟随本地配置，false 回退直接检索。
         """
-        return recall_memories(query, top_k=top_k, context=context, scope=scope)
+        return recall_memories(
+            query,
+            top_k=top_k,
+            context=context,
+            scope=scope,
+            graph_enabled=graph_enabled,
+        )
 
     @mcp.tool()
     def get_story(story_id: int) -> dict:

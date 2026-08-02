@@ -498,6 +498,18 @@ class TestProfileIdentityMigration:
                 uuid.UUID(row["global_id"])
                 assert row["profile_id"] == config.PROFILE_ID
                 assert row["sync_state"] == "local_only"
+            edge_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(edges)").fetchall()
+            }
+            assert {
+                "directed", "provenance_json", "version", "observations",
+                "last_reinforced_at", "deleted_at",
+            }.issubset(edge_columns)
+            migrated_edge = db.execute("SELECT * FROM edges WHERE id = 1").fetchone()
+            assert json.loads(migrated_edge["provenance_json"])["source"] == (
+                "legacy_migration"
+            )
             legacy_session = db.execute(
                 "SELECT context_json FROM sessions WHERE id = 1"
             ).fetchone()
