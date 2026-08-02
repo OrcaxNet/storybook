@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -166,6 +167,13 @@ def test_run_preserves_objects_relations_vectors_and_is_idempotent(
         assert migrated.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 2
         assert migrated.execute("SELECT COUNT(*) FROM stories").fetchone()[0] == 3
         assert migrated.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 2
+        for table in ("sessions", "stories", "edges"):
+            assert all(
+                uuid.UUID(row[0]).version == 7
+                for row in migrated.execute(
+                    f"SELECT global_id FROM {table} ORDER BY id"
+                )
+            )
         assert [
             tuple(row) for row in migrated.execute(
                 "SELECT id, parent_id, source_session_ids FROM stories ORDER BY id"

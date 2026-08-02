@@ -793,7 +793,6 @@ class MigrationManager:
                 store.init_db(
                     stage,
                     profile_id=profile.id,
-                    identity_namespace=migration_id,
                 )
                 retain_until = _timestamp(
                     _utc_now() + timedelta(days=BACKUP_RETENTION_DAYS)

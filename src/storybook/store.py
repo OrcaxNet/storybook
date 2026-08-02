@@ -298,7 +298,6 @@ def init_db(
     db_path: str | Path | None = None,
     *,
     profile_id: str | None = None,
-    identity_namespace: str | None = None,
 ):
     """Initialize one database and idempotently upgrade legacy rows.
 
@@ -313,11 +312,7 @@ def init_db(
     db = get_db(path)
     try:
         db.executescript(_SCHEMA)
-        _ensure_identity_columns(
-            db,
-            owning_profile_id,
-            identity_namespace=identity_namespace,
-        )
+        _ensure_identity_columns(db, owning_profile_id)
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
         _ensure_memory_event_backfill(db)
@@ -472,8 +467,6 @@ def _new_global_id() -> str:
 def _ensure_identity_columns(
     db: sqlite3.Connection,
     profile_id: str | None = None,
-    *,
-    identity_namespace: str | None = None,
 ) -> None:
     """为已有 v0.1 数据库原地补齐 Profile、global_id 与 sync_state。
 
@@ -499,16 +492,9 @@ def _ensure_identity_columns(
             f"SELECT id FROM {table} WHERE global_id IS NULL OR global_id = ''"
         ).fetchall()
         for row in missing:
-            global_id = (
-                str(uuid.uuid5(
-                    uuid.UUID(identity_namespace), f"{table}:{row['id']}"
-                ))
-                if identity_namespace
-                else _new_global_id()
-            )
             db.execute(
                 f"UPDATE {table} SET global_id = ? WHERE id = ?",
-                (global_id, row["id"]),
+                (_new_global_id(), row["id"]),
             )
         db.execute(
             f"UPDATE {table} SET profile_id = ? "
