@@ -153,14 +153,18 @@ storybook sync status                     # v0.2 明确显示 local_only、跨�
 
 ### v1 → v2 安全迁移与回滚
 
-迁移始终只读打开旧项目库，先做一致性备份，再在隔离的数据库世代内转换和校验。
+迁移的发现、dry-run、备份与转换阶段始终只读打开旧项目库，先做一致性备份，再在隔离
+的数据库世代内转换和校验。
 Session、Story、edge 及关系必须逐项等量；已有 embedding 会进入 sqlite-vec serving
 索引并执行真实查询 smoke test。v1 `content` 原样保存在 `legacy_raw`，Story v2 detail/source
 同步生成，`abstract_status=pending` 留给后续异步补全。所有检查通过后，才以一次原子
 registry CAS 切换 `database_ref`。切换前会在 SQLite 单写者边界内再次核对源库逻辑
-hash；backup 后的提交会使迁移明确失败，活动写事务也会阻止切换。只读源库使用稳定
-读事务做同一 CAS。rollback 副本另存基线 hash，若回滚后产生新写入，重复迁移会拒绝
-复用陈旧 v2 世代。因此失败不会改变旧库权威，也不会静默覆盖回滚后的权威数据。
+hash；backup 后的提交会使迁移明确失败，活动写事务也会阻止切换。对于可写的待退役
+世代，同一事务会预置持久拒写触发器，registry CAS 成功后先提交 fencing，再释放等待中
+的 writer；这些旧连接会收到 `SB_MIGRATION_GENERATION_FENCED`，不能在成功切换后向
+旧世代落入独有数据。只读源库使用稳定读事务做同一 CAS。rollback 对活动 v2 使用相同
+协议，副本另存基线 hash；若回滚后产生新写入，重复迁移会拒绝复用陈旧 v2 世代。因此
+失败不会改变旧库权威，也不会静默覆盖回滚后的权威数据。
 
 ```bash
 storybook migration discover --json
@@ -173,7 +177,8 @@ storybook migration delete-backup <migration_id> --yes      # 用户显式永久
 
 `migration_id` 由目标 Profile 与源库逻辑 SHA-256 确定；重复运行同一源库直接复用已验证
 世代，不插入重复对象。当前 Profile 已有 Session/Story/edge 时迁移会拒绝覆盖，应先创建
-一个新的空 Profile。原始源库永不修改；受管 v1 备份至少保留 30 天，且不会自动提前删除。
+一个新的空 Profile。原始记忆行不会删除或覆盖；成功切换只在可写旧库中增加世代拒写
+触发器，失败切换会回滚该 DDL。受管 v1 只读备份至少保留 30 天，且不会自动提前删除。
 
 ## 🧪 测试
 

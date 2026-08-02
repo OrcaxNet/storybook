@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 
@@ -143,7 +144,7 @@ def test_run_preserves_objects_relations_vectors_and_is_idempotent(
     tmp_path, migration_profile
 ):
     source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
-    source_before = source.read_bytes()
+    source_hash_before = migration._hash_database(source)
     manager = migration.MigrationManager()
 
     result = manager.run(source)
@@ -160,7 +161,19 @@ def test_run_preserves_objects_relations_vectors_and_is_idempotent(
     active = migration_profile.active_profile()
     assert active.database_ref == result["generation_ref"]
     assert config.DB_PATH == migration_profile.paths_for(active).database
-    assert source.read_bytes() == source_before
+    assert migration._hash_database(source) == source_hash_before
+    retired = sqlite3.connect(source)
+    try:
+        with pytest.raises(
+            sqlite3.DatabaseError, match="SB_MIGRATION_GENERATION_FENCED"
+        ):
+            retired.execute(
+                """INSERT INTO sessions (source, raw_content)
+                   VALUES ('retired-writer', 'must fail')"""
+            )
+    finally:
+        retired.rollback()
+        retired.close()
 
     migrated = store.get_db()
     try:
@@ -297,6 +310,88 @@ def test_active_source_writer_blocks_cutover_without_switching(
     assert migration_profile.active_profile().database_ref == original_ref
 
 
+def test_waiting_source_writer_is_fenced_after_successful_cutover(
+    tmp_path, migration_profile, monkeypatch
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    wal = sqlite3.connect(source)
+    wal.execute("PRAGMA journal_mode=WAL")
+    wal.close()
+    real_switch = migration_profile.set_profile_database
+    writer_started = threading.Event()
+    writer_result: dict[str, object] = {}
+    writer_thread: threading.Thread | None = None
+
+    def write_to_open_source() -> None:
+        writer = sqlite3.connect(source, timeout=5)
+        try:
+            writer_started.set()
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                """INSERT INTO sessions (source, raw_content, problem_desc)
+                   VALUES ('waiting-writer', 'raw-3', 'problem-3')"""
+            )
+            writer.commit()
+            writer_result["committed"] = True
+        except sqlite3.DatabaseError as exc:
+            writer.rollback()
+            writer_result["error"] = str(exc)
+        finally:
+            writer.close()
+
+    def switch_with_waiting_writer(*args, **kwargs):
+        nonlocal writer_thread
+        writer_thread = threading.Thread(target=write_to_open_source)
+        writer_thread.start()
+        assert writer_started.wait(timeout=5)
+        return real_switch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        migration_profile, "set_profile_database", switch_with_waiting_writer
+    )
+
+    applied = migration.MigrationManager().run(source)
+    assert writer_thread is not None
+    writer_thread.join(timeout=5)
+
+    assert not writer_thread.is_alive()
+    assert writer_result.get("committed") is not True
+    assert "SB_MIGRATION_GENERATION_FENCED" in str(writer_result.get("error"))
+    assert migration_profile.active_profile().database_ref == applied["generation_ref"]
+    source_db = sqlite3.connect(source)
+    try:
+        assert source_db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 2
+    finally:
+        source_db.close()
+
+
+def test_fence_staging_rolls_back_when_registry_switch_fails(
+    tmp_path, migration_profile, monkeypatch
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    original_ref = migration_profile.active_profile().database_ref
+
+    def fail_switch(*args, **kwargs):
+        raise RuntimeError("injected registry failure")
+
+    monkeypatch.setattr(migration_profile, "set_profile_database", fail_switch)
+
+    with pytest.raises(RuntimeError, match="injected registry failure"):
+        migration.MigrationManager().run(source)
+
+    assert migration_profile.active_profile().database_ref == original_ref
+    writer = sqlite3.connect(source)
+    try:
+        writer.execute(
+            """INSERT INTO sessions (source, raw_content, problem_desc)
+               VALUES ('retryable-writer', 'raw-3', 'problem-3')"""
+        )
+        writer.commit()
+        assert writer.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 3
+    finally:
+        writer.close()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX read-only permission bits")
 def test_read_only_source_uses_hash_cas_without_mutation(
     tmp_path, migration_profile
@@ -337,6 +432,98 @@ def test_rollback_atomically_points_to_independent_v1_copy(
     assert manager.rollback(applied["migration_id"])["status"] == (
         "already_rolled_back"
     )
+
+
+def test_rollback_rejects_active_v2_writer_without_switching(
+    tmp_path, migration_profile
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    writer = sqlite3.connect(config.DB_PATH)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+    )
+    try:
+        with pytest.raises(migration.MigrationError) as exc_info:
+            manager.rollback(applied["migration_id"])
+        assert exc_info.value.code == "SB_MIGRATION_AUTHORITY_BUSY"
+        assert (
+            migration_profile.active_profile().database_ref
+            == applied["generation_ref"]
+        )
+        writer.commit()
+    finally:
+        writer.close()
+
+    active = sqlite3.connect(config.DB_PATH)
+    try:
+        assert active.execute(
+            "SELECT access_count FROM stories WHERE id = 1"
+        ).fetchone()[0] == 1
+    finally:
+        active.close()
+
+
+def test_waiting_v2_writer_is_fenced_after_successful_rollback(
+    tmp_path, migration_profile, monkeypatch
+):
+    source = _legacy_db(tmp_path / "repo" / "data" / "memory.db")
+    manager = migration.MigrationManager()
+    applied = manager.run(source)
+    old_v2 = config.DB_PATH
+    wal = sqlite3.connect(old_v2)
+    wal.execute("PRAGMA journal_mode=WAL")
+    wal.close()
+    real_switch = migration_profile.set_profile_database
+    writer_started = threading.Event()
+    writer_result: dict[str, object] = {}
+    writer_thread: threading.Thread | None = None
+
+    def write_to_open_v2() -> None:
+        writer = sqlite3.connect(old_v2, timeout=5)
+        try:
+            writer_started.set()
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute(
+                "UPDATE stories SET access_count = access_count + 1 WHERE id = 1"
+            )
+            writer.commit()
+            writer_result["committed"] = True
+        except sqlite3.DatabaseError as exc:
+            writer.rollback()
+            writer_result["error"] = str(exc)
+        finally:
+            writer.close()
+
+    def switch_with_waiting_writer(*args, **kwargs):
+        nonlocal writer_thread
+        writer_thread = threading.Thread(target=write_to_open_v2)
+        writer_thread.start()
+        assert writer_started.wait(timeout=5)
+        return real_switch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        migration_profile, "set_profile_database", switch_with_waiting_writer
+    )
+
+    rolled_back = manager.rollback(applied["migration_id"])
+    assert writer_thread is not None
+    writer_thread.join(timeout=5)
+
+    assert not writer_thread.is_alive()
+    assert writer_result.get("committed") is not True
+    assert "SB_MIGRATION_GENERATION_FENCED" in str(writer_result.get("error"))
+    assert migration_profile.active_profile().database_ref == rolled_back["database_ref"]
+    old_db = sqlite3.connect(old_v2)
+    try:
+        assert old_db.execute(
+            "SELECT access_count FROM stories WHERE id = 1"
+        ).fetchone()[0] == 0
+    finally:
+        old_db.close()
 
 
 def test_reapply_rejects_changes_written_after_rollback(
@@ -383,6 +570,8 @@ def test_reapply_allows_unchanged_rollback_authority(
     assert reapplied["status"] == "reapplied"
     assert migration_profile.active_profile().database_ref == applied["generation_ref"]
     assert store.count_sessions() == 2
+    store.add_session("reapplied-writer", "new active v2 data")
+    assert store.count_sessions() == 3
 
 
 def test_cli_dry_run_and_status_json(tmp_path, migration_profile):

@@ -1,10 +1,12 @@
 """Safe v1 project database migration into a Profile-owned v2 generation.
 
-Inspection, backup and conversion never mutate the source.  At cut-over a
-write-free SQLite ``BEGIN IMMEDIATE`` guard briefly excludes source commits so
-the final logical-hash CAS and atomic Profile registry update have no gap.
-Read-only source files use a read transaction because no new writer can open
-them.  Conversion always happens in an isolated generation.
+Inspection, dry-run, backup and conversion never mutate the source.  At a
+successful cut-over, a SQLite ``BEGIN IMMEDIATE`` transaction stages durable
+deny-write triggers on each retiring generation, changes the Profile pointer,
+then commits those triggers before queued writers resume.  Failed cut-overs
+roll that DDL back.  OS-read-only sources use a stable read transaction because
+new writers cannot open them.  Conversion always happens in an isolated
+generation.
 """
 from __future__ import annotations
 
@@ -14,10 +16,10 @@ import os
 import shutil
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import sqlite_vec
 
@@ -38,6 +40,8 @@ except ImportError:  # pragma: no cover - Unix/macOS
 MIGRATION_NAMESPACE = uuid.UUID("6d7f36c9-cc7a-4d8a-b35b-642dc97c75b7")
 BACKUP_RETENTION_DAYS = 30
 CORE_TABLES = ("sessions", "stories", "edges")
+GENERATION_FENCE_PREFIX = "__storybook_generation_fence_"
+GENERATION_FENCE_ERROR = "SB_MIGRATION_GENERATION_FENCED"
 REQUIRED_COLUMNS = {
     "sessions": {"id", "source", "raw_content"},
     "stories": {
@@ -133,41 +137,122 @@ def _cutover_guard(
     busy_code: str,
     label: str,
 ) -> Iterator[sqlite3.Connection]:
-    """Hold a stable snapshot and exclude commits until registry cut-over.
+    """Hold a stable snapshot and exclude commits until fencing is committed.
 
     ``BEGIN IMMEDIATE`` changes no user data but takes SQLite's single-writer
-    slot.  A genuinely read-only file falls back to a read transaction; its OS
+    slot.  Callers may stage persistent fencing triggers in this transaction,
+    switch the registry, then commit before releasing queued writers.  A
+    genuinely read-only file falls back to a read transaction; its OS
     permissions already prevent a new writer from opening it.
     """
 
     resolved = path.expanduser().resolve(strict=True)
     db: sqlite3.Connection | None = None
     try:
-        try:
-            db = sqlite3.connect(
-                f"{resolved.as_uri()}?mode=rw", uri=True, timeout=0
-            )
-            db.row_factory = sqlite3.Row
-            db.execute("PRAGMA busy_timeout=0")
-            db.execute("BEGIN IMMEDIATE")
-        except (OSError, sqlite3.OperationalError) as exc:
-            if db is not None:
-                db.close()
-                db = None
-            if not _is_readonly_error(exc):
-                raise MigrationError(
-                    busy_code,
-                    f"{label}仍有活动写事务，无法建立无遗漏切换边界",
-                    hint="停止旧写入进程后重试；registry 尚未切换",
-                ) from exc
+        permission_read_only = (
+            os.name != "nt" and not (resolved.stat().st_mode & 0o222)
+        )
+        if permission_read_only:
             db = _read_only(resolved)
             db.execute("BEGIN")
+        else:
+            try:
+                db = sqlite3.connect(
+                    f"{resolved.as_uri()}?mode=rw", uri=True, timeout=0
+                )
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA busy_timeout=0")
+                db.execute("BEGIN IMMEDIATE")
+            except (OSError, sqlite3.OperationalError) as exc:
+                if db is not None:
+                    db.close()
+                    db = None
+                if not _is_readonly_error(exc):
+                    raise MigrationError(
+                        busy_code,
+                        f"{label}仍有活动写事务，无法建立无遗漏切换边界",
+                        hint="停止旧写入进程后重试；registry 尚未切换",
+                    ) from exc
+                db = _read_only(resolved)
+                db.execute("BEGIN")
         yield db
     finally:
         if db is not None:
             if db.in_transaction:
                 db.rollback()
             db.close()
+
+
+def _quoted_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _guard_is_writable(db: sqlite3.Connection) -> bool:
+    return not bool(db.execute("PRAGMA query_only").fetchone()[0])
+
+
+def _fence_trigger_name(table: str, operation: str) -> str:
+    table_key = hashlib.sha256(table.encode("utf-8")).hexdigest()[:16]
+    return f"{GENERATION_FENCE_PREFIX}{table_key}_{operation.casefold()}"
+
+
+def _stage_generation_fence(db: sqlite3.Connection) -> bool:
+    """Stage durable deny-write triggers in the guard's open transaction.
+
+    The DDL stays invisible while ``BEGIN IMMEDIATE`` holds queued writers.
+    Callers switch the Profile registry first and then commit the guard, so a
+    writer that opened the retiring generation before cut-over resumes only
+    after the triggers are visible and receives a stable fencing error.
+    """
+
+    if not _guard_is_writable(db):
+        return False
+    tables = [
+        str(row[0])
+        for row in db.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type = 'table'
+                 AND name NOT LIKE 'sqlite_%'
+                 AND upper(trim(sql)) NOT LIKE 'CREATE VIRTUAL TABLE%'
+               ORDER BY name"""
+        )
+    ]
+    for table in tables:
+        quoted_table = _quoted_identifier(table)
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            trigger = _quoted_identifier(_fence_trigger_name(table, operation))
+            db.execute(
+                f"""CREATE TRIGGER IF NOT EXISTS {trigger}
+                    BEFORE {operation} ON {quoted_table}
+                    BEGIN
+                        SELECT RAISE(ABORT, '{GENERATION_FENCE_ERROR}');
+                    END"""
+            )
+    return True
+
+
+def _stage_generation_unfence(db: sqlite3.Connection) -> bool:
+    """Stage removal of Storybook fencing before reactivating a generation."""
+
+    if not _guard_is_writable(db):
+        return False
+    triggers = [
+        str(row[0])
+        for row in db.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type = 'trigger' AND name LIKE ?
+               ORDER BY name""",
+            (f"{GENERATION_FENCE_PREFIX}%",),
+        )
+    ]
+    for trigger in triggers:
+        db.execute(f"DROP TRIGGER {_quoted_identifier(trigger)}")
+    return bool(triggers)
+
+
+def _commit_guard(db: sqlite3.Connection) -> None:
+    if db.in_transaction:
+        db.commit()
 
 
 def _hash_database(path: Path) -> str:
@@ -619,6 +704,97 @@ class MigrationManager:
         root = self.registry.paths_for(profile).root / "migrations"
         return root, root / ".migration.lock"
 
+    def _switch_profile_generation(
+        self,
+        *,
+        profile: Profile,
+        target_ref: str,
+        retiring: list[
+            tuple[
+                Path,
+                str,
+                str,
+                Callable[[sqlite3.Connection], None],
+            ]
+        ],
+        target_path: Path | None = None,
+        prepare_target: Callable[[], None] | None = None,
+    ) -> None:
+        """Fence every retiring generation and atomically move the pointer.
+
+        Each retiring database keeps a ``BEGIN IMMEDIATE`` transaction open
+        while deny-write triggers are staged.  The registry CAS happens before
+        those transactions commit, so connections already open or waiting on
+        an old generation can resume only after its fence is durable.  A
+        reactivated target is held under its own write guard and unfenced in
+        the same linearization window.
+        """
+
+        with ExitStack() as stack:
+            retiring_guards: list[sqlite3.Connection] = []
+            seen: set[Path] = set()
+            for path, busy_code, label, validate in retiring:
+                resolved = path.expanduser().resolve(strict=True)
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                db = stack.enter_context(
+                    _cutover_guard(
+                        resolved,
+                        busy_code=busy_code,
+                        label=label,
+                    )
+                )
+                validate(db)
+                _stage_generation_fence(db)
+                retiring_guards.append(db)
+
+            target_guard: sqlite3.Connection | None = None
+            if target_path is not None:
+                resolved_target = target_path.expanduser().resolve(strict=True)
+                if resolved_target in seen:
+                    raise MigrationError(
+                        "SB_MIGRATION_GENERATION_CONFLICT",
+                        "目标数据库世代同时被标记为待退役世代",
+                    )
+                target_guard = stack.enter_context(
+                    _cutover_guard(
+                        resolved_target,
+                        busy_code="SB_MIGRATION_TARGET_BUSY",
+                        label="待激活目标世代",
+                    )
+                )
+                _stage_generation_unfence(target_guard)
+
+            if prepare_target is not None:
+                prepare_target()
+            self.registry.set_profile_database(
+                profile.id,
+                target_ref,
+                expected_database_ref=profile.database_ref,
+            )
+            for db in retiring_guards:
+                _commit_guard(db)
+            if target_guard is not None:
+                _commit_guard(target_guard)
+            if self.registry is config.PROFILE_REGISTRY:
+                config.refresh_profile(profile.id)
+
+    @staticmethod
+    def _fence_without_switch(
+        path: Path,
+        *,
+        busy_code: str,
+        label: str,
+        validate: Callable[[sqlite3.Connection], None],
+    ) -> None:
+        """Retrofit a durable fence on an already-retired generation."""
+
+        with _cutover_guard(path, busy_code=busy_code, label=label) as db:
+            validate(db)
+            _stage_generation_fence(db)
+            _commit_guard(db)
+
     def plan(self, source: str | Path) -> dict:
         """Build a zero-write migration plan."""
 
@@ -705,6 +881,36 @@ class MigrationManager:
             existing = _read_manifest(manifest_path)
 
             if plan["already_applied"]:
+                def validate_retired_source(db: sqlite3.Connection) -> None:
+                    _validate_v1_schema(db)
+                    if _logical_hash(db) != plan["source_hash"]:
+                        raise MigrationError(
+                            "SB_MIGRATION_SOURCE_CHANGED",
+                            "已退役旧源库在迁移完成后发生变化",
+                            hint="保留当前 v2；先审计旧库独有写入",
+                        )
+
+                self._fence_without_switch(
+                    Path(plan["source"]),
+                    busy_code="SB_MIGRATION_SOURCE_BUSY",
+                    label="已退役旧源库",
+                    validate=validate_retired_source,
+                )
+                if existing:
+                    previous_ref = existing.get("previous_database_ref")
+                    if previous_ref:
+                        previous_path = root.parent / str(previous_ref)
+                        if (
+                            previous_path.is_file()
+                            and previous_path.resolve()
+                            != Path(plan["source"]).resolve()
+                        ):
+                            self._fence_without_switch(
+                                previous_path,
+                                busy_code="SB_MIGRATION_AUTHORITY_BUSY",
+                                label="已退役 Profile 世代",
+                                validate=lambda _db: None,
+                            )
                 if existing and existing.get("status") != "activated":
                     existing.update({
                         "status": "activated",
@@ -718,51 +924,48 @@ class MigrationManager:
                 )
                 authority_path = self.registry.paths_for(profile).database
 
-                def activate_existing() -> None:
-                    with _cutover_guard(
-                        Path(plan["source"]),
-                        busy_code="SB_MIGRATION_SOURCE_BUSY",
-                        label="旧源库",
-                    ) as live_source:
-                        _validate_v1_schema(live_source)
-                        if _logical_hash(live_source) != plan["source_hash"]:
-                            raise MigrationError(
-                                "SB_MIGRATION_SOURCE_CHANGED",
-                                "旧源库在切换前发生变化",
-                                hint="registry 未切换；重新规划迁移",
-                            )
-                        self.registry.set_profile_database(
-                            profile.id,
-                            plan["generation_ref"],
-                            expected_database_ref=profile.database_ref,
+                def validate_source(db: sqlite3.Connection) -> None:
+                    _validate_v1_schema(db)
+                    if _logical_hash(db) != plan["source_hash"]:
+                        raise MigrationError(
+                            "SB_MIGRATION_SOURCE_CHANGED",
+                            "旧源库在切换前发生变化",
+                            hint="registry 未切换；重新规划迁移",
                         )
-                        if self.registry is config.PROFILE_REGISTRY:
-                            config.refresh_profile(profile.id)
-                        existing.update({
-                            "status": "activated",
-                            "activated_at": _timestamp(_utc_now()),
-                        })
-                        _atomic_json(manifest_path, existing)
 
+                retiring = [(
+                    Path(plan["source"]),
+                    "SB_MIGRATION_SOURCE_BUSY",
+                    "旧源库",
+                    validate_source,
+                )]
                 if authority_path.is_file():
-                    with _cutover_guard(
+                    retiring.insert(0, (
                         authority_path,
-                        busy_code="SB_MIGRATION_AUTHORITY_BUSY",
-                        label="当前权威库",
-                    ) as authority_db:
-                        _assert_reapply_authority(
-                            authority_db,
+                        "SB_MIGRATION_AUTHORITY_BUSY",
+                        "当前权威库",
+                        lambda db: _assert_reapply_authority(
+                            db,
                             profile=profile,
                             manifest=existing,
-                        )
-                        activate_existing()
-                elif profile.database_ref == existing.get("previous_database_ref"):
-                    activate_existing()
-                else:
+                        ),
+                    ))
+                elif profile.database_ref != existing.get("previous_database_ref"):
                     raise MigrationError(
                         "SB_MIGRATION_ACTIVE_GENERATION_CHANGED",
                         "当前权威数据库不存在或已切换，不能复用迁移产物",
                     )
+                self._switch_profile_generation(
+                    profile=profile,
+                    target_ref=plan["generation_ref"],
+                    retiring=retiring,
+                    target_path=destination,
+                )
+                existing.update({
+                    "status": "activated",
+                    "activated_at": _timestamp(_utc_now()),
+                })
+                _atomic_json(manifest_path, existing)
                 return {
                     **plan, "dry_run": False, "status": "reapplied",
                     "validation": validation,
@@ -836,52 +1039,54 @@ class MigrationManager:
                     "created_at": now,
                 }
 
-                def cutover() -> None:
-                    with _cutover_guard(
-                        source_path,
-                        busy_code="SB_MIGRATION_SOURCE_BUSY",
-                        label="旧源库",
-                    ) as live_source:
-                        _validate_v1_schema(live_source)
-                        if _logical_hash(live_source) != plan["source_hash"]:
-                            raise MigrationError(
-                                "SB_MIGRATION_SOURCE_CHANGED",
-                                "旧数据库在 backup 后、切换前发生变化",
-                                hint="registry 未切换；重新运行 dry-run 后重试",
-                            )
-                        os.replace(stage, destination)
-                        _private_file(destination)
-                        _atomic_json(manifest_path, manifest)
-                        self.registry.set_profile_database(
-                            profile.id,
-                            plan["generation_ref"],
-                            expected_database_ref=profile.database_ref,
+                def validate_source(db: sqlite3.Connection) -> None:
+                    _validate_v1_schema(db)
+                    if _logical_hash(db) != plan["source_hash"]:
+                        raise MigrationError(
+                            "SB_MIGRATION_SOURCE_CHANGED",
+                            "旧数据库在 backup 后、切换前发生变化",
+                            hint="registry 未切换；重新运行 dry-run 后重试",
                         )
-                        if self.registry is config.PROFILE_REGISTRY:
-                            config.refresh_profile(profile.id)
-                        manifest.update({
-                            "status": "activated",
-                            "activated_at": now,
-                        })
-                        _atomic_json(manifest_path, manifest)
 
+                def prepare_destination() -> None:
+                    os.replace(stage, destination)
+                    _private_file(destination)
+                    _atomic_json(manifest_path, manifest)
+
+                retiring = [(
+                    source_path,
+                    "SB_MIGRATION_SOURCE_BUSY",
+                    "旧源库",
+                    validate_source,
+                )]
                 authority_path = self.registry.paths_for(profile).database
                 if authority_path.is_file():
-                    with _cutover_guard(
-                        authority_path,
-                        busy_code="SB_MIGRATION_AUTHORITY_BUSY",
-                        label="当前 Profile 权威库",
-                    ) as authority_db:
-                        counts = _core_counts_open(authority_db)
+                    def validate_authority(db: sqlite3.Connection) -> None:
+                        counts = _core_counts_open(db)
                         if any(counts.values()):
                             raise MigrationError(
                                 "SB_MIGRATION_AUTHORITY_CHANGED",
                                 f"当前 Profile 在迁移期间新增数据: {counts}",
                                 hint="registry 未切换；迁移到新的空 Profile",
                             )
-                        cutover()
-                else:
-                    cutover()
+
+                    retiring.insert(0, (
+                        authority_path,
+                        "SB_MIGRATION_AUTHORITY_BUSY",
+                        "当前 Profile 权威库",
+                        validate_authority,
+                    ))
+                self._switch_profile_generation(
+                    profile=profile,
+                    target_ref=plan["generation_ref"],
+                    retiring=retiring,
+                    prepare_target=prepare_destination,
+                )
+                manifest.update({
+                    "status": "activated",
+                    "activated_at": now,
+                })
+                _atomic_json(manifest_path, manifest)
                 return {
                     **plan,
                     "dry_run": False,
@@ -943,13 +1148,18 @@ class MigrationManager:
             finally:
                 rollback_tmp.unlink(missing_ok=True)
             rollback_baseline_hash = _hash_database(rollback_db)
-            self.registry.set_profile_database(
-                profile.id,
-                rollback_ref,
-                expected_database_ref=str(manifest["generation_ref"]),
+            authority_path = self.registry.paths_for(profile).database
+            self._switch_profile_generation(
+                profile=profile,
+                target_ref=rollback_ref,
+                retiring=[(
+                    authority_path,
+                    "SB_MIGRATION_AUTHORITY_BUSY",
+                    "当前 v2 权威世代",
+                    lambda _db: None,
+                )],
+                target_path=rollback_db,
             )
-            if self.registry is config.PROFILE_REGISTRY:
-                config.refresh_profile(profile.id)
             manifest.update({
                 "status": "rolled_back",
                 "rolled_back_at": _timestamp(_utc_now()),
