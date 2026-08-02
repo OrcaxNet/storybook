@@ -8,26 +8,53 @@ import pytest
 
 from ._helpers import FakeEmbedder, FakeLLM, config, embeddings_mod, llm_mod, store
 from storybook import adaptive, feedback, query_cache
+from storybook.profiles import PlatformRoots, ProfileRegistry
+
+
+def _profile_roots(tmp_path):
+    return PlatformRoots(
+        config=tmp_path / "profile-config",
+        data=tmp_path / "profile-data",
+        cache=tmp_path / "profile-cache",
+        state=tmp_path / "profile-state",
+        logs=tmp_path / "profile-logs",
+    )
 
 
 @pytest.fixture(autouse=True)
-def tmp_db(tmp_path, monkeypatch):
-    """每个测试一个隔离的临时数据库（autouse）：重定向 ``config.DB_PATH`` 到 tmp_path。"""
+def tmp_db(tmp_path):
+    """隔离每个测试的 Profile registry、数据库和性能日志。"""
     assert feedback.flush_feedback(timeout=2.0)
     query_cache.clear()
     adaptive.reset_reranker_circuit()
     embeddings_mod.mark_model_cold()
+    isolation = pytest.MonkeyPatch()
+    registry = ProfileRegistry(
+        tmp_path / "profile-config" / "profiles.json",
+        roots=_profile_roots(tmp_path),
+    )
+    isolation.setattr(config, "PROFILE_REGISTRY", registry)
+    config.refresh_profile(create=False)
     db_path = tmp_path / "test_memory.db"
-    monkeypatch.setattr(config, "DB_PATH", db_path)
-    monkeypatch.setattr(
+    isolation.setattr(config, "DB_PATH", db_path)
+    isolation.setattr(
         config, "PERFORMANCE_LOG_PATH", tmp_path / "query_performance.jsonl"
     )
-    store.init_db()
-    yield db_path
-    assert feedback.flush_feedback(timeout=2.0)
-    query_cache.clear()
-    adaptive.reset_reranker_circuit()
-    embeddings_mod.mark_model_cold()
+    try:
+        store.init_db()
+        yield db_path
+    finally:
+        try:
+            flushed = feedback.flush_feedback(timeout=2.0)
+            query_cache.clear()
+            adaptive.reset_reranker_circuit()
+            embeddings_mod.mark_model_cold()
+        finally:
+            isolation.undo()
+            # ``refresh_profile`` restores every derived path and the persisted
+            # flag from the host registry without creating or modifying it.
+            config.refresh_profile(create=False)
+        assert flushed
 
 
 @pytest.fixture

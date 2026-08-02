@@ -62,6 +62,8 @@ class TestQueryDiagnostics:
         assert summary["degraded_ratio"] == 0.2
 
     def test_status_performance_json(self, monkeypatch):
+        registry_path = config.PROFILE_REGISTRY.path
+        assert not registry_path.exists()
         monkeypatch.setattr(
             "storybook.setup_manager.health._check_ollama_reachable",
             lambda: (
@@ -92,6 +94,7 @@ class TestQueryDiagnostics:
         assert payload["degraded_reasons"] == ["profile_uninitialized"]
         assert payload["performance"]["sample_size"] == 1
         assert payload["performance"]["latency_ms"]["total"]["p95"] == 12.5
+        assert not registry_path.exists()
 
 
 @pytest.mark.parametrize(
