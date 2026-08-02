@@ -60,7 +60,10 @@ CREATE TABLE IF NOT EXISTS stories (
         CHECK(sync_state IN ('local_only', 'synced', 'pending', 'conflict', 'paused', 'error')),
     title TEXT NOT NULL,
     abstract TEXT NOT NULL DEFAULT '',
+    abstract_status TEXT NOT NULL DEFAULT 'ready'
+        CHECK(abstract_status IN ('pending', 'ready', 'failed')),
     content TEXT NOT NULL,
+    legacy_raw TEXT,
     detail_json TEXT NOT NULL DEFAULT '{}',
     sources_json TEXT NOT NULL DEFAULT '[]',
     keywords TEXT NOT NULL DEFAULT '[]',
@@ -259,6 +262,18 @@ CREATE TABLE IF NOT EXISTS query_state (
     value INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO query_state(key, value) VALUES ('index_version', 1);
+
+-- Durable idempotency/audit record for v1 -> v2 database generations.
+CREATE TABLE IF NOT EXISTS migration_history (
+    migration_id TEXT PRIMARY KEY,
+    source_hash TEXT NOT NULL UNIQUE,
+    source_schema TEXT NOT NULL,
+    target_schema TEXT NOT NULL,
+    source_counts_json TEXT NOT NULL,
+    backup_ref TEXT NOT NULL,
+    retain_until TEXT NOT NULL,
+    applied_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -266,6 +281,8 @@ def get_db(
     db_path: str | Path | None = None, *, load_vector_extension: bool = True
 ) -> sqlite3.Connection:
     """获取数据库连接（每次调用创建新连接，用完即关）"""
+    if db_path is None:
+        config.refresh_database_pointer()
     path = Path(db_path) if db_path is not None else config.DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(path))
@@ -285,13 +302,25 @@ def get_db(
     return db
 
 
-def init_db():
-    """初始化数据库 schema，并幂等补齐 Profile 与 ContextEnvelope 字段。"""
-    config.ensure_profile()
-    db = get_db()
+def init_db(
+    db_path: str | Path | None = None,
+    *,
+    profile_id: str | None = None,
+):
+    """Initialize one database and idempotently upgrade legacy rows.
+
+    An explicit ``db_path`` is used by the migration pipeline to build and
+    validate a generation before the Profile registry points at it.
+    """
+
+    if db_path is None:
+        config.ensure_profile()
+    path = Path(db_path) if db_path is not None else config.DB_PATH
+    owning_profile_id = profile_id or config.PROFILE_ID
+    db = get_db(path)
     try:
         db.executescript(_SCHEMA)
-        _ensure_identity_columns(db)
+        _ensure_identity_columns(db, owning_profile_id)
         _ensure_memory_graph_schema(db)
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
@@ -304,6 +333,7 @@ def init_db():
                 embedding FLOAT[{config.EMBED_DIM}]
             )
         """)
+        _ensure_story_vectors(db)
         legacy_vector = db.execute(
             """SELECT 1 FROM stories
                WHERE embedding IS NOT NULL AND embedding_version IS NULL
@@ -323,9 +353,34 @@ def init_db():
             (config.EMBED_MODEL, initial_version, initial_representation),
         )
         db.commit()
-        logger.info("数据库初始化完成: %s", config.DB_PATH)
+        logger.info("数据库初始化完成: %s", path)
     finally:
         db.close()
+
+
+def _ensure_story_vectors(db: sqlite3.Connection) -> None:
+    """Publish valid legacy BLOBs into vec0 without inventing embeddings."""
+
+    indexed = {
+        int(row[0]) for row in db.execute("SELECT story_id FROM story_vectors")
+    }
+    expected_bytes = config.EMBED_DIM * np.dtype(np.float32).itemsize
+    for row in db.execute(
+        "SELECT id, embedding FROM stories WHERE embedding IS NOT NULL ORDER BY id"
+    ):
+        if row["id"] in indexed:
+            continue
+        blob = bytes(row["embedding"])
+        if len(blob) != expected_bytes:
+            logger.warning(
+                "Story #%s legacy embedding size %s != %s; skipped vec0 backfill",
+                row["id"], len(blob), expected_bytes,
+            )
+            continue
+        db.execute(
+            "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",
+            (row["id"], blob),
+        )
 
 
 def _ensure_fts_index(db: sqlite3.Connection) -> None:
@@ -388,6 +443,8 @@ def _ensure_fts_index(db: sqlite3.Connection) -> None:
 def get_index_version(db_path: str | Path | None = None) -> int:
     """返回当前可检索内容版本，供跨进程缓存 key 使用。"""
 
+    if db_path is None:
+        config.refresh_database_pointer()
     path = Path(db_path) if db_path is not None else config.DB_PATH
     db = sqlite3.connect(str(path), timeout=0.05)
     try:
@@ -416,7 +473,10 @@ def _new_global_id() -> str:
     return new_uuid7()
 
 
-def _ensure_identity_columns(db: sqlite3.Connection) -> None:
+def _ensure_identity_columns(
+    db: sqlite3.Connection,
+    profile_id: str | None = None,
+) -> None:
     """为已有 v0.1 数据库原地补齐 Profile、global_id 与 sync_state。
 
     完整的旧库迁移/备份由后续迁移流程负责；这里仅做幂等、无损的兼容列扩展，
@@ -448,7 +508,7 @@ def _ensure_identity_columns(db: sqlite3.Connection) -> None:
         db.execute(
             f"UPDATE {table} SET profile_id = ? "
             "WHERE profile_id IS NULL OR profile_id = ''",
-            (config.PROFILE_ID,),
+            (profile_id or config.PROFILE_ID,),
         )
         db.execute(
             f"UPDATE {table} SET sync_state = 'local_only' "
@@ -731,6 +791,8 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
 
     additions = {
         "abstract": "TEXT NOT NULL DEFAULT ''",
+        "abstract_status": "TEXT NOT NULL DEFAULT 'ready'",
+        "legacy_raw": "TEXT",
         "detail_json": "TEXT NOT NULL DEFAULT '{}'",
         "sources_json": "TEXT NOT NULL DEFAULT '[]'",
         "embedding_model": "TEXT",
@@ -750,6 +812,7 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
     structure_was_legacy = not {
         "abstract", "detail_json", "sources_json"
     }.issubset(original_columns)
+    legacy_raw_was_missing = "legacy_raw" not in original_columns
     metadata_was_legacy = not {
         "embedding_model", "embedding_version", "embedding_content_hash",
         "embedding_status",
@@ -772,10 +835,10 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
         )
         if structure_was_legacy:
             db.execute(
-                """UPDATE stories SET abstract = ?, detail_json = ?, sources_json = ?
+                """UPDATE stories SET abstract = '', abstract_status = 'pending',
+                          legacy_raw = content, detail_json = ?, sources_json = ?
                    WHERE id = ?""",
                 (
-                    payload["abstract"],
                     json.dumps(
                         payload["detail"], ensure_ascii=False, sort_keys=True
                     ),
@@ -784,6 +847,17 @@ def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
                     ),
                     row["id"],
                 ),
+            )
+        elif legacy_raw_was_missing and row["embedding_version"] is None:
+            # Databases previously upgraded by the compatibility path may
+            # already have v2 columns while still carrying an unversioned v1
+            # vector.  Preserve their raw content without downgrading native v2
+            # rows created in the same database.
+            db.execute(
+                """UPDATE stories SET legacy_raw = content,
+                          abstract_status = 'pending'
+                   WHERE id = ?""",
+                (row["id"],),
             )
         if metadata_was_legacy:
             # An unversioned v0.1 BLOB has no trustworthy model/input/hash
@@ -857,7 +931,9 @@ def _revision_snapshot(row: sqlite3.Row | dict) -> dict:
     return {
         "title": data.get("title"),
         "abstract": data.get("abstract") or "",
+        "abstract_status": data.get("abstract_status") or "ready",
         "content": data.get("content") or "",
+        "legacy_raw": data.get("legacy_raw"),
         "detail": _json_load(data.get("detail_json"), {}),
         "sources": _json_load(data.get("sources_json"), []),
         "keywords": _json_load(data.get("keywords"), []),
@@ -1767,7 +1843,7 @@ def update_story(story_id: int, title: str = None, content: str = None,
             changed_fields.append("title")
         if abstract is not None:
             bounded, _ = story_v2.bound_abstract(abstract)
-            sets.append("abstract = ?")
+            sets.extend(("abstract = ?", "abstract_status = 'ready'"))
             params.append(bounded)
             changed_fields.append("abstract")
 

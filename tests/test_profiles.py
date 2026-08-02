@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from storybook import config, performance
+from storybook import config, performance, store
 from storybook.cli import cli
 from storybook.profiles import (
     DEFAULT_SYNC_STATE,
@@ -140,6 +140,58 @@ class TestProfileRegistry:
         assert registry.active_profile().id == isolated.id
         assert registry.active_paths().database != registry.paths_for(original).database
 
+    def test_database_generation_pointer_is_relative_and_atomic(self, tmp_path):
+        registry = ProfileRegistry(
+            tmp_path / "config" / "profiles.json", roots=_roots(tmp_path)
+        )
+        profile = registry.active_profile()
+
+        updated = registry.set_profile_database(
+            profile.id, "migrations/test-generation/v2.db"
+        )
+
+        assert updated.database_ref == "migrations/test-generation/v2.db"
+        assert registry.active_profile().database_ref == updated.database_ref
+        assert registry.active_paths().database == (
+            tmp_path / "data" / "profiles" / profile.id
+            / "migrations" / "test-generation" / "v2.db"
+        )
+        payload = json.loads(registry.path.read_text(encoding="utf-8"))
+        assert str(tmp_path) not in json.dumps(payload)
+
+    def test_database_generation_pointer_compare_and_swap_rejects_drift(
+        self, tmp_path
+    ):
+        registry = ProfileRegistry(
+            tmp_path / "config" / "profiles.json", roots=_roots(tmp_path)
+        )
+        profile = registry.active_profile()
+        registry.set_profile_database(profile.id, "migrations/a/v2.db")
+
+        with pytest.raises(ProfileError, match="已变化"):
+            registry.set_profile_database(
+                profile.id,
+                "migrations/b/v2.db",
+                expected_database_ref="db/memory.db",
+            )
+
+        assert registry.active_profile().database_ref == "migrations/a/v2.db"
+
+    @pytest.mark.parametrize(
+        "database_ref",
+        ["/tmp/memory.db", "C:/temp/memory.db", "../memory.db", "db/not-sqlite"],
+    )
+    def test_database_generation_pointer_rejects_unsafe_paths(
+        self, tmp_path, database_ref
+    ):
+        registry = ProfileRegistry(
+            tmp_path / "config" / "profiles.json", roots=_roots(tmp_path)
+        )
+        profile = registry.active_profile()
+
+        with pytest.raises(ProfileError, match="database_ref"):
+            registry.set_profile_database(profile.id, database_ref)
+
     def test_duplicate_names_and_invalid_modes_are_rejected(self, tmp_path):
         registry = ProfileRegistry(
             tmp_path / "config" / "profiles.json", roots=_roots(tmp_path)
@@ -252,3 +304,24 @@ class TestProfileCLI:
         assert written is True
         assert config.PERFORMANCE_LOG_PATH.is_file()
         assert not original_log.exists()
+
+    def test_long_running_process_follows_database_generation_pointer(
+        self, isolated_config
+    ):
+        profile = isolated_config.active_profile()
+        old_database = config.DB_PATH
+        database_ref = "migrations/generation-a/v2.db"
+        target = (
+            isolated_config.paths_for(profile).root
+            / "migrations" / "generation-a" / "v2.db"
+        )
+        store.init_db(target, profile_id=profile.id)
+
+        isolated_config.set_profile_database(profile.id, database_ref)
+        assert config.DB_PATH == old_database  # current process is stale so far
+
+        db = store.get_db()
+        db.close()
+
+        assert config.DB_PATH == target
+        assert config.ACTIVE_PROFILE.database_ref == database_ref
