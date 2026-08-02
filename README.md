@@ -8,7 +8,7 @@
 
 Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JSON 文件或内置模拟器），对每条会话跑一遍 **做梦周期（dream cycle）**：按“独立可复用结论 + 环境适用性”形成一个或多个 Story v2。每条 Story 保存 `title + abstract + structured detail + sources`；detail 与证据不硬截断，只有用于检索/展示的 abstract 有预算，并与已有记忆按相似度**合并 / 更新 / 新建**。
 
-检索时，以向量/词法直接命中为 seed，在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。每条图命中都返回 seed、完整路径、边 provenance 和分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
+检索时，Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。Auto 仅在 zero/low-confidence、复合、跨语言或强环境歧义时进入独立预算的 Query Transformation/HyDE 第二阶段；Deep 必须由调用方显式选择。每条结果返回来源路径与分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
 
 整个系统**完全离线**：LLM 与 embedding 都走本地 Ollama，不依赖任何云端服务。
 
@@ -17,9 +17,9 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🧠 **语义边界记忆整理**：长而不可拆的经历保持完整；短会话中的多个独立结论拆成多条 Story，并共享来源 Session
 - 🔗 **可解释 Memory Graph**：`semantic` / `temporal` / `causal` / `same_environment` / `parent_child` / `co_recall` / `supersedes` 多类型边，有明确方向、provenance、版本与软删除规则
 - 📐 **可演进双索引**：当前 `story_vectors` 持续服务，模型/版本切换先增量写 shadow，完整后原子切换；失败可续跑
-- 🔍 **低时延联想检索**：MCP 启动预热 + Ollama keep-alive；按 `index_version` 失效的查询向量/结果双缓存；向量不可用或超时时在独立 500ms 预算内切到 FTS/关键词 fallback
+- 🔍 **自适应 Hybrid Search**：Fast 无生成式调用，融合 vector + FTS/关键词 + environment + Graph；Auto 按可解释门控启用 rewrite/multi-query/HyDE；Deep 使用显式高预算；任一组件失败均保留可用 fallback
 - 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
-- 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 同时守护检索质量
+- 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/lexical/fusion/transform/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 与离线策略消融同时守护质量/时延
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
 - 🏠 **完全离线**：只需本地 Ollama，零云端依赖
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
@@ -47,9 +47,13 @@ collector → store → processor (用 llm + embeddings) → search
 
 ### 检索（`search.search`）
 
-直接 embed 查询文本 → vec0 top-K（扩大候选后按 `SIM_THRESHOLD_SEARCH=0.50` 过滤）→ 以直接命中为 seed 执行有界 Graph RAG → 合并去重、环境软加权并排序。`graph_enabled=false` 可回退到直接检索；预算用尽时保留已有结果并返回顶层 `truncated=true` 及原因。
+Fast：query normalization → vector + FTS/关键词 → 加权 RRF → 环境软加权 → 有界 Graph RAG → 本地 top-N rerank。Fast 不调用生成式 LLM；`graph_enabled=false` 可关闭图扩散。
 
-查询响应包含 `request_id`、`mode`、`degraded` 与 `latency_ms.{cache,embed,vector,graph,rerank,serialize,total}`。同一份阶段数据会写入本地 `logs/query_performance.jsonl`，但落盘接口只接受固定白名单字段：不保存原始 query、Story 内容、绝对路径、hostname 或仓库 URL。文件权限为 `0600`，超过大小上限后只保留最近记录。
+Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambiguous_ranking`、`long_compound_query`、`cross_language`、`environment_ambiguity` 等稳定原因决定是否调用一次本地 LLM，生成 rewrite、multi-query 或 HyDE 辅助表示。第二阶段有独立 deadline，超时后原 Fast 结果立即作为 fallback 返回。Deep 显式启用三种 transformation、更高 Graph 预算及 5s 总预算。
+
+本地 reranker 只处理有界 top-N，具有独立超时、连续失败熔断与冷却恢复；故障时返回 fusion/graph 排名并标明 `reranker_timeout` / `reranker_unavailable` / `reranker_circuit_open`，不会伪装成“无记忆”。
+
+查询响应保留兼容字段 `mode=cache|vector|lexical_fallback`，并新增 `retrieval_mode=fast|auto|deep`、`transform_used`、`query_plan`、`transform_trace`、`rerank_trace`、`degraded_reasons`。每条 match 返回 `source_paths` 与 `score_components`（vector/lexical/RRF/graph/environment/rerank）。同一份阶段数据会写入本地 `logs/query_performance.jsonl`，但落盘接口只接受固定白名单字段：不保存原始 query、Story 内容、绝对路径、hostname 或仓库 URL。文件权限为 `0600`，超过大小上限后只保留最近记录。
 
 ### 关联图
 
@@ -224,13 +228,13 @@ PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段�
 作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染用户 Profile 数据库。
 
 ```bash
-storybook eval all                              # 跑全部四轮评测（默认）
+storybook eval all                              # 跑全部五轮评测（默认）
 storybook eval retrieval                        # 仅检索评测
 storybook eval all --report data/eval_reports/baseline.json   # 落盘 JSON 报告，便于阈值调整前后对比
 python scripts/eval.py retrieval                # 等价独立脚本（未做 editable 安装时用）
 ```
 
-四轮评测：
+五轮评测：
 
 1. **retrieval** — 用 `data/retrieval_benchmark.json`（24 topic × 3 查询变体 = 72 对，含精确术语 / 同义改写 / 跨语言 EN↔ZH + 负例），
    真实 embedding 索引人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、负例特异性，并判定是否达 recall@3≥70%。
@@ -239,6 +243,7 @@ python scripts/eval.py retrieval                # 等价独立脚本（未做 ed
    （duplicate 应并入、distinct 应新建），输出 `SIM_THRESHOLD_HIGH` 阈值敏感性曲线。隔离度量 0.85/0.92 阈值，排除 LLM 关键词质量波动。
 3. **split** — 真实 embedding + 确定性 LLM 桩，度量分裂路径结构正确性（父向量移除、父子边 1.0、子向量入索引、子 story 可检索）。
 4. **ablation** — 比较 legacy、默认 `title+abstract+applicability`、全文单向量、title/abstract/applicability 分字段多向量；按 exact/synonym/cross-tool/cross-language 报告 recall@3/MRR 与索引/查询时延。
+5. **strategy** — 累积比较 direct-vector、hybrid、+graph、+rewrite、+HyDE、+reranker；按 exact/synonym/cross-language/cross-tool/ambiguous 报告 recall@3/MRR/p95。只有 hard-query 质量提升、overall 非劣与 fast/deep 时延门槛同时通过的策略才标记 `eligible_for_default=true`。
 
 Story v2 固定报告（2026-08-02，`data/eval_reports/story-v2-ablation-2026-08-02.json`）：四种表示在 24 topic × 4 分组上 recall@3/MRR 均为 100%；默认表示相对 legacy 为 `0.00pp`，通过“下降不超过 2pp”门槛。默认单向量索引均值 84.4ms/story，明显低于全文 205.2ms 与多向量 223.7ms；多向量检索 p95 0.94ms，高于默认 0.34ms，因此选择默认表示。
 
@@ -248,6 +253,10 @@ Memory Graph 固定报告（2026-08-02，`data/eval_reports/memory-graph-2026-08
 python -m storybook.graph_eval --stories 10000 --repeats 200 \
   --output data/eval_reports/memory-graph.json
 ```
+
+自适应检索固定报告（2026-08-02，`data/eval_reports/adaptive-retrieval-2026-08-02.json`）使用 24 topic × 5 分组。ambiguous 组模拟“只记得 outcome/指标、不记得问题名与工具”的经历召回：direct-vector hard recall@3 为 `87.5%`、overall 为 `90%`；`hybrid + graph + rewrite/HyDE` 的 hard/overall recall@3 均为 `100%`（hard `+12.5pp`），MRR `0.8875 → 0.9958`，本机离线累计 p95 `343.4ms`，同时通过质量、overall 非劣与 Deep ≤5s 门禁。本地 reranker 在该基准未产生额外质量收益，因而未优先于 HyDE 栈。
+
+10k Story 固定性能报告为 `data/perf_reports/flo152-warm.json`：并发 1/5 的 cache lane p95 `4.806/3.855ms`，vector/hybrid lane p95 `120.265/552.935ms`，recall@3/MRR 均为 `100%/1.0`。`data/perf_reports/flo152-deep-smoke.json` 是 6 查询×1、并发 1 的 Deep smoke：总 p95 `4.307s`、recall@3 `100%`；本机 9B LLM 在短生成 deadline 内会超时，并与 embedding 模型发生内存换入竞争，响应因此明确降级到 Fast/lexical 结果。该 smoke 证明总预算与 fallback，不把它冒充为生成式质量证据；rewrite/HyDE 的质量选择以离线消融及自动化故障注入为准。
 
 当前基线（2026-07-19，`data/eval_reports/baseline-2026-07-19.json`）：recall@3 = 100% ✅ 达标；
 合并正确率 85.7%（`dup-docker-dns` sim 0.83 落在 0.85 阈值下方被误判为 create，阈值敏感性显示 0.82 可达 100%）；
@@ -305,8 +314,8 @@ storybook process [--session ID]     # 做梦周期：处理所有 pending 会�
 storybook process --watch [--interval N]  # 监听模式：轮询 ~/.claude/projects，有新会话自动采集+加工（长驻）
 storybook dream --once                # 单次完整做梦周期（采集+加工）后退出；launchd/cron 入口
 storybook dream [--interval N]        # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
-storybook search "<query>" [--top 3] [--context auto|none] [--scope profile|strict]
-                                    # 向量检索 + 环境软加权；strict 才硬过滤
+storybook search "<query>" [--top 3] [--mode fast|auto|deep] [--no-transform] [--no-rerank]
+                                    # 默认 fast；auto 门控增强；deep 显式高预算
 storybook status --performance       # 最近 100 次查询 p50/p95、cache/fallback 比例
 storybook benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质量基准
 storybook stats                      # 系统统计
@@ -541,6 +550,12 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `STORYBOOK_QUERY_WARM_TIMEOUT_SECONDS` | `2` | warm embedding 硬超时，超时即降级 |
 | `STORYBOOK_QUERY_COLD_TIMEOUT_SECONDS` | `5` | cold embedding 硬超时，超时即降级 |
 | `STORYBOOK_QUERY_FALLBACK_TIMEOUT_SECONDS` | `0.5` | FTS/关键词 fallback 独立硬超时 |
+| `STORYBOOK_QUERY_DEFAULT_MODE` | `fast` | 默认检索模式；Fast 永不调用生成式 LLM |
+| `STORYBOOK_QUERY_TRANSFORM_ENABLED` | `1` | Query Transformation/HyDE 总开关 |
+| `STORYBOOK_QUERY_AUTO_CONFIDENCE_THRESHOLD` | `0.62` | Auto 低置信第二阶段门槛 |
+| `STORYBOOK_QUERY_AUTO_SECOND_STAGE_TIMEOUT_SECONDS` | `2.0` | Auto 生成+扩展检索独立预算 |
+| `STORYBOOK_QUERY_DEEP_TOTAL_TIMEOUT_SECONDS` | `5.0` | Deep 总预算，超时保留 Fast fallback |
+| `STORYBOOK_RERANK_ENABLED` / `TOP_N` / `TIMEOUT_SECONDS` | `1` / `20` / `0.08` | 本地有界 reranker 与独立超时 |
 | `STORYBOOK_GRAPH_ENABLED` | `1` | 默认启用 Graph RAG；`0` 仅返回直接检索 |
 | `STORYBOOK_GRAPH_MAX_HOPS` / `MAX_PATHS` / `FAN_OUT` | `2` / `64` / `8` | 图扩散结构预算 |
 | `STORYBOOK_GRAPH_TIME_BUDGET_MS` | `100` | 图扩散墙钟预算，用尽时返回 `truncated=true` |
@@ -566,7 +581,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `PRIME_TOKEN_BUDGET` | 2000 | 晨间简报 token 预算上限（≤2k，避免污染上下文） |
 | `PRIME_CONTENT_EXCERPT_CHARS` | 140 | 晨间简报中每条 Story 摘要最大字符数 |
 
-LLM 调用参数（temp 0.3、`num_ctx` 8192、120s 超时）硬编码在 `llm._chat` / `_generate` 中。
+记忆形成 LLM 使用 temp 0.3、`num_ctx` 8192 与 120s 超时；查询 transformation 把 Auto/Deep 的独立短 deadline 同时传入 HTTP 客户端。
 
 ## 📁 项目结构
 

@@ -96,6 +96,7 @@ def _build_recall_result(result: dict) -> dict:
             "keywords": m["keywords"],
             "similarity": m["similarity"],
             "score": m.get("score", m["similarity"]),
+            "fusion_score": m.get("fusion_score", m.get("score", m["similarity"])),
             "environment_score": m.get("environment_score", 0.0),
             "environment": m.get("environment"),
             "environments": m.get("environments", []),
@@ -105,6 +106,7 @@ def _build_recall_result(result: dict) -> dict:
             "seed_story_id": m.get("seed_story_id", m["story_id"]),
             "graph_path": m.get("graph_path", []),
             "score_components": m.get("score_components", {}),
+            "source_paths": m.get("source_paths", []),
             "related": _trim_related(m.get("related", [])),
         })
     return {
@@ -113,8 +115,10 @@ def _build_recall_result(result: dict) -> dict:
         "matches": matches,
         "request_id": result.get("request_id"),
         "mode": result.get("mode", "vector"),
+        "retrieval_mode": result.get("retrieval_mode", "fast"),
         "degraded": bool(result.get("degraded")),
         "degraded_reason": result.get("degraded_reason"),
+        "degraded_reasons": result.get("degraded_reasons", []),
         "result_state": result.get("result_state", "results" if matches else "no_match"),
         "fallback_status": result.get("fallback_status"),
         "cache_hit": bool(result.get("cache_hit")),
@@ -126,6 +130,10 @@ def _build_recall_result(result: dict) -> dict:
         "truncated": bool(result.get("truncated")),
         "truncated_reasons": result.get("truncated_reasons", []),
         "graph_trace": result.get("graph_trace", {}),
+        "transform_used": result.get("transform_used", []),
+        "query_plan": result.get("query_plan", {}),
+        "transform_trace": result.get("transform_trace", {}),
+        "rerank_trace": result.get("rerank_trace", {}),
     }
 
 
@@ -139,6 +147,9 @@ def recall_memories(
     context: dict | None = None,
     scope: str = "profile",
     graph_enabled: bool | None = None,
+    retrieval_mode: str = "fast",
+    transform_enabled: bool | None = None,
+    rerank_enabled: bool | None = None,
 ) -> dict:
     """召回与查询相关的记忆（向量检索 + 关联激活）。
 
@@ -159,6 +170,9 @@ def recall_memories(
         context=context,
         scope=scope,
         graph_enabled=graph_enabled,
+        retrieval_mode=retrieval_mode,
+        transform_enabled=transform_enabled,
+        rerank_enabled=rerank_enabled,
     )
     return _build_recall_result(result)
 
@@ -257,6 +271,9 @@ def create_server():
         context: dict | None = None,
         scope: str = "profile",
         graph_enabled: bool | None = None,
+        retrieval_mode: str = "fast",
+        transform_enabled: bool | None = None,
+        rerank_enabled: bool | None = None,
     ) -> dict:
         """召回与当前任务/问题相关的记忆（向量检索 + 关联激活）。
 
@@ -271,6 +288,9 @@ def create_server():
             context: 可选 ContextEnvelope；缺省时仅按 Profile 语义召回。
             scope: profile（默认软加权）或 strict（环境冲突硬过滤）。
             graph_enabled: 是否启用受预算图扩散；缺省跟随本地配置，false 回退直接检索。
+            retrieval_mode: fast（无生成式 LLM）、auto（按门控进入第二阶段）或 deep（显式深度召回）。
+            transform_enabled: 可选总开关；false 时 auto/deep 只返回 fast fallback。
+            rerank_enabled: 可选本地 reranker 开关；故障时保留融合结果。
         """
         return recall_memories(
             query,
@@ -278,6 +298,9 @@ def create_server():
             context=context,
             scope=scope,
             graph_enabled=graph_enabled,
+            retrieval_mode=retrieval_mode,
+            transform_enabled=transform_enabled,
+            rerank_enabled=rerank_enabled,
         )
 
     @mcp.tool()

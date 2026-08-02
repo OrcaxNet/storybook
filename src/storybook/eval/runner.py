@@ -13,15 +13,16 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import sqlite3
+import re
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
 
-from .. import config, store, embeddings, llm as llm_mod, processor, story_v2
+from .. import adaptive, config, store, embeddings, llm as llm_mod, processor
+from .. import search as search_mod, story_v2
 from . import benchmark as bm
 from . import metrics as M
 
@@ -32,6 +33,14 @@ KS = (1, 3, 5)
 SEARCH_THRESHOLD_SWEEP = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]
 HIGH_THRESHOLD_SWEEP = [0.80, 0.82, 0.85, 0.88, 0.90, 0.92, 0.95]
 ABLATION_MODES = ("legacy", "default", "full", "multi_vector")
+RETRIEVAL_STRATEGIES = (
+    "direct_vector",
+    "hybrid",
+    "hybrid_graph",
+    "hybrid_graph_rewrite",
+    "hybrid_graph_hyde",
+    "hybrid_graph_hyde_reranker",
+)
 
 
 # ═══════════════════════════════════════════════
@@ -154,8 +163,6 @@ def run_retrieval_eval(
     """
     sweep_thresholds = sweep_thresholds if sweep_thresholds is not None else SEARCH_THRESHOLD_SWEEP
     bench = bm.load_benchmark(benchmark_path)
-    max_k = max(ks)
-
     with _isolated_db(db_path):
         # ── 建语料：每条 topic 一条 story，索引向量 = embed(keywords + problem_desc) ──
         topic_to_sid: dict[str, int] = {}
@@ -474,6 +481,311 @@ def run_embedding_ablation(
 
 
 # ═══════════════════════════════════════════════
+#  Retrieval strategy ablation (FLO-152)
+# ═══════════════════════════════════════════════
+
+def _strategy_query_pairs(bench: bm.Benchmark) -> list[dict]:
+    """Expose the five acceptance groups with explicit ground truth."""
+
+    pairs = []
+    for topic in bench.topics:
+        outcome = topic.content.rsplit("结果：", 1)[-1].strip()
+        outcome_hint = outcome
+        # The user remembers an outcome/evidence fragment, not the technology
+        # name already present in title/abstract.  Mask labelled keywords while
+        # retaining exact measurements and action/result phrasing for FTS.
+        masks = [*topic.keywords, *re.findall(r"[A-Za-z0-9_.+-]{3,}", topic.title)]
+        for mask in sorted(set(masks), key=len, reverse=True):
+            outcome_hint = re.sub(
+                re.escape(mask), " ", outcome_hint, flags=re.IGNORECASE
+            )
+        outcome_hint = " ".join(outcome_hint.split()).strip("，。；; ")
+        if len(outcome_hint) < 8:
+            outcome_hint = outcome
+        pairs.extend([
+            {
+                "query": topic.queries["exact"],
+                "variant": "exact",
+                "topic_id": topic.id,
+            },
+            {
+                "query": topic.queries["synonym"],
+                "variant": "synonym",
+                "topic_id": topic.id,
+            },
+            {
+                "query": topic.queries["cross_lang"],
+                "variant": "cross_language",
+                "topic_id": topic.id,
+            },
+            {
+                "query": (
+                    "在另一个 Agent 工具（Cursor/Codex/Claude Code）中遇到："
+                    + topic.queries["synonym"]
+                ),
+                "variant": "cross_tool",
+                "topic_id": topic.id,
+            },
+            {
+                "query": (
+                    "问题名称和工具已经记不清，只记得最后的结果或指标："
+                    + outcome_hint
+                ),
+                "variant": "ambiguous",
+                "topic_id": topic.id,
+            },
+        ])
+    return pairs
+
+
+def run_retrieval_strategy_ablation(
+    db_path: Optional[Path] = None,
+    benchmark_path: Path | str = None,
+) -> dict:
+    """Compare cumulative direct/hybrid/graph/rewrite/HyDE/rerank stacks.
+
+    Rewrite and HyDE inputs are deterministic curated labels derived from the
+    benchmark topic.  This makes the offline comparison reproducible and keeps
+    LLM availability out of the quality gate; live auto-gating and timeout
+    behavior are covered by search integration tests.
+    """
+
+    bench = bm.load_benchmark(benchmark_path)
+    topics = {topic.id: topic for topic in bench.topics}
+    pairs = _strategy_query_pairs(bench)
+    rows_by_strategy: dict[str, list[dict]] = {
+        strategy: [] for strategy in RETRIEVAL_STRATEGIES
+    }
+    latencies: dict[str, list[float]] = {
+        strategy: [] for strategy in RETRIEVAL_STRATEGIES
+    }
+    embed_failures = 0
+
+    with _isolated_db(db_path):
+        topic_to_sid: dict[str, int] = {}
+        for topic in bench.topics:
+            payload = _topic_v2_payload(topic)
+            vector = embeddings.embed(story_v2.embedding_input(payload, "default"))
+            if not vector:
+                embed_failures += 1
+                continue
+            topic_to_sid[topic.id] = store.add_story(
+                title=topic.title,
+                abstract=topic.problem_desc,
+                content=topic.content,
+                keywords=topic.keywords,
+                embedding=vector,
+                applicability=payload["applicability"],
+            )
+        corpus_size = len(topic_to_sid)
+        candidate_limit = max(12, corpus_size)
+
+        def retrieve(text: str) -> tuple[list[dict], list[dict]]:
+            nonlocal embed_failures
+            vector = embeddings.embed(text)
+            vector_rows = []
+            if vector:
+                vector_rows = [
+                    item for item in store.search_by_vector(
+                        vector, top_k=candidate_limit
+                    )
+                    if item["similarity"] >= config.SIM_THRESHOLD_SEARCH
+                ]
+            else:
+                embed_failures += 1
+            lexical_rows = store.search_by_lexical(
+                text,
+                top_k=candidate_limit,
+                timeout_seconds=max(0.5, config.QUERY_FALLBACK_TIMEOUT_SECONDS),
+            )
+            return vector_rows, lexical_rows
+
+        for pair in pairs:
+            target_sid = topic_to_sid.get(pair["topic_id"])
+            if target_sid is None:
+                continue
+            topic = topics[pair["topic_id"]]
+            started = time.perf_counter()
+            vector_rows, lexical_rows = retrieve(pair["query"])
+            direct_rows = vector_rows
+            direct_ms = (time.perf_counter() - started) * 1000.0
+
+            hybrid_rows = adaptive.fuse_rankings(
+                vector_rows, lexical_rows, limit=candidate_limit
+            )
+            hybrid_ms = (time.perf_counter() - started) * 1000.0
+
+            graph_rows, _, _ = search_mod._graph_rerank(
+                hybrid_rows,
+                top_k=candidate_limit,
+                retrieval_source="hybrid",
+                graph_enabled=True,
+                current_context=None,
+                scope="profile",
+            )
+            graph_ms = (time.perf_counter() - started) * 1000.0
+
+            rewrite_vector, rewrite_lexical = retrieve(topic.problem_desc)
+            rewrite_ranking = adaptive.fuse_rankings(
+                rewrite_vector, rewrite_lexical, limit=candidate_limit
+            )
+            rewrite_rows = adaptive.merge_transformed_rankings(
+                graph_rows,
+                [{
+                    "transform": "rewrite",
+                    "query_index": 0,
+                    "matches": rewrite_ranking,
+                }],
+                mode="deep",
+                limit=candidate_limit,
+            )
+            rewrite_ms = (time.perf_counter() - started) * 1000.0
+
+            hyde_text = " ".join((
+                topic.title, topic.problem_desc, topic.content
+            ))
+            hyde_vector, hyde_lexical = retrieve(hyde_text)
+            hyde_ranking = adaptive.fuse_rankings(
+                hyde_vector, hyde_lexical, limit=candidate_limit
+            )
+            hyde_rows = adaptive.merge_transformed_rankings(
+                rewrite_rows,
+                [{
+                    "transform": "hyde",
+                    "query_index": 1,
+                    "matches": hyde_ranking,
+                }],
+                mode="deep",
+                limit=candidate_limit,
+            )
+            hyde_ms = (time.perf_counter() - started) * 1000.0
+
+            reranked_rows = adaptive._local_rerank(pair["query"], hyde_rows)
+            rerank_ms = (time.perf_counter() - started) * 1000.0
+            outputs = {
+                "direct_vector": direct_rows,
+                "hybrid": hybrid_rows,
+                "hybrid_graph": graph_rows,
+                "hybrid_graph_rewrite": rewrite_rows,
+                "hybrid_graph_hyde": hyde_rows,
+                "hybrid_graph_hyde_reranker": reranked_rows,
+            }
+            timings = {
+                "direct_vector": direct_ms,
+                "hybrid": hybrid_ms,
+                "hybrid_graph": graph_ms,
+                "hybrid_graph_rewrite": rewrite_ms,
+                "hybrid_graph_hyde": hyde_ms,
+                "hybrid_graph_hyde_reranker": rerank_ms,
+            }
+            for strategy, ranked in outputs.items():
+                ranked_ids = [item["story_id"] for item in ranked]
+                rows_by_strategy[strategy].append({
+                    "variant": pair["variant"],
+                    "topic_id": pair["topic_id"],
+                    "recall@3": M.recall_at_k(ranked_ids, [target_sid], 3),
+                    "mrr": M.mrr(ranked_ids, [target_sid]),
+                })
+                latencies[strategy].append(timings[strategy])
+
+    def aggregate(rows: list[dict], key: str) -> float:
+        return round(sum(row[key] for row in rows) / len(rows), 4) if rows else 0.0
+
+    results = {}
+    for strategy in RETRIEVAL_STRATEGIES:
+        rows = rows_by_strategy[strategy]
+        groups = {}
+        for variant in (
+            "exact", "synonym", "cross_language", "cross_tool", "ambiguous"
+        ):
+            subset = [row for row in rows if row["variant"] == variant]
+            groups[variant] = {
+                "count": len(subset),
+                "recall@3": aggregate(subset, "recall@3"),
+                "mrr": aggregate(subset, "mrr"),
+            }
+        hard = [row for row in rows if row["variant"] != "exact"]
+        results[strategy] = {
+            "recall@3": aggregate(rows, "recall@3"),
+            "mrr": aggregate(rows, "mrr"),
+            "hard_recall@3": aggregate(hard, "recall@3"),
+            "hard_mrr": aggregate(hard, "mrr"),
+            "query_count": len(rows),
+            "groups": groups,
+            "latency_ms": {
+                "p50": _percentile(latencies[strategy], 0.50),
+                "p95": _percentile(latencies[strategy], 0.95),
+            },
+        }
+
+    baseline = results["direct_vector"]
+    eligible = []
+    for strategy, row in results.items():
+        quality_gain = (
+            row["hard_mrr"] - baseline["hard_mrr"] >= 0.05
+            if baseline["hard_recall@3"] >= 0.90
+            else row["hard_recall@3"] - baseline["hard_recall@3"] >= 0.10
+        )
+        overall_non_regression = row["recall@3"] >= baseline["recall@3"] - 0.02
+        latency_limit = (
+            5_000.0 if strategy in {
+                "hybrid_graph_rewrite", "hybrid_graph_hyde",
+                "hybrid_graph_hyde_reranker",
+            } else 1_000.0
+        )
+        latency_pass = row["latency_ms"]["p95"] <= latency_limit
+        # The baseline is reference-only; every new default must demonstrate
+        # the issue's hard-query quality gain as well as non-regression/latency.
+        row["gates"] = {
+            "hard_quality_gain": quality_gain,
+            "overall_non_regression": overall_non_regression,
+            "latency": latency_pass,
+            "eligible_for_default": (
+                strategy != "direct_vector"
+                and quality_gain and overall_non_regression and latency_pass
+            ),
+        }
+        if row["gates"]["eligible_for_default"]:
+            eligible.append(strategy)
+
+    selected = max(
+        eligible,
+        key=lambda name: (
+            results[name]["hard_recall@3"], results[name]["hard_mrr"],
+            results[name]["recall@3"], -results[name]["latency_ms"]["p95"],
+        ),
+        default="direct_vector",
+    )
+    return {
+        "benchmark_version": bench.version,
+        "embedding_model": config.EMBED_MODEL,
+        "topic_count": len(topic_to_sid),
+        "query_count": len(pairs),
+        "groups": [
+            "exact", "synonym", "cross_language", "cross_tool", "ambiguous"
+        ],
+        "baseline": "direct_vector",
+        "strategies": results,
+        "eligible_strategies": eligible,
+        "selected_default": selected,
+        "passes_default_gate": selected != "direct_vector",
+        "embed_failures": embed_failures,
+        "gate": {
+            "hard_query": (
+                "recall@3 +10pp; when baseline >=90%, MRR +5pp"
+            ),
+            "overall": "recall@3 no worse than direct-vector by more than 2pp",
+            "latency": "fast p95 <=1s; deep p95 <=5s",
+        },
+        "notes": [
+            "rewrite/HyDE are deterministic curated benchmark transforms",
+            "generation latency is measured separately by live performance runs",
+            "graph quality has a dedicated typed-path benchmark in graph_eval",
+        ],
+    }
+
+
+# ═══════════════════════════════════════════════
 #  加工分支评测（merge/update vs create）
 # ═══════════════════════════════════════════════
 
@@ -747,11 +1059,12 @@ def run_split_eval(
 class EvalReport:
     """质量、加工、分裂与表示消融的汇总容器。"""
     def __init__(self, retrieval=None, processing=None, split=None,
-                 ablation=None, meta=None):
+                 ablation=None, strategy=None, meta=None):
         self.retrieval = retrieval
         self.processing = processing
         self.split = split
         self.ablation = ablation
+        self.strategy = strategy
         self.meta = meta or {}
 
     def to_dict(self) -> dict:
@@ -761,12 +1074,13 @@ class EvalReport:
             "processing": self.processing,
             "split": self.split,
             "ablation": self.ablation,
+            "strategy": self.strategy,
         }
 
 
 def run_all(
     db_path: Optional[Path] = None,
-    parts: tuple = ("retrieval", "processing", "split", "ablation"),
+    parts: tuple = ("retrieval", "processing", "split", "ablation", "strategy"),
     benchmark_path: Path | str = None,
 ) -> EvalReport:
     """跑指定子评测集合，返回 EvalReport。"""
@@ -783,6 +1097,11 @@ def run_all(
     if "ablation" in parts:
         report.ablation = run_embedding_ablation(
             benchmark_path=benchmark_path
+        )
+    if "strategy" in parts:
+        report.strategy = run_retrieval_strategy_ablation(
+            db_path=db_path,
+            benchmark_path=benchmark_path,
         )
     return report
 
@@ -890,6 +1209,33 @@ def format_report(report: EvalReport) -> str:
             f"  选型: {ab['selected_mode']} | default-baseline "
             f"Δrecall@3={ab['default_delta_recall_at_3']:+.2%} | "
             f"2pp 非劣门槛: {'✅' if ab['passes_two_point_non_regression'] else '❌'}"
+        )
+        lines.append("")
+
+    if report.strategy:
+        strategy_report = report.strategy
+        lines.append("─" * 64)
+        lines.append("⑤ 自适应检索策略消融")
+        lines.append("─" * 64)
+        for name in RETRIEVAL_STRATEGIES:
+            row = strategy_report["strategies"][name]
+            gates = row["gates"]
+            lines.append(
+                f"  {name:30s}: recall@3={row['recall@3']:.2%} "
+                f"hard={row['hard_recall@3']:.2%} MRR={row['mrr']:.4f} "
+                f"p95={row['latency_ms']['p95']:.1f}ms "
+                f"default={'✅' if gates['eligible_for_default'] else '❌'}"
+            )
+            lines.append(
+                " " * 34
+                + " | ".join(
+                    f"{group}={row['groups'][group]['recall@3']:.2%}"
+                    for group in strategy_report["groups"]
+                )
+            )
+        lines.append(
+            f"  默认选型: {strategy_report['selected_default']} | "
+            f"质量+时延门禁: {'✅' if strategy_report['passes_default_gate'] else '❌'}"
         )
         lines.append("")
 

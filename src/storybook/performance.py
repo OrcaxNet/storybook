@@ -21,13 +21,23 @@ from . import config
 logger = logging.getLogger(__name__)
 
 LATENCY_STAGES = (
-    "cache", "embed", "vector", "fallback", "graph", "rerank", "serialize", "total"
+    "cache", "embed", "vector", "lexical", "fusion", "transform", "fallback",
+    "graph", "rerank", "serialize", "total"
 )
 _VALID_MODES = {"cache", "vector", "lexical_fallback", "unavailable", "error"}
 _VALID_DEGRADED_REASONS = {
     "embedding_unavailable",
     "embedding_timeout",
     "vector_index_unavailable",
+    "lexical_index_unavailable",
+    "query_transform_timeout",
+    "query_transform_unavailable",
+    "transformed_embedding_timeout",
+    "transformed_embedding_unavailable",
+    "reranker_timeout",
+    "reranker_unavailable",
+    "reranker_circuit_open",
+    "graph_unavailable",
     "write_feedback_failed",
 }
 _MAX_LOG_BYTES = 2 * 1024 * 1024

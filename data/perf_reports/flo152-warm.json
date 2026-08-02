@@ -1,0 +1,481 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-08-02T02:16:12.540124+00:00",
+  "machine": {
+    "os": "Darwin",
+    "os_release": "25.3.0",
+    "arch": "arm64",
+    "cpu": "arm",
+    "cpu_count": 10,
+    "memory_bytes": 17179869184
+  },
+  "model": {
+    "embedding": "qwen3-embedding:0.6b",
+    "dimension": 1024,
+    "state": "warm",
+    "retrieval_mode": "fast"
+  },
+  "dataset": {
+    "stories": 10000,
+    "seed": 20260729,
+    "query_count": 50,
+    "variants": [
+      "exact",
+      "synonym",
+      "cross_lang"
+    ],
+    "database_bytes": 90251264
+  },
+  "workload": {
+    "repeats_per_query": 20,
+    "concurrencies": [
+      1,
+      5
+    ],
+    "requests_per_scenario": 1000
+  },
+  "scenarios": [
+    {
+      "concurrency": 1,
+      "sample_count": 1000,
+      "latency_ms": {
+        "cache": {
+          "p50": 0.064,
+          "p95": 0.101,
+          "p99": 0.111
+        },
+        "embed": {
+          "p50": 0.0,
+          "p95": 3.325,
+          "p99": 75.223
+        },
+        "vector": {
+          "p50": 0.0,
+          "p95": 0.324,
+          "p99": 6.811
+        },
+        "lexical": {
+          "p50": 0.0,
+          "p95": 0.213,
+          "p99": 29.924
+        },
+        "fusion": {
+          "p50": 0.0,
+          "p95": 0.001,
+          "p99": 0.037
+        },
+        "transform": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "fallback": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "graph": {
+          "p50": 0.0,
+          "p95": 0.048,
+          "p99": 2.244
+        },
+        "rerank": {
+          "p50": 0.0,
+          "p95": 0.004,
+          "p99": 0.152
+        },
+        "serialize": {
+          "p50": 0.045,
+          "p95": 0.077,
+          "p99": 0.089
+        },
+        "total": {
+          "p50": 0.433,
+          "p95": 49.366,
+          "p99": 114.857
+        }
+      },
+      "latency_by_mode": {
+        "cache": {
+          "cache": {
+            "p50": 0.066,
+            "p95": 0.102,
+            "p99": 0.111
+          },
+          "embed": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "vector": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "lexical": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fusion": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "transform": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "rerank": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "serialize": {
+            "p50": 0.045,
+            "p95": 0.076,
+            "p99": 0.083
+          },
+          "total": {
+            "p50": 0.424,
+            "p95": 4.806,
+            "p99": 12.539
+          }
+        },
+        "vector": {
+          "cache": {
+            "p50": 0.023,
+            "p95": 0.039,
+            "p99": 0.047
+          },
+          "embed": {
+            "p50": 74.185,
+            "p95": 77.174,
+            "p99": 81.906
+          },
+          "vector": {
+            "p50": 6.629,
+            "p95": 7.264,
+            "p99": 8.316
+          },
+          "lexical": {
+            "p50": 28.548,
+            "p95": 30.945,
+            "p99": 34.474
+          },
+          "fusion": {
+            "p50": 0.033,
+            "p95": 0.059,
+            "p99": 0.071
+          },
+          "transform": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 1.665,
+            "p95": 2.806,
+            "p99": 3.193
+          },
+          "rerank": {
+            "p50": 0.12,
+            "p95": 0.252,
+            "p99": 0.304
+          },
+          "serialize": {
+            "p50": 0.061,
+            "p95": 0.094,
+            "p99": 0.098
+          },
+          "total": {
+            "p50": 112.599,
+            "p95": 120.265,
+            "p99": 125.574
+          }
+        }
+      },
+      "cache_hit_ratio": 0.95,
+      "fallback_ratio": 0.0,
+      "degraded_ratio": 0.0,
+      "fallback": {
+        "attempts": 0,
+        "success_rate": null,
+        "false_empty_rate": null
+      },
+      "quality": {
+        "overall": {
+          "count": 1000,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "mrr": 1.0
+        },
+        "by_variant": {
+          "exact": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 320,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          }
+        }
+      }
+    },
+    {
+      "concurrency": 5,
+      "sample_count": 1000,
+      "latency_ms": {
+        "cache": {
+          "p50": 0.151,
+          "p95": 0.585,
+          "p99": 0.77
+        },
+        "embed": {
+          "p50": 0.0,
+          "p95": 4.479,
+          "p99": 162.621
+        },
+        "vector": {
+          "p50": 0.0,
+          "p95": 0.371,
+          "p99": 9.58
+        },
+        "lexical": {
+          "p50": 0.0,
+          "p95": 0.217,
+          "p99": 310.242
+        },
+        "fusion": {
+          "p50": 0.0,
+          "p95": 0.001,
+          "p99": 0.044
+        },
+        "transform": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "fallback": {
+          "p50": 0.0,
+          "p95": 0.0,
+          "p99": 0.0
+        },
+        "graph": {
+          "p50": 0.0,
+          "p95": 0.07,
+          "p99": 7.96
+        },
+        "rerank": {
+          "p50": 0.0,
+          "p95": 0.004,
+          "p99": 0.208
+        },
+        "serialize": {
+          "p50": 0.071,
+          "p95": 0.086,
+          "p99": 0.092
+        },
+        "total": {
+          "p50": 3.138,
+          "p95": 18.612,
+          "p99": 486.505
+        }
+      },
+      "latency_by_mode": {
+        "cache": {
+          "cache": {
+            "p50": 0.157,
+            "p95": 0.587,
+            "p99": 0.77
+          },
+          "embed": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "vector": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "lexical": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fusion": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "transform": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "rerank": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "serialize": {
+            "p50": 0.07,
+            "p95": 0.085,
+            "p99": 0.088
+          },
+          "total": {
+            "p50": 3.114,
+            "p95": 3.855,
+            "p99": 6.235
+          }
+        },
+        "vector": {
+          "cache": {
+            "p50": 0.057,
+            "p95": 0.231,
+            "p99": 0.626
+          },
+          "embed": {
+            "p50": 135.186,
+            "p95": 180.72,
+            "p99": 184.556
+          },
+          "vector": {
+            "p50": 8.48,
+            "p95": 10.41,
+            "p99": 10.688
+          },
+          "lexical": {
+            "p50": 241.156,
+            "p95": 378.736,
+            "p99": 396.127
+          },
+          "fusion": {
+            "p50": 0.036,
+            "p95": 0.068,
+            "p99": 0.072
+          },
+          "transform": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "fallback": {
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0
+          },
+          "graph": {
+            "p50": 5.519,
+            "p95": 11.871,
+            "p99": 15.872
+          },
+          "rerank": {
+            "p50": 0.16,
+            "p95": 0.29,
+            "p99": 0.311
+          },
+          "serialize": {
+            "p50": 0.079,
+            "p95": 0.099,
+            "p99": 0.107
+          },
+          "total": {
+            "p50": 406.359,
+            "p95": 552.935,
+            "p99": 565.605
+          }
+        }
+      },
+      "cache_hit_ratio": 0.95,
+      "fallback_ratio": 0.0,
+      "degraded_ratio": 0.0,
+      "fallback": {
+        "attempts": 0,
+        "success_rate": null,
+        "false_empty_rate": null
+      },
+      "quality": {
+        "overall": {
+          "count": 1000,
+          "recall@1": 1.0,
+          "recall@3": 1.0,
+          "recall@5": 1.0,
+          "mrr": 1.0
+        },
+        "by_variant": {
+          "exact": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 340,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          },
+          "cross_lang": {
+            "count": 320,
+            "recall@1": 1.0,
+            "recall@3": 1.0,
+            "recall@5": 1.0,
+            "mrr": 1.0
+          }
+        }
+      }
+    }
+  ],
+  "setup_and_run_ms": 16239.519,
+  "privacy": {
+    "raw_queries_recorded": false,
+    "story_content_recorded": false,
+    "absolute_paths_recorded": false,
+    "repository_urls_recorded": false,
+    "hostname_recorded": false
+  }
+}

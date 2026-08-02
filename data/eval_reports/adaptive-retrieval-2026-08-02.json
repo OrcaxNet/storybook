@@ -1,0 +1,311 @@
+{
+  "meta": {
+    "parts": [
+      "strategy"
+    ],
+    "embed_mode": "ollama",
+    "part": "strategy"
+  },
+  "retrieval": null,
+  "processing": null,
+  "split": null,
+  "ablation": null,
+  "strategy": {
+    "benchmark_version": 1,
+    "embedding_model": "qwen3-embedding:0.6b",
+    "topic_count": 24,
+    "query_count": 120,
+    "groups": [
+      "exact",
+      "synonym",
+      "cross_language",
+      "cross_tool",
+      "ambiguous"
+    ],
+    "baseline": "direct_vector",
+    "strategies": {
+      "direct_vector": {
+        "recall@3": 0.9,
+        "mrr": 0.8875,
+        "hard_recall@3": 0.875,
+        "hard_mrr": 0.8594,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.5,
+            "mrr": 0.4375
+          }
+        },
+        "latency_ms": {
+          "p50": 83.095,
+          "p95": 108.079
+        },
+        "gates": {
+          "hard_quality_gain": false,
+          "overall_non_regression": true,
+          "latency": true,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid": {
+        "recall@3": 0.9083,
+        "mrr": 0.8988,
+        "hard_recall@3": 0.8854,
+        "hard_mrr": 0.8735,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.5417,
+            "mrr": 0.4939
+          }
+        },
+        "latency_ms": {
+          "p50": 83.108,
+          "p95": 108.127
+        },
+        "gates": {
+          "hard_quality_gain": false,
+          "overall_non_regression": true,
+          "latency": true,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid_graph": {
+        "recall@3": 0.9083,
+        "mrr": 0.8988,
+        "hard_recall@3": 0.8854,
+        "hard_mrr": 0.8735,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.5417,
+            "mrr": 0.4939
+          }
+        },
+        "latency_ms": {
+          "p50": 84.098,
+          "p95": 113.518
+        },
+        "gates": {
+          "hard_quality_gain": false,
+          "overall_non_regression": true,
+          "latency": true,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid_graph_rewrite": {
+        "recall@3": 1.0,
+        "mrr": 0.9833,
+        "hard_recall@3": 1.0,
+        "hard_mrr": 0.9792,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 0.9167
+          }
+        },
+        "latency_ms": {
+          "p50": 169.831,
+          "p95": 202.416
+        },
+        "gates": {
+          "hard_quality_gain": true,
+          "overall_non_regression": true,
+          "latency": true,
+          "eligible_for_default": true
+        }
+      },
+      "hybrid_graph_hyde": {
+        "recall@3": 1.0,
+        "mrr": 0.9958,
+        "hard_recall@3": 1.0,
+        "hard_mrr": 0.9948,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 0.9792
+          }
+        },
+        "latency_ms": {
+          "p50": 282.919,
+          "p95": 343.415
+        },
+        "gates": {
+          "hard_quality_gain": true,
+          "overall_non_regression": true,
+          "latency": true,
+          "eligible_for_default": true
+        }
+      },
+      "hybrid_graph_hyde_reranker": {
+        "recall@3": 1.0,
+        "mrr": 0.9958,
+        "hard_recall@3": 1.0,
+        "hard_mrr": 0.9948,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 0.9792
+          }
+        },
+        "latency_ms": {
+          "p50": 283.095,
+          "p95": 343.488
+        },
+        "gates": {
+          "hard_quality_gain": true,
+          "overall_non_regression": true,
+          "latency": true,
+          "eligible_for_default": true
+        }
+      }
+    },
+    "eligible_strategies": [
+      "hybrid_graph_rewrite",
+      "hybrid_graph_hyde",
+      "hybrid_graph_hyde_reranker"
+    ],
+    "selected_default": "hybrid_graph_hyde",
+    "passes_default_gate": true,
+    "embed_failures": 0,
+    "gate": {
+      "hard_query": "recall@3 +10pp; when baseline >=90%, MRR +5pp",
+      "overall": "recall@3 no worse than direct-vector by more than 2pp",
+      "latency": "fast p95 <=1s; deep p95 <=5s"
+    },
+    "notes": [
+      "rewrite/HyDE are deterministic curated benchmark transforms",
+      "generation latency is measured separately by live performance runs",
+      "graph quality has a dedicated typed-path benchmark in graph_eval"
+    ]
+  }
+}

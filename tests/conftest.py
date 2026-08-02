@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 
 from ._helpers import FakeEmbedder, FakeLLM, config, embeddings_mod, llm_mod, store
-from storybook import feedback, query_cache
+from storybook import adaptive, feedback, query_cache
 
 
 @pytest.fixture(autouse=True)
@@ -15,6 +15,7 @@ def tmp_db(tmp_path, monkeypatch):
     """每个测试一个隔离的临时数据库（autouse）：重定向 ``config.DB_PATH`` 到 tmp_path。"""
     assert feedback.flush_feedback(timeout=2.0)
     query_cache.clear()
+    adaptive.reset_reranker_circuit()
     embeddings_mod.mark_model_cold()
     db_path = tmp_path / "test_memory.db"
     monkeypatch.setattr(config, "DB_PATH", db_path)
@@ -25,6 +26,7 @@ def tmp_db(tmp_path, monkeypatch):
     yield db_path
     assert feedback.flush_feedback(timeout=2.0)
     query_cache.clear()
+    adaptive.reset_reranker_circuit()
     embeddings_mod.mark_model_cold()
 
 
@@ -46,4 +48,7 @@ def fake_llm(monkeypatch):
     monkeypatch.setattr(llm_mod, "merge_stories", fl.merge_stories)
     monkeypatch.setattr(llm_mod, "judge_split", fl.judge_split)
     monkeypatch.setattr(llm_mod, "split_story", fl.split_story)
+    monkeypatch.setattr(
+        llm_mod, "transform_search_query", fl.transform_search_query
+    )
     return fl

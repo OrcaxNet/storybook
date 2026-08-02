@@ -14,7 +14,13 @@ from . import story_v2
 logger = logging.getLogger(__name__)
 
 
-def _chat(prompt: str, system: str = "") -> Optional[str]:
+def _chat(
+    prompt: str,
+    system: str = "",
+    *,
+    timeout_seconds: float = 120,
+    num_predict: int | None = None,
+) -> Optional[str]:
     """调用 Ollama chat API，返回纯文本响应"""
     messages = []
     if system:
@@ -22,6 +28,9 @@ def _chat(prompt: str, system: str = "") -> Optional[str]:
     messages.append({"role": "user", "content": prompt})
 
     try:
+        options = {"temperature": 0.3, "num_ctx": 8192}
+        if num_predict is not None:
+            options["num_predict"] = max(32, int(num_predict))
         resp = requests.post(
             f"{config.OLLAMA_HOST}/api/chat",
             json={
@@ -29,9 +38,9 @@ def _chat(prompt: str, system: str = "") -> Optional[str]:
                 "messages": messages,
                 "stream": False,
                 "think": config.LLM_THINK,
-                "options": {"temperature": 0.3, "num_ctx": 8192},
+                "options": options,
             },
-            timeout=120,
+            timeout=max(0.1, float(timeout_seconds)),
         )
         resp.raise_for_status()
         data = resp.json()
@@ -66,6 +75,87 @@ def _generate(prompt: str) -> Optional[str]:
 # ═══════════════════════════════════════════════
 #  核心 LLM 操作
 # ═══════════════════════════════════════════════
+
+def transform_search_query(
+    query: str,
+    transformations: list[str],
+    *,
+    timeout_seconds: float,
+) -> dict | None:
+    """Generate only the explicitly gated search transformations in one call.
+
+    The caller owns the outer hard deadline.  This function also passes the
+    remaining budget to ``requests`` so a timed-out worker does not retain the
+    local Ollama connection for the historical 120-second formation timeout.
+    """
+
+    allowed = [
+        item for item in dict.fromkeys(transformations)
+        if item in {"rewrite", "multi_query", "hyde"}
+    ]
+    if not allowed:
+        return None
+    prompt = f"""你是本地记忆检索查询规划器。只生成请求的检索辅助表示，不回答问题。
+
+原始查询：{query}
+启用策略：{', '.join(allowed)}
+
+输出严格 JSON 对象，字段如下：
+{{
+  "rewrite": "语义不丢失、适合检索的单一改写；未启用 rewrite 时为空字符串",
+  "queries": ["最多 {max(1, config.QUERY_MULTI_QUERY_LIMIT)} 条互补检索查询；未启用 multi_query 时为空数组"],
+  "hypothetical_document": "一段可能命中相关经历的简短假设性记忆摘要；未启用 hyde 时为空字符串"
+}}
+
+约束：
+- 保留技术名、错误文本、版本和环境条件，不虚构路径、主机名或凭据。
+- multi-query 各自覆盖原问题的不同子意图，不重复原句。
+- HyDE 只描述可能的“问题—行动—结果”记忆形态，不声称它真实发生。
+- 只输出 JSON，不输出 Markdown。
+"""
+    result = _chat(
+        prompt,
+        system="你负责生成可审计、最小化的检索辅助表示。",
+        timeout_seconds=timeout_seconds,
+        num_predict=384,
+    )
+    if not result:
+        return None
+    try:
+        start = result.find("{")
+        end = result.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        decoded = json.loads(result[start:end + 1])
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+
+    rewrite = _bounded_search_text(decoded.get("rewrite")) if "rewrite" in allowed else ""
+    hypothetical = (
+        _bounded_search_text(decoded.get("hypothetical_document"), limit=1200)
+        if "hyde" in allowed else ""
+    )
+    queries = []
+    if "multi_query" in allowed and isinstance(decoded.get("queries"), list):
+        for value in decoded["queries"]:
+            candidate = _bounded_search_text(value)
+            if candidate and candidate != query.strip() and candidate not in queries:
+                queries.append(candidate)
+            if len(queries) >= max(1, config.QUERY_MULTI_QUERY_LIMIT):
+                break
+    return {
+        "rewrite": rewrite,
+        "queries": queries,
+        "hypothetical_document": hypothetical,
+    }
+
+
+def _bounded_search_text(value, *, limit: int = 600) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split()).strip()[:max(1, limit)]
 
 def extract_keywords(text: str) -> list[str]:
     """从技术文本提取 5-10 个核心关键词"""

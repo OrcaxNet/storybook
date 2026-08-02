@@ -199,6 +199,75 @@ QUERY_FEEDBACK_QUEUE_SIZE = int(
     os.getenv("STORYBOOK_QUERY_FEEDBACK_QUEUE_SIZE", "1024")
 )
 
+# ── 自适应 Hybrid Search / Query Transformation ──
+# ``fast`` 是兼容且可预测的默认值：常态融合 vector + lexical + environment，
+# 可继续使用受预算 Memory Graph，但绝不调用生成式 LLM。``auto`` 在 fast 结果
+# 低置信或查询复杂时才进入第二阶段；``deep`` 由调用方显式选择。
+QUERY_DEFAULT_MODE = os.getenv("STORYBOOK_QUERY_DEFAULT_MODE", "fast").strip().lower()
+QUERY_TRANSFORM_ENABLED = os.getenv(
+    "STORYBOOK_QUERY_TRANSFORM_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+QUERY_AUTO_CONFIDENCE_THRESHOLD = float(os.getenv(
+    "STORYBOOK_QUERY_AUTO_CONFIDENCE_THRESHOLD", "0.62"
+))
+QUERY_AUTO_SCORE_GAP_THRESHOLD = float(os.getenv(
+    "STORYBOOK_QUERY_AUTO_SCORE_GAP_THRESHOLD", "0.035"
+))
+QUERY_AUTO_COMPLEX_CHARS = int(os.getenv(
+    "STORYBOOK_QUERY_AUTO_COMPLEX_CHARS", "80"
+))
+QUERY_AUTO_MAX_TRANSFORMS = int(os.getenv(
+    "STORYBOOK_QUERY_AUTO_MAX_TRANSFORMS", "2"
+))
+QUERY_MULTI_QUERY_LIMIT = int(os.getenv(
+    "STORYBOOK_QUERY_MULTI_QUERY_LIMIT", "3"
+))
+QUERY_AUTO_TRANSFORM_TIMEOUT_SECONDS = float(os.getenv(
+    "STORYBOOK_QUERY_AUTO_TRANSFORM_TIMEOUT_SECONDS", "1.2"
+))
+QUERY_DEEP_TRANSFORM_TIMEOUT_SECONDS = float(os.getenv(
+    "STORYBOOK_QUERY_DEEP_TRANSFORM_TIMEOUT_SECONDS", "3.5"
+))
+QUERY_AUTO_SECOND_STAGE_TIMEOUT_SECONDS = float(os.getenv(
+    "STORYBOOK_QUERY_AUTO_SECOND_STAGE_TIMEOUT_SECONDS", "2.0"
+))
+QUERY_DEEP_SECOND_STAGE_TIMEOUT_SECONDS = float(os.getenv(
+    "STORYBOOK_QUERY_DEEP_SECOND_STAGE_TIMEOUT_SECONDS", "4.0"
+))
+QUERY_DEEP_TOTAL_TIMEOUT_SECONDS = float(os.getenv(
+    "STORYBOOK_QUERY_DEEP_TOTAL_TIMEOUT_SECONDS", "5.0"
+))
+
+# RRF 把不同量纲的 vector / lexical / transformed-query 排名变成可解释分数。
+HYBRID_RRF_K = int(os.getenv("STORYBOOK_HYBRID_RRF_K", "60"))
+HYBRID_VECTOR_WEIGHT = float(os.getenv(
+    "STORYBOOK_HYBRID_VECTOR_WEIGHT", "1.0"
+))
+HYBRID_LEXICAL_WEIGHT = float(os.getenv(
+    "STORYBOOK_HYBRID_LEXICAL_WEIGHT", "0.8"
+))
+HYBRID_TRANSFORM_WEIGHT_AUTO = float(os.getenv(
+    "STORYBOOK_HYBRID_TRANSFORM_WEIGHT_AUTO", "0.35"
+))
+HYBRID_TRANSFORM_WEIGHT_DEEP = float(os.getenv(
+    "STORYBOOK_HYBRID_TRANSFORM_WEIGHT_DEEP", "0.5"
+))
+
+# 本地轻量 reranker 只处理有界 top-N，并拥有独立 deadline 与进程内熔断器。
+RERANK_ENABLED = os.getenv(
+    "STORYBOOK_RERANK_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+RERANK_TOP_N = int(os.getenv("STORYBOOK_RERANK_TOP_N", "20"))
+RERANK_TIMEOUT_SECONDS = float(os.getenv(
+    "STORYBOOK_RERANK_TIMEOUT_SECONDS", "0.08"
+))
+RERANK_FAILURE_THRESHOLD = int(os.getenv(
+    "STORYBOOK_RERANK_FAILURE_THRESHOLD", "2"
+))
+RERANK_CIRCUIT_COOLDOWN_SECONDS = float(os.getenv(
+    "STORYBOOK_RERANK_CIRCUIT_COOLDOWN_SECONDS", "30"
+))
+
 # ── 记忆加工阈值 ──
 SIM_THRESHOLD_HIGH = 0.85      # ≥ → 合并/更新
 SIM_THRESHOLD_UPDATE_ONLY = 0.92  # ≥ → 仅补充细节（不合并内容）
@@ -246,6 +315,15 @@ GRAPH_MAX_PATHS = int(os.getenv("STORYBOOK_GRAPH_MAX_PATHS", "64"))
 GRAPH_FAN_OUT = int(os.getenv("STORYBOOK_GRAPH_FAN_OUT", "8"))
 GRAPH_TIME_BUDGET_MS = float(os.getenv("STORYBOOK_GRAPH_TIME_BUDGET_MS", "100"))
 GRAPH_TOKEN_BUDGET = int(os.getenv("STORYBOOK_GRAPH_TOKEN_BUDGET", "1600"))
+GRAPH_DEEP_MAX_HOPS = int(os.getenv("STORYBOOK_GRAPH_DEEP_MAX_HOPS", "3"))
+GRAPH_DEEP_MAX_PATHS = int(os.getenv("STORYBOOK_GRAPH_DEEP_MAX_PATHS", "160"))
+GRAPH_DEEP_FAN_OUT = int(os.getenv("STORYBOOK_GRAPH_DEEP_FAN_OUT", "16"))
+GRAPH_DEEP_TIME_BUDGET_MS = float(os.getenv(
+    "STORYBOOK_GRAPH_DEEP_TIME_BUDGET_MS", "350"
+))
+GRAPH_DEEP_TOKEN_BUDGET = int(os.getenv(
+    "STORYBOOK_GRAPH_DEEP_TOKEN_BUDGET", "3200"
+))
 GRAPH_HOP_DECAY = float(os.getenv("STORYBOOK_GRAPH_HOP_DECAY", "0.82"))
 GRAPH_MIN_SCORE = float(os.getenv("STORYBOOK_GRAPH_MIN_SCORE", "0.55"))
 GRAPH_CO_RECALL_HALF_LIFE_DAYS = float(os.getenv(

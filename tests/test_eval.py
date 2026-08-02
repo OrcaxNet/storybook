@@ -166,6 +166,40 @@ class TestEmbeddingAblation:
         assert "cross_tool" in text
 
 
+class TestRetrievalStrategyAblation:
+    def test_reports_cumulative_strategies_groups_latency_and_gates(
+        self, fake_embedder
+    ):
+        result = eval_module.run_retrieval_strategy_ablation()
+
+        assert list(result["strategies"]) == [
+            "direct_vector",
+            "hybrid",
+            "hybrid_graph",
+            "hybrid_graph_rewrite",
+            "hybrid_graph_hyde",
+            "hybrid_graph_hyde_reranker",
+        ]
+        assert result["groups"] == [
+            "exact", "synonym", "cross_language", "cross_tool", "ambiguous"
+        ]
+        assert result["query_count"] == 120
+        for row in result["strategies"].values():
+            assert set(row["groups"]) == set(result["groups"])
+            assert row["latency_ms"]["p95"] >= 0
+            assert set(row["gates"]) == {
+                "hard_quality_gain", "overall_non_regression", "latency",
+                "eligible_for_default",
+            }
+        assert result["selected_default"] in result["strategies"]
+
+        report = eval_module.EvalReport(strategy=result)
+        text = eval_module.format_report(report)
+        assert "自适应检索策略消融" in text
+        assert "hybrid_graph_hyde_reranker" in text
+        assert "ambiguous" in text
+
+
 # ═══════════════════════════════════════════════
 #  加工分支评测
 # ═══════════════════════════════════════════════
