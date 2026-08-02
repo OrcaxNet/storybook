@@ -1,0 +1,403 @@
+{
+  "meta": {
+    "parts": [
+      "strategy"
+    ],
+    "embed_mode": "ollama",
+    "part": "strategy"
+  },
+  "retrieval": null,
+  "processing": null,
+  "split": null,
+  "ablation": null,
+  "strategy": {
+    "benchmark_version": 1,
+    "embedding_model": "qwen3-embedding:0.6b",
+    "topic_count": 24,
+    "query_count": 120,
+    "groups": [
+      "exact",
+      "synonym",
+      "cross_language",
+      "cross_tool",
+      "ambiguous"
+    ],
+    "baseline": "direct_vector",
+    "strategies": {
+      "direct_vector": {
+        "recall@3": 0.9,
+        "mrr": 0.8875,
+        "hard_recall@3": 0.875,
+        "hard_mrr": 0.8594,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.5,
+            "mrr": 0.4375
+          }
+        },
+        "latency_ms": {
+          "p50": 81.282,
+          "p95": 97.985
+        },
+        "evidence_source": "raw_query_only",
+        "gates": {
+          "hard_quality_gain": false,
+          "overall_non_regression": true,
+          "latency": true,
+          "ground_truth_isolation": true,
+          "online_latency_evidence": true,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid": {
+        "recall@3": 0.9083,
+        "mrr": 0.8988,
+        "hard_recall@3": 0.8854,
+        "hard_mrr": 0.8735,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.5417,
+            "mrr": 0.4939
+          }
+        },
+        "latency_ms": {
+          "p50": 81.337,
+          "p95": 98.011
+        },
+        "evidence_source": "raw_query_only",
+        "gates": {
+          "hard_quality_gain": false,
+          "overall_non_regression": true,
+          "latency": true,
+          "ground_truth_isolation": true,
+          "online_latency_evidence": true,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid_graph": {
+        "recall@3": 0.9083,
+        "mrr": 0.8988,
+        "hard_recall@3": 0.8854,
+        "hard_mrr": 0.8735,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.5417,
+            "mrr": 0.4939
+          }
+        },
+        "latency_ms": {
+          "p50": 82.643,
+          "p95": 99.101
+        },
+        "evidence_source": "raw_query_only",
+        "gates": {
+          "hard_quality_gain": false,
+          "overall_non_regression": true,
+          "latency": true,
+          "ground_truth_isolation": true,
+          "online_latency_evidence": true,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid_graph_reranker": {
+        "recall@3": 0.9833,
+        "mrr": 0.9841,
+        "hard_recall@3": 0.9792,
+        "hard_mrr": 0.9801,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.9167,
+            "mrr": 0.9204
+          }
+        },
+        "latency_ms": {
+          "p50": 83.349,
+          "p95": 99.744
+        },
+        "evidence_source": "raw_query_only",
+        "gates": {
+          "hard_quality_gain": true,
+          "overall_non_regression": true,
+          "latency": true,
+          "ground_truth_isolation": true,
+          "online_latency_evidence": true,
+          "eligible_for_default": true
+        }
+      },
+      "hybrid_graph_rewrite": {
+        "recall@3": 0.9917,
+        "mrr": 0.9674,
+        "hard_recall@3": 0.9896,
+        "hard_mrr": 0.9592,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.9583,
+            "mrr": 0.8368
+          }
+        },
+        "latency_ms": {
+          "p50": 84.576,
+          "p95": 422.672
+        },
+        "evidence_source": "query_only_pre_generated",
+        "gates": {
+          "hard_quality_gain": true,
+          "overall_non_regression": true,
+          "latency": true,
+          "ground_truth_isolation": true,
+          "online_latency_evidence": false,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid_graph_hyde": {
+        "recall@3": 0.9917,
+        "mrr": 0.9753,
+        "hard_recall@3": 0.9896,
+        "hard_mrr": 0.9691,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 0.9583,
+            "mrr": 0.8764
+          }
+        },
+        "latency_ms": {
+          "p50": 84.589,
+          "p95": 522.941
+        },
+        "evidence_source": "query_only_pre_generated",
+        "gates": {
+          "hard_quality_gain": true,
+          "overall_non_regression": true,
+          "latency": true,
+          "ground_truth_isolation": true,
+          "online_latency_evidence": false,
+          "eligible_for_default": false
+        }
+      },
+      "hybrid_graph_hyde_reranker": {
+        "recall@3": 1.0,
+        "mrr": 1.0,
+        "hard_recall@3": 1.0,
+        "hard_mrr": 1.0,
+        "query_count": 120,
+        "groups": {
+          "exact": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "synonym": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_language": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "cross_tool": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          },
+          "ambiguous": {
+            "count": 24,
+            "recall@3": 1.0,
+            "mrr": 1.0
+          }
+        },
+        "latency_ms": {
+          "p50": 85.15,
+          "p95": 524.904
+        },
+        "evidence_source": "query_only_pre_generated",
+        "gates": {
+          "hard_quality_gain": true,
+          "overall_non_regression": true,
+          "latency": true,
+          "ground_truth_isolation": true,
+          "online_latency_evidence": false,
+          "eligible_for_default": false
+        }
+      }
+    },
+    "eligible_strategies": [
+      "hybrid_graph_reranker"
+    ],
+    "selected_default": "hybrid_graph_reranker",
+    "passes_default_gate": true,
+    "embed_failures": 0,
+    "transformation_provenance": {
+      "source": "query_only_pre_generated",
+      "generator": "qwythos-hermes:latest",
+      "generation_inputs": [
+        "raw_query",
+        "requested_transformations",
+        "timeout_seconds"
+      ],
+      "ground_truth_fields_used_for_generation": [],
+      "ground_truth_usage": "topic_id is used only for post-ranking scoring",
+      "pre_generated_outputs": true,
+      "oracle_upper_bound": false,
+      "oracle_eligible_for_default": false,
+      "online_latency_evidence": false,
+      "prompt_version": "transform_search_query-v1",
+      "artifact_sha256": "35ba9bc960ef2777e7d330b17da9ad449011d7f16e2e5fbd15db30fd0cb5bd9c",
+      "artifact_entry_count": 24,
+      "artifact_cache_hits": 24,
+      "artifact_cache_misses": 96,
+      "attempts": 120,
+      "successes": 24,
+      "failures": 96,
+      "generated_counts": {
+        "rewrite": 24,
+        "multi_query": 62,
+        "hyde": 24
+      }
+    },
+    "gate": {
+      "hard_query": "recall@3 +10pp; when baseline >=90%, MRR +5pp",
+      "overall": "recall@3 no worse than direct-vector by more than 2pp",
+      "latency": "fast p95 <=1s; deep p95 <=5s"
+    },
+    "notes": [
+      "transform generation receives the raw query only; labels and target Story fields are unavailable until post-ranking scoring",
+      "live generation latency is included in rewrite/HyDE cumulative latency",
+      "pre-generated query-only evidence is labelled; oracle evidence can never select a default",
+      "graph quality has a dedicated typed-path benchmark in graph_eval"
+    ]
+  }
+}

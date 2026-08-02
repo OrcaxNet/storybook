@@ -10,11 +10,15 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
+
 import numpy as np
 import pytest
 
-from storybook import config, embeddings
+from storybook import config
 from storybook import eval as eval_module
+from storybook.eval import runner as runner_module
 from storybook.eval import metrics as M
 from ._helpers import basis
 
@@ -164,6 +168,187 @@ class TestEmbeddingAblation:
         text = eval_module.format_report(report)
         assert "embedding 表示消融" in text
         assert "cross_tool" in text
+
+
+class TestRetrievalStrategyAblation:
+    def test_pre_generated_artifact_enforces_query_only_contract(self, tmp_path):
+        query = "remembered clue"
+        artifact = {
+            "source": "query_only_pre_generated",
+            "generator": "local-test-model",
+            "prompt_version": "test-v1",
+            "generation_inputs": [
+                "raw_query", "requested_transformations", "timeout_seconds"
+            ],
+            "entries": [{
+                "query": query,
+                "query_sha256": hashlib.sha256(query.encode()).hexdigest(),
+                "output": {
+                    "rewrite": "safe rewrite",
+                    "queries": [],
+                    "hypothetical_document": "",
+                },
+            }],
+        }
+        path = tmp_path / "transforms.json"
+        path.write_text(json.dumps(artifact), encoding="utf-8")
+
+        provider = eval_module.pre_generated_transform_provider(path)
+
+        assert provider(query, [], timeout_seconds=1) == artifact["entries"][0][
+            "output"
+        ]
+        assert provider("missing", [], timeout_seconds=1) is None
+        assert provider.evidence_metadata["stats"] == {
+            "cache_hits": 1, "cache_misses": 1
+        }
+
+        artifact["entries"][0]["topic_id"] = "forbidden-label"
+        path.write_text(json.dumps(artifact), encoding="utf-8")
+        with pytest.raises(ValueError, match="ground-truth"):
+            eval_module.pre_generated_transform_provider(path)
+
+    def test_reports_cumulative_strategies_groups_latency_and_gates(
+        self, fake_embedder, fake_llm
+    ):
+        result = eval_module.run_retrieval_strategy_ablation()
+
+        assert list(result["strategies"]) == [
+            "direct_vector",
+            "hybrid",
+            "hybrid_graph",
+            "hybrid_graph_reranker",
+            "hybrid_graph_rewrite",
+            "hybrid_graph_hyde",
+            "hybrid_graph_hyde_reranker",
+        ]
+        assert result["groups"] == [
+            "exact", "synonym", "cross_language", "cross_tool", "ambiguous"
+        ]
+        assert result["query_count"] == 120
+        for row in result["strategies"].values():
+            assert set(row["groups"]) == set(result["groups"])
+            assert row["latency_ms"]["p95"] >= 0
+            assert set(row["gates"]) == {
+                "hard_quality_gain", "overall_non_regression", "latency",
+                "ground_truth_isolation", "online_latency_evidence",
+                "eligible_for_default",
+            }
+        assert result["selected_default"] in result["strategies"]
+        assert result["transformation_provenance"] == {
+            "source": "live_generated",
+            "generator": config.LLM_MODEL,
+            "generation_inputs": [
+                "raw_query", "requested_transformations", "timeout_seconds"
+            ],
+            "ground_truth_fields_used_for_generation": [],
+            "ground_truth_usage": "topic_id is used only for post-ranking scoring",
+            "pre_generated_outputs": False,
+            "oracle_upper_bound": False,
+            "oracle_eligible_for_default": False,
+            "online_latency_evidence": True,
+            "prompt_version": None,
+            "artifact_sha256": None,
+            "artifact_entry_count": None,
+            "artifact_cache_hits": None,
+            "artifact_cache_misses": None,
+            "attempts": 120,
+            "successes": 0,
+            "failures": 120,
+            "generated_counts": {"rewrite": 0, "multi_query": 0, "hyde": 0},
+        }
+
+        report = eval_module.EvalReport(strategy=result)
+        text = eval_module.format_report(report)
+        assert "自适应检索策略消融" in text
+        assert "hybrid_graph_hyde_reranker" in text
+        assert "ambiguous" in text
+        assert "live_generated" in text
+
+    def test_transform_retrieval_never_reads_target_story_fields(
+        self, fake_embedder, monkeypatch
+    ):
+        bench = eval_module.load_benchmark()
+        target = bench.topics[0]
+        raw_query = "raw query without target labels"
+        monkeypatch.setattr(
+            runner_module,
+            "_strategy_query_pairs",
+            lambda _bench: [{
+                "query": raw_query,
+                "variant": "ambiguous",
+                "topic_id": target.id,
+            }],
+        )
+        provider_calls = []
+
+        def provider(query, transformations, **kwargs):
+            provider_calls.append((query, transformations, kwargs))
+            return {
+                "rewrite": "query-only rewrite",
+                "queries": ["query-only alternate"],
+                "hypothetical_document": "query-only hypothetical memory",
+            }
+
+        result = eval_module.run_retrieval_strategy_ablation(
+            transform_provider=provider,
+            transform_source="query_only_pre_generated",
+        )
+
+        assert provider_calls == [(
+            raw_query,
+            ["rewrite", "multi_query", "hyde"],
+            {"timeout_seconds": config.QUERY_DEEP_TRANSFORM_TIMEOUT_SECONDS},
+        )]
+        # One embed call per indexed Story precedes all retrieval calls.
+        retrieval_inputs = fake_embedder.calls[len(bench.topics):]
+        assert set(retrieval_inputs) == {
+            raw_query,
+            "query-only rewrite",
+            "query-only alternate",
+            "query-only hypothetical memory",
+        }
+        assert target.title not in retrieval_inputs
+        assert target.problem_desc not in retrieval_inputs
+        assert target.content not in retrieval_inputs
+        provenance = result["transformation_provenance"]
+        assert provenance["source"] == "query_only_pre_generated"
+        assert provenance["pre_generated_outputs"] is True
+        assert provenance["ground_truth_fields_used_for_generation"] == []
+        assert provenance["online_latency_evidence"] is False
+
+    def test_oracle_upper_bound_cannot_select_default(
+        self, fake_embedder, monkeypatch
+    ):
+        target = eval_module.load_benchmark().topics[0]
+        monkeypatch.setattr(
+            runner_module,
+            "_strategy_query_pairs",
+            lambda _bench: [{
+                "query": "opaque query",
+                "variant": "ambiguous",
+                "topic_id": target.id,
+            }],
+        )
+
+        result = eval_module.run_retrieval_strategy_ablation(
+            transform_provider=lambda *_args, **_kwargs: {
+                "rewrite": target.problem_desc,
+                "queries": [],
+                "hypothetical_document": target.content,
+            },
+            transform_source="oracle_upper_bound",
+        )
+
+        assert result["transformation_provenance"]["oracle_upper_bound"] is True
+        for name in (
+            "hybrid_graph_rewrite", "hybrid_graph_hyde",
+            "hybrid_graph_hyde_reranker",
+        ):
+            gates = result["strategies"][name]["gates"]
+            assert gates["ground_truth_isolation"] is False
+            assert gates["online_latency_evidence"] is False
+            assert gates["eligible_for_default"] is False
 
 
 # ═══════════════════════════════════════════════

@@ -1,0 +1,373 @@
+{
+  "schema_version": 1,
+  "source": "query_only_pre_generated",
+  "generator": "qwythos-hermes:latest",
+  "prompt_version": "transform_search_query-v1",
+  "generated_at": "2026-08-02T02:55:44.014990+00:00",
+  "generation_inputs": [
+    "raw_query",
+    "requested_transformations",
+    "timeout_seconds"
+  ],
+  "ground_truth_fields_used_for_generation": [],
+  "requested_transformations": [
+    "rewrite",
+    "multi_query",
+    "hyde"
+  ],
+  "variants": [
+    "ambiguous"
+  ],
+  "entries": [
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：setData 用 包裹后渲染次数从无限降为 2 次",
+      "query_sha256": "65cdd3cdc6f2eaab413767aa3ff28d45d7bad86a13cd132b15c246039c1fbab1",
+      "variant": "ambiguous",
+      "elapsed_ms": 20290.064,
+      "output": {
+        "rewrite": "setData 包裹后渲染次数从无限降为 2 次",
+        "queries": [
+          "setData 包裹导致渲染次数无限循环的修复方法",
+          "setData 渲染次数异常优化技巧",
+          "setData 性能优化减少重绘重排"
+        ],
+        "hypothetical_document": "用户遇到 setData 包裹后渲染次数无限大的问题，通过调整 setData 调用时机或合并多次 setData 为一次，成功将渲染次数降低至 2 次。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：用展开运算符创建新引用后 UI 正确更新",
+      "query_sha256": "0903e189a4e5a8fe8014167c18c4d987c489edb79049bbac037da792a0090ff8",
+      "variant": "ambiguous",
+      "elapsed_ms": 16839.986,
+      "output": {
+        "rewrite": "用展开运算符创建新引用后 UI 正确更新",
+        "queries": [
+          "Vue 展开运算符创建新引用导致 UI 未更新的已知问题",
+          "React 展开运算符创建新引用导致 UI 未更新的已知问题",
+          "Angular 展开运算符创建新引用导致 UI 未更新的已知问题"
+        ],
+        "hypothetical_document": "用户报告在使用展开运算符创建新的响应式引用时，UI 未能正确更新的问题。该问题可能涉及 Vue、React 或 Angular 框架中的特定版本，环境条件包括开发服务器配置和组件生命周期钩子。最终解决方案可能是通过强制触发重渲染或使用特定的响应式代理方法来解决 UI 同步延迟。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：改用 后内存从 2GB 降到 50MB",
+      "query_sha256": "0e04e8d39c391e8866a5fe74ff59c164b2c6fc66bc4261773eec93a0afcd5fae",
+      "variant": "ambiguous",
+      "elapsed_ms": 13368.67,
+      "output": {
+        "rewrite": "内存优化后指标：从 2GB 降至 50MB",
+        "queries": [
+          "memory optimization reduced from 2GB to 50MB",
+          "reduce memory usage from 2GB to 50MB",
+          "memory footprint dropped 2GB to 50MB"
+        ],
+        "hypothetical_document": "User asked about a specific tool or strategy that successfully optimized memory consumption, resulting in a dramatic reduction of the system's memory usage from an initial peak of 2GB down to just 50MB."
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：换 后 不再 ，并发从 1 提升到 50",
+      "query_sha256": "1c3dbf2e24412055ec490141e5a81132a63524881fd1c3325df920a272042808",
+      "variant": "ambiguous",
+      "elapsed_ms": 14322.798,
+      "output": {
+        "rewrite": "并发从1提升到50后不再换行",
+        "queries": [
+          "并发提升导致换行消失问题排查",
+          "高并发场景下文本换行行为异常",
+          "性能优化后界面渲染换行丢失"
+        ],
+        "hypothetical_document": "用户在低并发环境下观察到正常换行，进行系统升级或配置调整（如启用缓存、合并请求等）以提升并发处理能力至50。调整后测试发现输出结果中原本存在的换行符消失，文本变为单行显示，怀疑是渲染逻辑在高负载下被优化跳过或序列化格式变更导致。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：用 + 后多进程数据同步正确",
+      "query_sha256": "6dadb9907e8974bcf8b878208a07ac9f7ef5dfb9b4b68f356ceca8cabee210ea",
+      "variant": "ambiguous",
+      "elapsed_ms": 10817.079,
+      "output": {
+        "rewrite": "多进程数据同步使用 + 后正确",
+        "queries": [
+          "多进程数据同步 + 命令用法",
+          "多进程数据同步 + 结果指标验证"
+        ],
+        "hypothetical_document": "用户遇到多进程数据同步问题，尝试使用 + 操作符进行数据合并或追加。执行后检查输出，发现数据正确同步且无冲突错误，确认该方式适用于当前场景。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：通过 成功恢复丢失的 3 个 commit",
+      "query_sha256": "0e95985b04c56a8d9cbe2b476daeb109bf39f193c416062662762115101d62a9",
+      "variant": "ambiguous",
+      "elapsed_ms": 12864.356,
+      "output": {
+        "rewrite": "成功恢复丢失的 3 个 commit",
+        "queries": [
+          "找回丢失的 3 个 git commit",
+          "git restore lost commits history",
+          "recover missing commits from repository"
+        ],
+        "hypothetical_document": "用户遇到 Git 仓库中丢失提交的问题，尝试通过执行 `git reflog` 或 `git fsck --lost-found` 命令来定位未合并的 commit 引用。最终成功恢复了三个具体的 commit ID，并确认这些提交已重新出现在分支历史中。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：按步骤解决 完成",
+      "query_sha256": "09a5df36de0cbef1987d0f93cd5d96871edc22d3d7cc5754e152b8a70dfe5856",
+      "variant": "ambiguous",
+      "elapsed_ms": 18176.826,
+      "output": {
+        "rewrite": "按步骤解决并完成：问题名称和工具已遗忘，仅保留最终结果或指标",
+        "queries": [
+          "按步骤解决并完成：问题名称和工具已遗忘，仅保留最终结果或指标"
+        ],
+        "hypothetical_document": "用户曾遇到一个技术问题，具体名称和所用工具均已忘记。用户记录了该问题的解决过程，强调必须‘按步骤’执行操作才能完成修复。最终得到的关键结果是某个具体的性能指标数值（如响应时间、吞吐量等）或状态标记（如‘成功’、‘已部署’），这是验证解决方案有效的唯一依据。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：配 的 后容器内 解析正常",
+      "query_sha256": "cffd33055182b3666a724c1d502e4927e09985e7292fe7854f27bdfc10ac1a68",
+      "variant": "ambiguous",
+      "elapsed_ms": 15336.375,
+      "output": {
+        "rewrite": "配后容器内解析正常",
+        "queries": [
+          "配后容器内解析正常 问题名称",
+          "配后容器内解析正常 工具名称",
+          "配后容器内解析正常 指标"
+        ],
+        "hypothetical_document": "用户遇到一个关于‘配后容器内解析正常’的问题，不确定具体是哪个功能或配置项导致的。可能涉及容器镜像构建后的解析步骤、网络连通性检查或日志输出异常。最终通过某种工具（如 kubectl、docker inspect 或自定义脚本）验证了容器内部状态，确认解析过程正常，并记录了相关指标（如启动时间、资源占用）。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：修正 后容器内可见文件",
+      "query_sha256": "782d5fff245cb304e45b55b6391c6de036795e3c0795258bceb625929229737c",
+      "variant": "ambiguous",
+      "elapsed_ms": 14280.631,
+      "output": {
+        "rewrite": "修正后容器内可见文件",
+        "queries": [
+          "修正后容器内可见文件",
+          "容器可见文件修正结果指标",
+          "修正操作后的文件系统状态"
+        ],
+        "hypothetical_document": "用户询问关于容器内文件可见性的问题，具体涉及某次修正操作后的状态。记忆中该查询旨在确认修正后哪些文件或目录在容器内部是可见的（即可访问或列出），可能关联到权限变更、挂载点调整或路径修复等上下文，最终期望获得一个包含修正后可见文件列表的结果或指标。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：加 后前端 请求成功",
+      "query_sha256": "26dcac6e71ba5298d22e640d06956a7603ebd605ee0d703c50d6435624150f3c",
+      "variant": "ambiguous",
+      "elapsed_ms": 11650.674,
+      "output": {
+        "rewrite": "前端请求成功加后指标",
+        "queries": [
+          "前端请求加后成功",
+          "加后前端请求成功"
+        ],
+        "hypothetical_document": "用户询问关于‘加’操作后前端请求成功的结果或指标，系统检索到相关记忆：在特定条件下执行加法操作后，前端接口返回 HTTP 200 状态码且响应体包含预期的聚合数据，验证了该流程的稳定性。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：改 后 uv -e . 成功",
+      "query_sha256": "17001fe82c73ba71c8e84429751b1b72afdffad3c9bb3f6bdfb5849af01f8710",
+      "variant": "ambiguous",
+      "elapsed_ms": 14066.044,
+      "output": {
+        "rewrite": "uv -e . 成功 启用策略",
+        "queries": [
+          "uv install editable project root success log",
+          "uv run pip install -e . exit code 0",
+          "uv add package editable mode verification"
+        ],
+        "hypothetical_document": "User attempted to enable a strategy or tool using `uv` in the current directory. They ran `uv -e .` (likely intending `uv add` or similar) and observed success, indicated by an exit code of 0 or a specific output message confirming the operation completed without errors."
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：启用 intents + 配 server 后通信正常",
+      "query_sha256": "5ede479583d5020d471945a0891be12aa9b8d8b22add8fb79f0ec48ce58d879f",
+      "variant": "ambiguous",
+      "elapsed_ms": 13704.079,
+      "output": {
+        "rewrite": "启用 intents + 配 server 后通信正常",
+        "queries": [
+          "启用 intents 后配置 server 的步骤与结果",
+          "intents 策略下服务器通信恢复的指标表现",
+          "启用 intents 并配置 server 后的系统状态验证"
+        ],
+        "hypothetical_document": "用户在启用 intents 功能后，尝试通过配置 server 参数来建立连接。经过一系列调试操作（如检查端口、网络连通性），最终成功建立了通信链路，各项指标显示服务运行正常，问题得以解决。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：需架构层改动， 新增端点或 gateway 透传 messageId",
+      "query_sha256": "099cdf8877943ce0c6567e78c641e4d521618e8d02512b850a5fdf419df709e0",
+      "variant": "ambiguous",
+      "elapsed_ms": 13174.895,
+      "output": {
+        "rewrite": "架构层改动新增端点或 gateway 透传 messageId",
+        "queries": [
+          "架构变更记录 新增 API 端点",
+          "网关配置透传 messageId 参数",
+          "系统升级日志 gateway 路由修改"
+        ],
+        "hypothetical_document": "用户曾咨询关于系统架构层需要改动的问题，具体涉及新增一个端点或在现有的 gateway 中进行透传操作以传递 messageId。最终的处理方案是实施了相应的架构调整，确保了 messageId 能够正确透传给下游服务。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：加 约束后 正确，编译通过",
+      "query_sha256": "37c6699be120ab1801f77f42ebcd36d302746affc1d045a6a15f14ebd54558a6",
+      "variant": "ambiguous",
+      "elapsed_ms": 11384.015,
+      "output": {
+        "rewrite": "编译通过 加约束后正确",
+        "queries": [
+          "编译通过后添加约束才正确的情况",
+          "编译错误修复后增加约束验证通过",
+          "代码编译成功但需加约束条件才能运行正确"
+        ],
+        "hypothetical_document": "用户遇到编译问题，尝试添加特定约束条件（如类型注解、边界检查或配置参数）后，程序编译通过且运行结果符合预期指标。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：用 后查询从 1001 次降到 2 次，耗时 3s→50ms",
+      "query_sha256": "e17cf442eea45748d0af445ea94b43d23e858914aa8127474d11ac74f1b4047a",
+      "variant": "ambiguous",
+      "elapsed_ms": 16666.145,
+      "output": {
+        "rewrite": "查询性能优化：后查询次数从1001次降至2次，耗时从3秒降至50毫秒",
+        "queries": [
+          "数据库查询执行计划分析与优化技巧",
+          "如何减少SQL语句执行次数并降低响应时间",
+          "查询性能瓶颈诊断与索引优化案例"
+        ],
+        "hypothetical_document": "用户曾遇到查询性能严重下降问题，初始状态为后查询1001次、耗时3秒。通过深入分析执行计划发现全表扫描导致大量回表查询，随后实施了针对性的索引覆盖策略并重构了SQL语句逻辑。优化后的最终结果为后查询仅2次、耗时50毫秒，成功解决了高延迟和冗余IO问题。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：统一加锁顺序后死锁消除。",
+      "query_sha256": "48a2c2b309c684e96ea95e4c968dc159644fa930fcd505b63334271870960d2f",
+      "variant": "ambiguous",
+      "elapsed_ms": 9941.456,
+      "output": {
+        "rewrite": "统一加锁顺序后死锁消除",
+        "queries": [
+          "统一加锁顺序如何避免死锁",
+          "deadlock elimination by consistent lock ordering"
+        ],
+        "hypothetical_document": "用户遇到死锁问题，尝试通过统一所有线程的加锁顺序来修复。实施后系统运行正常，确认该策略成功消除了死锁现象。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：加 + 后 DB 负载峰值降 90%",
+      "query_sha256": "26953dfb94c19c4e668b1430cb9594f0bac78e2a8583e9f2264e1bf94c1bb7e9",
+      "variant": "ambiguous",
+      "elapsed_ms": 13020.11,
+      "output": {
+        "rewrite": "加 + 后 DB 负载峰值降 90%",
+        "queries": [
+          "加 + 操作导致数据库负载峰值下降的具体原因分析",
+          "加 + 后数据库性能指标变化与负载降低关联",
+          "加 + 场景下数据库峰值负载优化策略"
+        ],
+        "hypothetical_document": "用户曾遇到加号相关操作后数据库负载异常升高问题，通过调整索引或查询语句将 DB 负载峰值降低了约 90%，最终解决了性能瓶颈。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：换 LRU 缓存后内存稳定在 200MB 以内，不再",
+      "query_sha256": "7ea10cde7a7ee7c0b9fb031936144b438c385f05e631c3c53a71c7208a3bc91d",
+      "variant": "ambiguous",
+      "elapsed_ms": 18707.192,
+      "output": {
+        "rewrite": "换 LRU 缓存后内存稳定在 200MB 以内",
+        "queries": [
+          "LRU 缓存配置导致内存使用量降至 200MB 以内的具体操作和参数调整",
+          "系统内存优化案例：启用 LRU 策略后指标从高位回落至 200MB 的记录",
+          "通过更换缓存算法实现内存占用稳定在 200MB 以下的技术复盘"
+        ],
+        "hypothetical_document": "用户曾遇到内存溢出问题，尝试了多种优化手段未果。最终决定将默认的全局缓存策略替换为 LRU（最近最少使用）淘汰算法，并调整了缓存容量上限参数。实施后监控数据显示，系统内存占用迅速下降并稳定在 200MB 以内，解决了之前的性能瓶颈。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：加心跳后 稳定运行 24h 无断连",
+      "query_sha256": "ffd49d861e96828c1a634f02d33c3e44607bf1d435aad6107a8d88e5e658c3ac",
+      "variant": "ambiguous",
+      "elapsed_ms": 12838.093,
+      "output": {
+        "rewrite": "加心跳后稳定运行24h无断连",
+        "queries": [
+          "加心跳后稳定运行24h无断连"
+        ],
+        "hypothetical_document": "用户遇到连接不稳定的问题，尝试通过添加心跳机制来维持会话。实施后系统持续运行了24小时，期间未发生任何断连事件，验证了该策略的有效性。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：修正 引用后 正常运行",
+      "query_sha256": "32b7663345f7c74b34be31620842b66ae58bdf03dca88e289eae130e8d1ea7b4",
+      "variant": "ambiguous",
+      "elapsed_ms": 14729.612,
+      "output": {
+        "rewrite": "修正引用后正常运行",
+        "queries": [
+          "修正引用后正常运行 问题名称",
+          "修正引用后正常运行 工具",
+          "修正引用后正常运行 结果指标"
+        ],
+        "hypothetical_document": "用户报告了一个关于‘修正引用后正常运行’的问题，询问具体使用了哪个工具以及最终的结果或关键指标是什么。该查询旨在检索之前处理过类似‘修正引用导致运行异常’场景的对话记录，以确认问题名称、所用工具（如 sed, awk, grep 等）及验证成功的输出结果。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：配 头后后端正确获取客户端真实 IP",
+      "query_sha256": "6cda8625f547ab9db0ce1d15a697dacfab0839d8f43d25c343647b1890d0c9e7",
+      "variant": "ambiguous",
+      "elapsed_ms": 11766.733,
+      "output": {
+        "rewrite": "配头后后端正确获取客户端真实 IP",
+        "queries": [
+          "配头后端获取客户端真实 IP 配置",
+          "后端获取客户端真实 IP 方法",
+          "配头后后端获取客户端真实 IP 结果"
+        ],
+        "hypothetical_document": "在配头后端环境中，通过正确配置代理头（如 X-Forwarded-For）或集成特定工具，成功获取了客户端的真实 IP 地址。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：调整借用顺序后编译通过",
+      "query_sha256": "c2eae72209f9b7d855a3ee4ba8a0fd932921afa33a5e61ececfaab152091d97f",
+      "variant": "ambiguous",
+      "elapsed_ms": 17057.242,
+      "output": {
+        "rewrite": "调整借用顺序后编译通过的问题名称和工具",
+        "queries": [
+          "调整借用顺序后编译通过的工具是什么",
+          "调整借用顺序后编译通过的错误信息或指标",
+          "调整借用顺序后编译通过的解决方案步骤"
+        ],
+        "hypothetical_document": "用户遇到编译错误，尝试了多种工具（如 gcc, clang）和不同的参数组合但均失败。随后用户意识到可能是依赖项的加载顺序问题，于是调整了借用顺序（例如先链接库再编译对象文件，或修改 CMakeLists.txt 中的 link_libraries 调用次序）。调整后重新运行构建命令，编译器成功通过所有检查，最终生成了可执行文件或目标文件，验证了顺序调整的有效性。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：加 + 超时后 数稳定",
+      "query_sha256": "b43dbd0c07ec8b3d68587f6d8e6a911611db2e16cc48a2bf1d0ac3172a223de5",
+      "variant": "ambiguous",
+      "elapsed_ms": 13790.418,
+      "output": {
+        "rewrite": "本地记忆检索：加 + 超时后数稳定",
+        "queries": [
+          "本地记忆检索：加 + 超时后数稳定"
+        ],
+        "hypothetical_document": "用户曾遇到一个关于‘加 + 超时后数稳定’的问题，尝试了多种工具但未找到确切名称。最终通过某种方式确认了结果或指标在超时后保持稳定，并记录了相关操作步骤和观察到的数值变化趋势。"
+      }
+    },
+    {
+      "query": "问题名称和工具已经记不清，只记得最后的结果或指标：加 函数后开发环境正确警告类型不匹配",
+      "query_sha256": "d921c77952df8a1d457646fe289683eaea6379527c4488368379ce03006f75ef",
+      "variant": "ambiguous",
+      "elapsed_ms": 13355.095,
+      "output": {
+        "rewrite": "开发环境警告类型不匹配 加函数后",
+        "queries": [
+          "开发环境 警告类型不匹配 解决方案",
+          "add function warning type mismatch development environment"
+        ],
+        "hypothetical_document": "用户遇到开发环境中添加新函数后出现警告，错误提示为‘类型不匹配’（type mismatch）。该警告阻止了后续操作。用户尝试通过调整参数签名或导入路径来修复，最终发现是函数返回值的类型声明与实际实现不一致导致的，修正类型注解后警告消失，环境恢复正常。"
+      }
+    }
+  ]
+}

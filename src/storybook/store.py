@@ -2142,6 +2142,32 @@ def get_story(story_id: int, *, include_deleted: bool = False) -> Optional[dict]
         db.close()
 
 
+def get_story_rerank_texts(story_ids: list[int]) -> dict[int, str]:
+    """Read full local detail for a bounded reranker candidate set in one query.
+
+    The mapping is an internal scoring input. Search results continue to expose
+    the budgeted recall summary rather than expanding raw evidence by default.
+    """
+
+    unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
+    if not unique_ids:
+        return {}
+    placeholders = ",".join("?" for _ in unique_ids)
+    db = get_db(load_vector_extension=False)
+    try:
+        rows = db.execute(
+            f"""SELECT id, content FROM stories
+                 WHERE id IN ({placeholders}) AND deleted_at IS NULL""",
+            unique_ids,
+        ).fetchall()
+        return {
+            int(row["id"]): str(row["content"] or "")
+            for row in rows
+        }
+    finally:
+        db.close()
+
+
 def get_all_stories(*, include_deleted: bool = False) -> list[dict]:
     db = get_db()
     try:

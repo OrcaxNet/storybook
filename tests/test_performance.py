@@ -79,20 +79,24 @@ class TestQueryDiagnostics:
 
 
 @pytest.mark.parametrize(
-    "delayed_stage", ["cache", "embed", "vector", "rerank", "graph", "serialize"]
+    "delayed_stage",
+    ["cache", "embed", "vector", "lexical", "fusion", "graph", "rerank", "serialize"],
 )
 def test_mocked_stage_latency_is_attributed_to_that_stage(
     delayed_stage, fake_embedder, monkeypatch
 ):
     _seed()
     fake_embedder.register("q", basis(0))
+    ordered_stages = (
+        "cache", "embed", "vector", "lexical", "fusion", "graph", "rerank", "serialize"
+    )
     durations = {
         stage: (0.025 if stage == delayed_stage else 0.0)
-        for stage in ("cache", "embed", "vector", "rerank", "graph", "serialize")
+        for stage in ordered_stages
     }
     current = 0.0
     values = [current]  # total start
-    for stage in ("cache", "embed", "vector", "rerank", "graph", "serialize"):
+    for stage in ordered_stages:
         values.extend((current, current + durations[stage]))
         current += durations[stage]
     values.append(current)  # total end
@@ -104,7 +108,7 @@ def test_mocked_stage_latency_is_attributed_to_that_stage(
     assert result["latency_ms"][delayed_stage] == 25.0
     assert result["latency_ms"]["total"] == 25.0
     other_stages = {
-        stage for stage in ("cache", "embed", "vector", "rerank", "graph", "serialize")
+        stage for stage in ordered_stages
         if stage != delayed_stage
     }
     assert all(result["latency_ms"][stage] == 0.0 for stage in other_stages)

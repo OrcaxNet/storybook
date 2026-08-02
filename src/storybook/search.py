@@ -10,7 +10,8 @@ import uuid
 from collections.abc import Callable
 from typing import TypeVar
 
-from . import config, embeddings, feedback, graph as graph_module, performance
+from . import adaptive, config, embeddings, feedback, graph as graph_module, performance
+from . import llm
 from . import query_cache, store
 from . import context as context_module
 
@@ -26,17 +27,19 @@ def search(
     context: dict | None = None,
     scope: str = "profile",
     graph_enabled: bool | None = None,
+    retrieval_mode: str | None = None,
+    transform_enabled: bool | None = None,
+    rerank_enabled: bool | None = None,
     record_diagnostics: bool = True,
 ) -> dict:
-    """
-    检索记忆：
-    1. 直接对 query 生成向量
-    2. 向量检索 Top-K story
-    3. 每个 story 下方按权重展示关联 story
+    """Retrieve memories through fast, auto, or explicitly deep recall.
 
-    返回: {query, keywords, top_matches: [{story, similarity, related: [...]}]}
+    ``mode`` in the response retains the v0.2 execution-lane contract
+    (cache/vector/lexical_fallback).  ``retrieval_mode`` exposes the new public
+    strategy without breaking older MCP/CLI consumers.
     """
     top_k = max(1, top_k or config.TOP_K_SEARCH)
+    retrieval_mode = adaptive.resolve_mode(retrieval_mode)
     graph_enabled = (
         config.GRAPH_DEFAULT_ENABLED if graph_enabled is None
         else bool(graph_enabled)
@@ -47,20 +50,35 @@ def search(
         context_module.normalize_envelope(context, profile_id=config.PROFILE_ID)
         if context is not None else None
     )
-    normalized_query = query.strip()
+    normalized_query = adaptive.normalize_query(query)
+    if not normalized_query:
+        raise ValueError("query 不能为空")
     request_id = uuid.uuid4().hex
     latency = performance.empty_latency()
     total_started = performance.now()
     model_state = embeddings.model_state()
     index_version = store.get_index_version()
 
-    def finish(result: dict, *, mode: str, degraded: bool = False,
-               degraded_reason: str | None = None) -> dict:
+    def finish(
+        result: dict,
+        *,
+        mode: str,
+        degraded: bool = False,
+        degraded_reason: str | None = None,
+    ) -> dict:
+        degraded_reasons = list(dict.fromkeys(
+            reason for reason in result.get("degraded_reasons", []) if reason
+        ))
+        if degraded_reason and degraded_reason not in degraded_reasons:
+            degraded_reasons.insert(0, degraded_reason)
+        primary_degraded_reason = degraded_reasons[0] if degraded_reasons else None
         result.update({
             "request_id": request_id,
             "mode": mode,
-            "degraded": degraded,
-            "degraded_reason": degraded_reason,
+            "retrieval_mode": retrieval_mode,
+            "degraded": bool(degraded or degraded_reasons),
+            "degraded_reason": primary_degraded_reason,
+            "degraded_reasons": degraded_reasons,
             "index_version": index_version,
             "cache_hit": mode == "cache",
             "model_state": model_state,
@@ -84,8 +102,8 @@ def search(
                 latency_ms=latency,
                 result_count=len(result.get("top_matches", [])),
                 cache_hit=mode == "cache",
-                degraded=degraded,
-                degraded_reason=degraded_reason,
+                degraded=bool(degraded or degraded_reasons),
+                degraded_reason=primary_degraded_reason,
                 model_state=model_state,
             )
         return result
@@ -97,7 +115,12 @@ def search(
     # the existing fast result cache for context-free profile searches only;
     # the query-vector cache remains safe and shared for every variant.
     result_cache_enabled = current_context is None and scope == "profile"
-    result_cache_query = f"{normalized_query}\x1fgraph={int(graph_enabled)}"
+    result_cache_query = (
+        f"{normalized_query}\x1fgraph={int(graph_enabled)}"
+        f"\x1fmode={retrieval_mode}"
+        f"\x1ftransform={int(config.QUERY_TRANSFORM_ENABLED if transform_enabled is None else bool(transform_enabled))}"
+        f"\x1frerank={int(config.RERANK_ENABLED if rerank_enabled is None else bool(rerank_enabled))}"
+    )
     cached = (
         query_cache.get_result(identity, result_cache_query, top_k)
         if result_cache_enabled else None
@@ -155,6 +178,9 @@ def search(
             current_context=current_context,
             scope=scope,
             graph_enabled=graph_enabled,
+            retrieval_mode=retrieval_mode,
+            transform_enabled=transform_enabled,
+            rerank_enabled=rerank_enabled,
         )
 
     # ── Step 2: 向量检索 ──
@@ -176,16 +202,127 @@ def search(
             current_context=current_context,
             scope=scope,
             graph_enabled=graph_enabled,
+            retrieval_mode=retrieval_mode,
+            transform_enabled=transform_enabled,
+            rerank_enabled=rerank_enabled,
         )
     latency["vector"] = performance.elapsed_ms(vector_started)
 
-    # 过滤低于阈值的
-    rerank_started = performance.now()
-    matches = [m for m in matches if m["similarity"] >= config.SIM_THRESHOLD_SEARCH]
-    matches, strict_filtered = _environment_rerank(
-        matches, current_context=current_context, scope=scope, top_k=top_k
+    # ── Step 3: 常态 lexical lane + RRF fusion ──
+    candidate_limit = max(top_k * 4, top_k, min(64, config.RERANK_TOP_N))
+    vector_matches = [
+        match for match in matches
+        if match["similarity"] >= config.SIM_THRESHOLD_SEARCH
+    ]
+    lexical_started = performance.now()
+    lexical_status, lexical_matches = _call_with_deadline(
+        lambda: store.search_by_lexical(
+            normalized_query,
+            top_k=candidate_limit,
+            timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
+        ),
+        config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
-    latency["rerank"] = performance.elapsed_ms(rerank_started)
+    latency["lexical"] = performance.elapsed_ms(lexical_started)
+    degraded_reasons: list[str] = []
+    if lexical_status != "ok" or lexical_matches is None:
+        lexical_matches = []
+        degraded_reasons.append("lexical_index_unavailable")
+
+    fusion_started = performance.now()
+    matches = adaptive.fuse_rankings(
+        vector_matches,
+        lexical_matches,
+        limit=candidate_limit,
+    )
+    matches, strict_filtered = _environment_rerank(
+        matches,
+        current_context=current_context,
+        scope=scope,
+        top_k=candidate_limit,
+    )
+    latency["fusion"] = performance.elapsed_ms(fusion_started)
+
+    # ── Step 4: explainable auto/deep gate + independently budgeted stage ──
+    query_plan = adaptive.plan_query(
+        normalized_query,
+        matches,
+        requested_mode=retrieval_mode,
+        current_context=current_context,
+        strict_filtered=strict_filtered,
+        transform_enabled=transform_enabled,
+    )
+    transform_used: list[str] = []
+    transform_trace = {
+        "status": "skipped",
+        "generated_queries": 0,
+        "retrievals_completed": 0,
+        "degraded_reasons": [],
+    }
+    if query_plan["should_transform"]:
+        second_stage_timeout = (
+            config.QUERY_DEEP_SECOND_STAGE_TIMEOUT_SECONDS
+            if retrieval_mode == "deep"
+            else config.QUERY_AUTO_SECOND_STAGE_TIMEOUT_SECONDS
+        )
+        if retrieval_mode == "deep":
+            elapsed_seconds = max(0.0, performance.now() - total_started)
+            reserved_seconds = (
+                config.GRAPH_DEEP_TIME_BUDGET_MS / 1000.0
+                + config.RERANK_TIMEOUT_SECONDS
+                + 0.05
+            )
+            second_stage_timeout = min(
+                second_stage_timeout,
+                max(
+                    0.001,
+                    config.QUERY_DEEP_TOTAL_TIMEOUT_SECONDS
+                    - elapsed_seconds
+                    - reserved_seconds,
+                ),
+            )
+        transform_started = performance.now()
+        transform_status, transformed = _call_with_deadline(
+            lambda: _run_second_stage(
+                normalized_query,
+                selected_transforms=query_plan["selected_transforms"],
+                retrieval_mode=retrieval_mode,
+                identity=identity,
+                candidate_limit=candidate_limit,
+            ),
+            second_stage_timeout,
+        )
+        latency["transform"] = performance.elapsed_ms(transform_started)
+        if transform_status == "ok" and transformed is not None:
+            transform_trace = transformed["trace"]
+            transform_used = transformed["transform_used"]
+            degraded_reasons.extend(transformed["degraded_reasons"])
+            matches = adaptive.merge_transformed_rankings(
+                matches,
+                transformed["rankings"],
+                mode=retrieval_mode,
+                limit=candidate_limit,
+            )
+            matches, extra_strict_filtered = _environment_rerank(
+                matches,
+                current_context=current_context,
+                scope=scope,
+                top_k=candidate_limit,
+            )
+            strict_filtered += extra_strict_filtered
+        else:
+            reason = (
+                "query_transform_timeout"
+                if transform_status == "timeout"
+                else "query_transform_unavailable"
+            )
+            degraded_reasons.append(reason)
+            transform_trace = {
+                "status": transform_status,
+                "generated_queries": 0,
+                "retrievals_completed": 0,
+                "degraded_reasons": [reason],
+            }
 
     if not matches:
         result = {
@@ -197,29 +334,81 @@ def search(
             "feedback_queued": True,
             "strict_filtered": strict_filtered,
             "graph_enabled": graph_enabled,
+            "transform_used": transform_used,
+            "query_plan": query_plan,
+            "transform_trace": transform_trace,
+            "rerank_trace": {
+                "enabled": bool(config.RERANK_ENABLED),
+                "status": "not_run",
+                "top_n": 0,
+                "degraded_reason": None,
+            },
+            "degraded_reasons": degraded_reasons,
             "truncated": False,
             "truncated_reasons": [],
             "graph_trace": _empty_graph_trace(matches),
         }
-        if result_cache_enabled:
+        if result_cache_enabled and not degraded_reasons:
             query_cache.set_result(
                 identity, result_cache_query, top_k, _cacheable_result(result)
             )
-        return finish(result, mode="vector")
+        return finish(result, mode="vector", degraded=bool(degraded_reasons))
 
-    # ── Step 3: 受预算 Memory Graph 扩散与去重排序 ──
+    # ── Step 5: 受模式预算的 Memory Graph 扩散与去重排序 ──
     graph_started = performance.now()
     matches, graph_info, graph_strict_filtered = _graph_rerank(
         matches,
-        top_k=top_k,
+        top_k=candidate_limit,
         retrieval_source="vector",
         graph_enabled=graph_enabled,
         current_context=current_context,
         scope=scope,
+        graph_budget=(
+            {
+                "max_hops": config.GRAPH_DEEP_MAX_HOPS,
+                "max_paths": config.GRAPH_DEEP_MAX_PATHS,
+                "fan_out": config.GRAPH_DEEP_FAN_OUT,
+                "time_budget_ms": min(
+                    config.GRAPH_DEEP_TIME_BUDGET_MS,
+                    max(
+                        0.0,
+                        (
+                            config.QUERY_DEEP_TOTAL_TIMEOUT_SECONDS
+                            - max(0.0, performance.now() - total_started)
+                            - config.RERANK_TIMEOUT_SECONDS
+                        ) * 1000.0,
+                    ),
+                ),
+                "token_budget": config.GRAPH_DEEP_TOKEN_BUDGET,
+            }
+            if retrieval_mode == "deep" else None
+        ),
     )
     strict_filtered += graph_strict_filtered
-    top_matches = _attach_related(matches)
     latency["graph"] = performance.elapsed_ms(graph_started)
+    if graph_info["trace"].get("status") == "degraded":
+        degraded_reasons.append(
+            graph_info["trace"].get("degraded_reason", "graph_unavailable")
+        )
+
+    # ── Step 6: bounded local reranker with timeout/circuit fallback ──
+    rerank_started = performance.now()
+    matches, rerank_detail_trace = _hydrate_rerank_details(
+        matches, enabled=rerank_enabled
+    )
+    matches, rerank_trace = adaptive.rerank(
+        normalized_query,
+        matches,
+        enabled=rerank_enabled,
+    )
+    rerank_trace, rerank_reasons = _merge_rerank_traces(
+        rerank_trace, rerank_detail_trace
+    )
+    matches = _strip_rerank_details(matches)
+    latency["rerank"] = performance.elapsed_ms(rerank_started)
+    degraded_reasons.extend(rerank_reasons)
+    matches = matches[:top_k]
+    top_matches = _attach_related(matches)
 
     feedback_queued = feedback.enqueue_recall_feedback(
         [match["story_id"] for match in top_matches]
@@ -229,21 +418,157 @@ def search(
         "query": query,
         "keywords": keywords,
         "top_matches": top_matches,
-        "result_state": "results",
+        "result_state": "degraded_results" if degraded_reasons else "results",
         "query_vector_cache_hit": query_vector_cache_hit,
         "feedback_queued": feedback_queued,
         "strict_filtered": strict_filtered,
         "graph_enabled": graph_enabled,
+        "transform_used": transform_used,
+        "query_plan": query_plan,
+        "transform_trace": transform_trace,
+        "rerank_trace": rerank_trace,
+        "degraded_reasons": degraded_reasons,
         "truncated": graph_info["truncated"],
         "truncated_reasons": graph_info["truncated_reasons"],
         "graph_trace": graph_info["trace"],
     }
-    if result_cache_enabled:
+    if result_cache_enabled and not degraded_reasons:
         query_cache.set_result(
             identity, result_cache_query, top_k, _cacheable_result(result)
         )
 
-    return finish(result, mode="vector")
+    return finish(result, mode="vector", degraded=bool(degraded_reasons))
+
+
+def _run_second_stage(
+    normalized_query: str,
+    *,
+    selected_transforms: list[str],
+    retrieval_mode: str,
+    identity: str,
+    candidate_limit: int,
+) -> dict:
+    """Generate and retrieve transformed queries inside the caller deadline."""
+
+    transform_timeout = (
+        config.QUERY_DEEP_TRANSFORM_TIMEOUT_SECONDS
+        if retrieval_mode == "deep"
+        else config.QUERY_AUTO_TRANSFORM_TIMEOUT_SECONDS
+    )
+    payload = llm.transform_search_query(
+        normalized_query,
+        selected_transforms,
+        timeout_seconds=transform_timeout,
+    )
+    if not payload:
+        return {
+            "rankings": [],
+            "transform_used": [],
+            "degraded_reasons": ["query_transform_unavailable"],
+            "trace": {
+                "status": "unavailable",
+                "generated_queries": 0,
+                "retrievals_completed": 0,
+                "degraded_reasons": ["query_transform_unavailable"],
+            },
+        }
+
+    variants: list[tuple[str, str]] = []
+    if "rewrite" in selected_transforms and payload.get("rewrite"):
+        variants.append(("rewrite", str(payload["rewrite"])))
+    if "multi_query" in selected_transforms:
+        for value in payload.get("queries", [])[:max(1, config.QUERY_MULTI_QUERY_LIMIT)]:
+            if value:
+                variants.append(("multi_query", str(value)))
+    if "hyde" in selected_transforms and payload.get("hypothetical_document"):
+        variants.append(("hyde", str(payload["hypothetical_document"])))
+
+    deduplicated: list[tuple[str, str]] = []
+    seen = {normalized_query}
+    for transform, value in variants:
+        candidate = adaptive.normalize_query(value)
+        if candidate and candidate not in seen:
+            deduplicated.append((transform, candidate))
+            seen.add(candidate)
+    variants = deduplicated[:max(1, config.QUERY_MULTI_QUERY_LIMIT + 2)]
+
+    rankings: list[dict] = []
+    used: list[str] = []
+    degraded_reasons: list[str] = []
+    for query_index, (transform, transformed_query) in enumerate(variants):
+        vector = query_cache.get_query_vector(identity, transformed_query)
+        if vector is None:
+            embed_timeout = min(
+                config.QUERY_WARM_TIMEOUT_SECONDS,
+                max(0.05, transform_timeout),
+            )
+            embed_status, vector = _call_with_deadline(
+                lambda value=transformed_query: embeddings.embed(
+                    value,
+                    timeout_seconds=embed_timeout,
+                    keep_alive=config.EMBED_KEEP_ALIVE,
+                ),
+                embed_timeout,
+            )
+            if embed_status == "timeout":
+                degraded_reasons.append("transformed_embedding_timeout")
+            elif embed_status != "ok" or not vector:
+                degraded_reasons.append("transformed_embedding_unavailable")
+            else:
+                embeddings.mark_model_used()
+                query_cache.set_query_vector(identity, transformed_query, vector)
+
+        vector_matches = []
+        if vector:
+            try:
+                vector_matches = [
+                    item for item in store.search_by_vector(
+                        vector, top_k=candidate_limit
+                    )
+                    if item["similarity"] >= config.SIM_THRESHOLD_SEARCH
+                ]
+            except Exception:  # noqa: BLE001
+                degraded_reasons.append("vector_index_unavailable")
+
+        lexical_status, lexical_matches = _call_with_deadline(
+            lambda value=transformed_query: store.search_by_lexical(
+                value,
+                top_k=candidate_limit,
+                timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
+            ),
+            config.QUERY_FALLBACK_TIMEOUT_SECONDS,
+        )
+        if lexical_status != "ok" or lexical_matches is None:
+            lexical_matches = []
+            degraded_reasons.append("lexical_index_unavailable")
+        fused = adaptive.fuse_rankings(
+            vector_matches, lexical_matches, limit=candidate_limit
+        )
+        if fused:
+            rankings.append({
+                "transform": transform,
+                "query_index": query_index,
+                "matches": fused,
+            })
+        if transform not in used:
+            used.append(transform)
+
+    stable_reasons = list(dict.fromkeys(degraded_reasons))
+    status = "ok" if variants else "unavailable"
+    if not variants:
+        stable_reasons.append("query_transform_unavailable")
+    return {
+        "rankings": rankings,
+        "transform_used": used,
+        "degraded_reasons": stable_reasons,
+        "trace": {
+            "status": status,
+            "generated_queries": len(variants),
+            "retrievals_completed": len(rankings),
+            "transforms": used,
+            "degraded_reasons": stable_reasons,
+        },
+    }
 
 
 def _lexical_fallback(
@@ -258,6 +583,9 @@ def _lexical_fallback(
     current_context: dict | None,
     scope: str,
     graph_enabled: bool,
+    retrieval_mode: str,
+    transform_enabled: bool | None,
+    rerank_enabled: bool | None,
 ) -> dict:
     fallback_started = performance.now()
     call_status, fallback_output = _call_with_deadline(
@@ -267,6 +595,8 @@ def _lexical_fallback(
             current_context=current_context,
             scope=scope,
             graph_enabled=graph_enabled,
+            retrieval_mode=retrieval_mode,
+            rerank_enabled=rerank_enabled,
         ),
         config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
@@ -274,10 +604,11 @@ def _lexical_fallback(
     if call_status == "ok":
         (
             matches, top_matches, fallback_ms, graph_ms, strict_filtered,
-            graph_info,
+            graph_info, rerank_trace, fallback_degraded_reasons,
         ) = fallback_output
         latency["fallback"] = fallback_ms
         latency["graph"] = graph_ms
+        latency["rerank"] = rerank_trace.get("elapsed_ms", 0.0)
         feedback_queued = feedback.enqueue_recall_feedback(
             [match["story_id"] for match in matches or []]
         )
@@ -295,6 +626,28 @@ def _lexical_fallback(
             "truncated_reasons": [],
             "trace": _empty_graph_trace([]),
         }
+        rerank_trace = {
+            "enabled": bool(config.RERANK_ENABLED),
+            "status": "not_run",
+            "top_n": 0,
+            "degraded_reason": None,
+        }
+        fallback_degraded_reasons = []
+
+    query_plan = adaptive.plan_query(
+        normalized_query,
+        top_matches,
+        requested_mode=retrieval_mode,
+        current_context=current_context,
+        strict_filtered=strict_filtered,
+        transform_enabled=transform_enabled,
+    )
+    # A missing primary embedding is already on the fast fallback path.  Do not
+    # let a generative second stage delay or disguise that usable lexical result.
+    query_plan["should_transform"] = False
+    query_plan["effective_mode"] = "fast_fallback"
+    query_plan["skip_reason"] = "primary_embedding_unavailable"
+    degraded_reasons = [degraded_reason, *fallback_degraded_reasons]
 
     return finish(
         {
@@ -307,6 +660,16 @@ def _lexical_fallback(
             "query_vector_cache_hit": query_vector_cache_hit,
             "feedback_queued": feedback_queued,
             "graph_enabled": graph_enabled,
+            "transform_used": [],
+            "query_plan": query_plan,
+            "transform_trace": {
+                "status": "skipped",
+                "generated_queries": 0,
+                "retrievals_completed": 0,
+                "degraded_reasons": [],
+            },
+            "rerank_trace": rerank_trace,
+            "degraded_reasons": degraded_reasons,
             "truncated": graph_info["truncated"],
             "truncated_reasons": graph_info["truncated_reasons"],
             "graph_trace": graph_info["trace"],
@@ -324,34 +687,145 @@ def _run_lexical_fallback(
     current_context: dict | None,
     scope: str,
     graph_enabled: bool,
-) -> tuple[list[dict], list[dict], float, float, int, dict]:
+    retrieval_mode: str,
+    rerank_enabled: bool | None,
+) -> tuple[list[dict], list[dict], float, float, int, dict, dict, list[str]]:
     """在同一个 500ms deadline 内完成词法检索与关联读取。"""
 
     fallback_started = time.perf_counter()
-    matches = store.search_by_lexical(
+    lexical_matches = store.search_by_lexical(
         normalized_query,
-        top_k=max(top_k * 4, top_k),
+        top_k=max(top_k * 4, top_k, min(64, config.RERANK_TOP_N)),
         timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
     fallback_ms = round((time.perf_counter() - fallback_started) * 1000, 3)
+    candidate_limit = max(top_k * 4, top_k, min(64, config.RERANK_TOP_N))
+    matches = adaptive.fuse_rankings([], lexical_matches, limit=candidate_limit)
     matches, strict_filtered = _environment_rerank(
-        matches, current_context=current_context, scope=scope, top_k=top_k
+        matches,
+        current_context=current_context,
+        scope=scope,
+        top_k=candidate_limit,
     )
     graph_started = time.perf_counter()
     matches, graph_info, graph_strict_filtered = _graph_rerank(
         matches,
-        top_k=top_k,
+        top_k=candidate_limit,
         retrieval_source="lexical",
         graph_enabled=graph_enabled,
         current_context=current_context,
         scope=scope,
+        graph_budget=(
+            {
+                "max_hops": config.GRAPH_DEEP_MAX_HOPS,
+                "max_paths": config.GRAPH_DEEP_MAX_PATHS,
+                "fan_out": config.GRAPH_DEEP_FAN_OUT,
+                "time_budget_ms": config.GRAPH_DEEP_TIME_BUDGET_MS,
+                "token_budget": config.GRAPH_DEEP_TOKEN_BUDGET,
+            }
+            if retrieval_mode == "deep" else None
+        ),
     )
     strict_filtered += graph_strict_filtered
+    matches, rerank_detail_trace = _hydrate_rerank_details(
+        matches, enabled=rerank_enabled
+    )
+    matches, rerank_trace = adaptive.rerank(
+        normalized_query, matches, enabled=rerank_enabled
+    )
+    rerank_trace, rerank_reasons = _merge_rerank_traces(
+        rerank_trace, rerank_detail_trace
+    )
+    matches = _strip_rerank_details(matches)
+    matches = matches[:top_k]
     top_matches = _attach_related(matches)
     graph_ms = round((time.perf_counter() - graph_started) * 1000, 3)
+    degraded_reasons = []
+    if graph_info["trace"].get("status") == "degraded":
+        degraded_reasons.append(
+            graph_info["trace"].get("degraded_reason", "graph_unavailable")
+        )
+    degraded_reasons.extend(rerank_reasons)
     return (
         matches, top_matches, fallback_ms, graph_ms, strict_filtered, graph_info,
+        rerank_trace, degraded_reasons,
     )
+
+
+def _hydrate_rerank_details(
+    matches: list[dict], *, enabled: bool | None
+) -> tuple[list[dict], dict]:
+    """Attach full detail to only the bounded local reranker prefix."""
+
+    use_reranker = config.RERANK_ENABLED if enabled is None else bool(enabled)
+    top_n = min(len(matches), max(0, config.RERANK_TOP_N))
+    trace = {
+        "detail_status": "not_run",
+        "detail_degraded_reason": None,
+        "details_hydrated": 0,
+    }
+    if not use_reranker or top_n == 0:
+        return matches, trace
+    status, details = adaptive.call_with_deadline(
+        lambda: store.get_story_rerank_texts([
+            item["story_id"] for item in matches[:top_n]
+        ]),
+        config.RERANK_TIMEOUT_SECONDS,
+    )
+    if status != "ok" or not isinstance(details, dict):
+        detail_status = "timeout" if status == "timeout" else "unavailable"
+        trace.update({
+            "detail_status": detail_status,
+            "detail_degraded_reason": (
+                "reranker_detail_timeout"
+                if detail_status == "timeout"
+                else "reranker_detail_unavailable"
+            ),
+        })
+        logger.warning("reranker detail hydration %s", detail_status)
+        return matches, trace
+    hydrated = []
+    for position, item in enumerate(matches):
+        candidate = dict(item)
+        if position < top_n and details.get(int(item["story_id"])):
+            candidate["_rerank_text"] = details[int(item["story_id"])]
+            trace["details_hydrated"] += 1
+        hydrated.append(candidate)
+    trace["detail_status"] = "ok"
+    return hydrated, trace
+
+
+def _merge_rerank_traces(
+    rerank_trace: dict, detail_trace: dict
+) -> tuple[dict, list[str]]:
+    """Expose core and detail failures through one stable degradation contract."""
+
+    merged = dict(rerank_trace)
+    core_reason = merged.get("degraded_reason")
+    merged.update(detail_trace)
+    reasons = list(dict.fromkeys(
+        reason for reason in (
+            core_reason,
+            detail_trace.get("detail_degraded_reason"),
+        ) if reason
+    ))
+    merged["degraded_reason"] = reasons[0] if reasons else None
+    merged["degraded_reasons"] = reasons
+    return merged, reasons
+
+
+def _strip_rerank_details(matches: list[dict]) -> list[dict]:
+    """Guarantee internal full-detail scoring text never reaches recall output."""
+
+    stripped = []
+    for item in matches:
+        if "_rerank_text" not in item:
+            stripped.append(item)
+            continue
+        candidate = dict(item)
+        candidate.pop("_rerank_text", None)
+        stripped.append(candidate)
+    return stripped
 
 
 def _environment_rerank(
@@ -382,16 +856,28 @@ def _environment_rerank(
             strict_filtered += 1
             continue
         match.update(fit)
+        semantic_score = float(
+            match.get("fusion_score", match.get("score", match["similarity"]))
+        )
         match["score"] = _environment_rank_score(
-            match["similarity"],
+            semantic_score,
             fit["environment_score"],
             has_context=current_context is not None,
         )
+        components = match.setdefault("score_components", {})
+        components.update({
+            "environment_score": fit["environment_score"],
+            "final_score": match["score"],
+        })
         reranked.append(match)
     return (
         sorted(
             reranked,
-            key=lambda item: (item["similarity"], item["environment_score"]),
+            key=lambda item: (
+                item.get("fusion_score", item["similarity"]),
+                item["environment_score"],
+                item.get("similarity", 0.0),
+            ),
             reverse=True,
         )[:top_k],
         strict_filtered,
@@ -431,22 +917,25 @@ def _graph_rerank(
     graph_enabled: bool,
     current_context: dict | None,
     scope: str,
+    graph_budget: dict | None = None,
 ) -> tuple[list[dict], dict, int]:
     """Merge direct seeds with deduplicated graph candidates."""
 
     direct = []
     for match in matches:
         item = dict(match)
+        components = dict(item.get("score_components", {}))
+        components.update({
+            "direct_similarity": item["similarity"],
+            "environment_score": item.get("environment_score", 0.0),
+            "graph_score": 0.0,
+            "final_score": item.get("score", item["similarity"]),
+        })
         item.update({
-            "retrieval_source": retrieval_source,
+            "retrieval_source": item.get("retrieval_source", retrieval_source),
             "seed_story_id": item["story_id"],
             "graph_path": [],
-            "score_components": {
-                "direct_similarity": item["similarity"],
-                "environment_score": item.get("environment_score", 0.0),
-                "graph_score": 0.0,
-                "final_score": item.get("score", item["similarity"]),
-            },
+            "score_components": components,
         })
         direct.append(item)
     if not graph_enabled:
@@ -457,7 +946,7 @@ def _graph_rerank(
         }, 0
 
     try:
-        expansion = graph_module.expand(direct)
+        expansion = graph_module.expand(direct, **(graph_budget or {}))
     except Exception:  # noqa: BLE001 -- graph failure must preserve direct recall
         logger.warning("Memory Graph 扩散失败，已回退直接检索")
         trace = _empty_graph_trace(direct, status="degraded")
@@ -553,6 +1042,9 @@ def _attach_related(matches: list[dict]) -> list[dict]:
             "keywords": match["keywords"],
             "similarity": match["similarity"],
             "score": match.get("score", match["similarity"]),
+            "fusion_score": match.get(
+                "fusion_score", match.get("score", match["similarity"])
+            ),
             "environment_score": match.get("environment_score", 0.0),
             "environment": match.get("matched_environment"),
             "environments": match.get("environments", []),
@@ -562,6 +1054,7 @@ def _attach_related(matches: list[dict]) -> list[dict]:
             "seed_story_id": match.get("seed_story_id", match["story_id"]),
             "graph_path": match.get("graph_path", []),
             "score_components": match.get("score_components", {}),
+            "source_paths": match.get("source_paths", []),
             "related": [
                 {
                     "story_id": item["id"],
@@ -622,8 +1115,15 @@ def format_search_result(result: dict) -> str:
     lines.append(f"🔍 搜索: {result['query']}")
     if result.get("latency_ms"):
         lines.append(
-            f"   {result.get('mode', 'unknown')} · "
+            f"   {result.get('retrieval_mode', 'fast')}/"
+            f"{result.get('mode', 'unknown')} · "
             f"{result['latency_ms'].get('total', 0):.1f}ms"
+        )
+
+    if result.get("transform_used"):
+        lines.append(
+            f"   查询增强: {', '.join(result['transform_used'])} · "
+            f"触发原因: {', '.join(result.get('query_plan', {}).get('trigger_reasons', []))}"
         )
 
     if result.get("keywords"):
@@ -631,8 +1131,8 @@ def format_search_result(result: dict) -> str:
 
     if result.get("degraded") and result.get("top_matches"):
         lines.append(
-            f"   ⚠️ 向量路径已降级（{result.get('degraded_reason', 'unknown')}），"
-            "以下为关键词 fallback 结果"
+            f"   ⚠️ 检索组件已降级（{', '.join(result.get('degraded_reasons', [])) or 'unknown'}），"
+            "以下为可用 fallback 结果"
         )
 
     if not result.get("top_matches"):

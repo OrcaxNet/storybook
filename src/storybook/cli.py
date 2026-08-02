@@ -849,8 +849,28 @@ def dream(once, interval):
     show_default=True,
     help="profile 默认软加权；strict 对环境冲突硬过滤",
 )
+@click.option(
+    "--mode",
+    "retrieval_mode",
+    type=click.Choice(["fast", "auto", "deep"]),
+    default=lambda: config.QUERY_DEFAULT_MODE,
+    show_default="fast",
+    help="fast 无生成式调用；auto 按置信门控；deep 使用显式高预算",
+)
+@click.option(
+    "--transform/--no-transform",
+    default=None,
+    help="覆盖 Query Transformation/HyDE 总开关",
+)
+@click.option(
+    "--rerank/--no-rerank",
+    default=None,
+    help="覆盖本地有界 reranker 开关",
+)
 @click.option("--cwd", type=click.Path(path_type=Path), default=None, hidden=True)
-def search(query, top, context_mode, scope, cwd):
+def search(
+    query, top, context_mode, scope, retrieval_mode, transform, rerank, cwd
+):
     """🔍 搜索记忆"""
     store.init_db()
     current_context = None
@@ -865,6 +885,9 @@ def search(query, top, context_mode, scope, cwd):
         top_k=top,
         context=current_context,
         scope=scope,
+        retrieval_mode=retrieval_mode,
+        transform_enabled=transform,
+        rerank_enabled=rerank,
     )
     output = search_module.format_search_result(result)
     click.echo(output)
@@ -1028,16 +1051,19 @@ def main():
 @cli.command()
 @click.argument("part", required=False, default="all",
                 type=click.Choice([
-                    "all", "retrieval", "processing", "split", "ablation"
+                    "all", "retrieval", "processing", "split", "ablation",
+                    "strategy",
                 ]))
 @click.option("--report", "-r", type=click.Path(dir_okay=False, writable=True),
               help="把完整 JSON 报告写入该路径")
 @click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
               help="自定义 benchmark 数据集 JSON（默认 data/retrieval_benchmark.json）")
-def eval(part, report, benchmark_path):
+@click.option("--transform-cache", type=click.Path(exists=True, dir_okay=False),
+              help="query-only 预生成 transformation JSON；仅用于可复现质量证据")
+def eval(part, report, benchmark_path, transform_cache):
     """📐 检索、加工、分裂与 Story v2 embedding 表示消融
 
-    PART 取值：retrieval / processing / split / ablation / all（默认 all）。
+    PART 取值：retrieval / processing / split / ablation / strategy / all（默认 all）。
 
     retrieval 用真实 embedding + 人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、
     阈值敏感性曲线，并判定是否达 PRD「重复 bug 检索准确率≥70%」(recall@3)。
@@ -1045,18 +1071,32 @@ def eval(part, report, benchmark_path):
     split 度量分裂路径结构正确性。
     ablation 比较 legacy/default/full/multi-vector，并按 exact/synonym/
     cross-tool/cross-language 分组报告质量与时延。
+    strategy 比较 direct-vector、hybrid、+graph、+rewrite、+HyDE、+reranker，
+    并按 exact/synonym/cross-language/cross-tool/ambiguous 执行默认启用门禁。
 
     需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染用户 Profile 数据库。
     用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
     """
     parts = (
-        "retrieval", "processing", "split", "ablation"
+        "retrieval", "processing", "split", "ablation", "strategy"
     ) if part == "all" else (part,)
     click.echo(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
 
     bp = benchmark_path
     try:
-        rep = eval_module.run_all(parts=parts, benchmark_path=bp)
+        transform_provider = None
+        transform_source = "live_generated"
+        if transform_cache:
+            transform_provider = eval_module.pre_generated_transform_provider(
+                transform_cache
+            )
+            transform_source = "query_only_pre_generated"
+        rep = eval_module.run_all(
+            parts=parts,
+            benchmark_path=bp,
+            transform_provider=transform_provider,
+            transform_source=transform_source,
+        )
     except Exception as ex:
         click.echo(f"❌ 评测失败: {ex}")
         raise
@@ -1075,6 +1115,9 @@ def eval(part, report, benchmark_path):
 @cli.command(name="benchmark")
 @click.option("--model-state", type=click.Choice(["warm", "cold"]), default="warm",
               show_default=True, help="warm 会先预热；cold 每批请求前卸载 embedding 模型")
+@click.option("--retrieval-mode", type=click.Choice(["fast", "auto", "deep"]),
+              default="fast", show_default=True,
+              help="要测量的检索模式；deep 会包含本地 LLM transformation")
 @click.option("--stories", type=click.IntRange(min=1), default=10_000,
               show_default=True, help="隔离数据集 Story 数")
 @click.option("--queries", type=click.IntRange(min=1), default=50,
@@ -1088,7 +1131,7 @@ def eval(part, report, benchmark_path):
               help="把无原始 query 的完整 JSON 报告写入该路径")
 @click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
               help="自定义质量 benchmark JSON")
-def benchmark(model_state, stories, queries, repeats, concurrencies, report,
+def benchmark(model_state, retrieval_mode, stories, queries, repeats, concurrencies, report,
               benchmark_path):
     """📈 运行隔离的查询性能与质量基准。"""
     result = perf_benchmark.run_performance_benchmark(
@@ -1097,6 +1140,7 @@ def benchmark(model_state, stories, queries, repeats, concurrencies, report,
         repeats=repeats,
         concurrencies=tuple(concurrencies),
         model_state=model_state,
+        retrieval_mode=retrieval_mode,
         benchmark_path=benchmark_path,
     )
     click.echo(perf_benchmark.format_benchmark_report(result))

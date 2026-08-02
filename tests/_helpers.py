@@ -113,6 +113,11 @@ class FakeLLM:
             {"title": "子记忆2", "content": "子内容2"},
         ]
         self.stories: list[dict] | None = None
+        self.transformation: dict | None = {
+            "rewrite": "",
+            "queries": [],
+            "hypothetical_document": "",
+        }
         self.calls: dict[str, int] = {}
 
     def _tick(self, name: str) -> None:
@@ -143,6 +148,10 @@ class FakeLLM:
     def split_story(self, merged_text):
         self._tick("split_story")
         return [dict(s) for s in self.sub_stories]
+
+    def transform_search_query(self, query, transformations, **kwargs):
+        self._tick("transform_search_query")
+        return dict(self.transformation) if self.transformation is not None else None
 
 
 # ═══════════════════════════════════════════════

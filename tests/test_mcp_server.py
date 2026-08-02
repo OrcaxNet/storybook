@@ -69,6 +69,7 @@ class TestBuildRecallResult:
         })
         assert result["query"] == "q"
         assert result["count"] == 1
+        assert result["retrieval_mode"] == "fast"
         m = result["matches"][0]
         assert m["story_id"] == 1
         assert m["similarity"] == 0.88
@@ -301,6 +302,9 @@ class TestServerWiring:
         assert "context" in props
         assert "scope" in props
         assert "graph_enabled" in props
+        assert "retrieval_mode" in props
+        assert "transform_enabled" in props
+        assert "rerank_enabled" in props
         # query 必填
         assert "query" in tools["recall"].inputSchema.get("required", [])
 

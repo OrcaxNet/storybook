@@ -39,6 +39,7 @@ def run_performance_benchmark(
     repeats: int = DEFAULT_REPEATS,
     concurrencies: tuple[int, ...] = DEFAULT_CONCURRENCIES,
     model_state: str = "warm",
+    retrieval_mode: str = "fast",
     benchmark_path: Path | str | None = None,
     unload_model_fn: Callable[[], None] | None = None,
 ) -> dict:
@@ -49,6 +50,9 @@ def run_performance_benchmark(
         raise ValueError("query_count 和 repeats 必须大于 0")
     if model_state not in {"warm", "cold"}:
         raise ValueError("model_state 只能是 warm 或 cold")
+    retrieval_mode = retrieval_mode.strip().lower()
+    if retrieval_mode not in {"fast", "auto", "deep"}:
+        raise ValueError("retrieval_mode 只能是 fast、auto 或 deep")
     if not concurrencies or any(c < 1 for c in concurrencies):
         raise ValueError("concurrencies 必须是正整数")
 
@@ -74,6 +78,7 @@ def run_performance_benchmark(
                     repeats=repeats,
                     concurrency=concurrency,
                     model_state=model_state,
+                    retrieval_mode=retrieval_mode,
                     unload_model_fn=unload_model_fn,
                 )
             )
@@ -88,6 +93,7 @@ def run_performance_benchmark(
             "embedding": config.EMBED_MODEL,
             "dimension": config.EMBED_DIM,
             "state": model_state,
+            "retrieval_mode": retrieval_mode,
         },
         "dataset": {
             "stories": story_count,
@@ -130,7 +136,8 @@ def format_benchmark_report(report: dict) -> str:
             f"{machine['cpu_count']} cores | memory: {machine['memory_bytes']} bytes"
         ),
         (
-            f"model_state: {model['state']} | runs: {dataset['query_count']} queries "
+            f"model_state: {model['state']} | retrieval_mode: "
+            f"{model.get('retrieval_mode', 'fast')} | runs: {dataset['query_count']} queries "
             f"× {workload['repeats_per_query']} repeats"
         ),
     ]
@@ -286,6 +293,7 @@ def _run_scenario(
     repeats: int,
     concurrency: int,
     model_state: str,
+    retrieval_mode: str,
     unload_model_fn: Callable[[], None] | None,
 ) -> dict:
     tasks = [pair for _ in range(repeats) for pair in pairs]
@@ -309,7 +317,10 @@ def _run_scenario(
                 query_cache.clear()
             futures = [
                 executor.submit(
-                    _query_once, pair, topic_to_story[pair["topic_id"]]
+                    _query_once,
+                    pair,
+                    topic_to_story[pair["topic_id"]],
+                    retrieval_mode,
                 )
                 for pair in batch
             ]
@@ -371,9 +382,14 @@ def _run_scenario(
     }
 
 
-def _query_once(pair: dict, target_story_id: int) -> dict:
+def _query_once(
+    pair: dict, target_story_id: int, retrieval_mode: str = "fast"
+) -> dict:
     result = search_module.search(
-        pair["query"], top_k=5, record_diagnostics=False
+        pair["query"],
+        top_k=5,
+        retrieval_mode=retrieval_mode,
+        record_diagnostics=False,
     )
     match_ids = [match["story_id"] for match in result.get("top_matches", [])]
     return {
@@ -382,6 +398,7 @@ def _query_once(pair: dict, target_story_id: int) -> dict:
         "target_hit": target_story_id in match_ids,
         "match_ids": match_ids,
         "mode": result.get("mode", "error"),
+        "retrieval_mode": result.get("retrieval_mode", retrieval_mode),
         "degraded": bool(result.get("degraded")),
         "latency_ms": result["latency_ms"],
     }
