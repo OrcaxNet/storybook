@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from . import config
+from .identifiers import new_uuid7
 
 try:
     import fcntl
@@ -183,9 +184,15 @@ def _local_device_id() -> str:
             if raw != canonical:
                 _write_identity(fd, canonical)
             return existing
-        value = str(uuid.uuid4())
+        value = new_uuid7()
         _write_identity(fd, value.encode("ascii"))
         return value
+
+
+def local_device_id() -> str:
+    """Return the stable, privacy-safe identifier for this local device."""
+
+    return _local_device_id()
 
 
 def local_hash(value: Any, namespace: str) -> str | None:
@@ -396,7 +403,7 @@ def capture_context(
     integration_mode = (
         integration_mode if integration_mode in INTEGRATION_MODES else "manual"
     )
-    device_id = _local_device_id()
+    device_id = local_device_id()
     try:
         install_id = str(uuid.uuid5(
             uuid.UUID(device_id), f"{tool_type}:{integration_mode}",
