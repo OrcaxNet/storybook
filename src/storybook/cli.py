@@ -554,7 +554,7 @@ def init():
 def doctor(fix):
     """🩺 环境与健康自检
 
-    检查 Ollama 可达性、LLM/Embedding 模型、向量维度、sqlite-vec 扩展与
+    检查 DeepSeek LLM 配置、Ollama/Embedding 模型、向量维度、sqlite-vec 扩展与
     story_vectors 虚表、向量双写一致性，逐项给出 ✅/❌ 与修复建议。
     加 --fix 自动修复向量双写不一致。
     """
@@ -975,8 +975,8 @@ def status(include_performance, as_json):
     )
     model = payload["model"]
     click.echo(
-        f"Models         LLM {model['llm']['status']} · "
-        f"Embedding {model['embedding']['status']}"
+        f"Models         LLM {model['llm']['provider']}={model['llm']['status']} · "
+        f"Embedding {model['embedding']['provider']}={model['embedding']['status']}"
     )
     adapter = payload["adapter"]
     checks = ", ".join(
@@ -1139,7 +1139,7 @@ def eval(part, report, benchmark_path, transform_cache):
               show_default=True, help="warm 会先预热；cold 每批请求前卸载 embedding 模型")
 @click.option("--retrieval-mode", type=click.Choice(["fast", "auto", "deep"]),
               default="fast", show_default=True,
-              help="要测量的检索模式；deep 会包含本地 LLM transformation")
+              help="要测量的检索模式；deep 会包含 DeepSeek LLM transformation")
 @click.option("--stories", type=click.IntRange(min=1), default=10_000,
               show_default=True, help="隔离数据集 Story 数")
 @click.option("--queries", type=click.IntRange(min=1), default=50,

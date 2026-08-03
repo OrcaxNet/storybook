@@ -1,7 +1,8 @@
 """环境与健康自检 - ``storybook doctor``
 
-逐项检查 Ollama 可达性 / LLM 与 Embedding 模型 / 向量维度 / sqlite-vec 扩展与虚表 /
-向量双写一致性，给出 ✅/❌ 与可操作修复建议；``--fix`` 可修复向量双写不一致。
+逐项检查 Ollama 可达性 / DeepSeek LLM 配置 / Embedding 模型 / 向量维度 /
+sqlite-vec 扩展与虚表 / 向量双写一致性，给出 ✅/❌ 与可操作修复建议；
+``--fix`` 可修复向量双写不一致。
 
 优先级与依赖：Ollama 不可达时模型/维度检查跳过；sqlite-vec 或虚表缺失时一致性检查跳过。
 """
@@ -93,15 +94,20 @@ def run_doctor(fix: bool = False) -> bool:
 
     embed_pulled = ollama_ok and _model_pulled(tags, config.EMBED_MODEL)
 
-    # [2] LLM 模型已拉取
-    if not ollama_ok:
-        results.append(CheckResult("LLM 模型", False, skipped=True,
-                                   detail=f"{config.LLM_MODEL}（Ollama 不可达，跳过）"))
-    elif _model_pulled(tags, config.LLM_MODEL):
-        results.append(CheckResult("LLM 模型", True, detail=config.LLM_MODEL))
+    # [2] 云端生成式 LLM 只做无费用的配置就绪检查，不发送生成请求，也不依赖 Ollama。
+    if config.LLM_API_KEY:
+        results.append(CheckResult(
+            "LLM 配置",
+            True,
+            detail=f"provider={config.LLM_PROVIDER}，model={config.LLM_MODEL}"))
     else:
-        results.append(CheckResult("LLM 模型", False, detail=config.LLM_MODEL,
-                                   suggestion=f"`ollama pull {config.LLM_MODEL}`"))
+        results.append(CheckResult(
+            "LLM 配置",
+            False,
+            detail=(f"provider={config.LLM_PROVIDER}，model={config.LLM_MODEL}，"
+                    "reason=llm_credentials_missing"),
+            suggestion=("设置 ANTHROPIC_AUTH_TOKEN（或 DEEPSEEK_KEY），"
+                        "也可通过 STORYBOOK_LLM_ENV_FILE 指定配置文件")))
 
     # [3] Embedding 模型已拉取
     if not ollama_ok:

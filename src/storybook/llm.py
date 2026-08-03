@@ -1,5 +1,5 @@
 """
-LLM 处理层 — 封装 Ollama LLM API
+LLM 处理层 — 封装 DeepSeek Anthropic-compatible Messages API
 提供：摘要生成、关键词提取、分裂判断、Story 拆分、合并
 """
 import json
@@ -21,55 +21,81 @@ def _chat(
     timeout_seconds: float = 120,
     num_predict: int | None = None,
 ) -> Optional[str]:
-    """调用 Ollama chat API，返回纯文本响应"""
-    messages = []
+    """Call DeepSeek's Anthropic-compatible API and return text blocks."""
+
+    if not config.LLM_API_KEY:
+        logger.error(
+            "LLM request failed provider=%s category=credentials_missing",
+            config.LLM_PROVIDER,
+        )
+        return None
+
+    max_tokens = 4096 if num_predict is None else max(32, int(num_predict))
+    payload = {
+        "model": config.LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.3,
+        "thinking": {"type": "enabled" if config.LLM_THINK else "disabled"},
+    }
     if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+        payload["system"] = system
 
     try:
-        options = {"temperature": 0.3, "num_ctx": 8192}
-        if num_predict is not None:
-            options["num_predict"] = max(32, int(num_predict))
         resp = requests.post(
-            f"{config.OLLAMA_HOST}/api/chat",
-            json={
-                "model": config.LLM_MODEL,
-                "messages": messages,
-                "stream": False,
-                "think": config.LLM_THINK,
-                "options": options,
+            f"{config.LLM_BASE_URL.rstrip('/')}/v1/messages",
+            headers={
+                "x-api-key": config.LLM_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
             },
+            json=payload,
             timeout=max(0.1, float(timeout_seconds)),
         )
         resp.raise_for_status()
         data = resp.json()
-        return data.get("message", {}).get("content", "").strip()
-    except Exception as e:
-        logger.error("LLM 调用失败: %s", e)
-        return None
+        blocks = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(blocks, list):
+            raise ValueError("invalid content")
+        text = "".join(
+            block.get("text", "")
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ).strip()
+        if not text:
+            raise ValueError("empty content")
+        return text
+    except requests.exceptions.Timeout:
+        category, status = "timeout", None
+    except requests.exceptions.HTTPError as exc:
+        category = "http_error"
+        status = exc.response.status_code if exc.response is not None else None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        category, status = "invalid_response", None
+    except requests.exceptions.RequestException:
+        category, status = "network_error", None
+    except Exception:  # noqa: BLE001 -- provider failures preserve fallback semantics
+        category, status = "unexpected_error", None
+    if status is None:
+        logger.error(
+            "LLM request failed provider=%s category=%s",
+            config.LLM_PROVIDER,
+            category,
+        )
+    else:
+        logger.error(
+            "LLM request failed provider=%s category=%s status=%s",
+            config.LLM_PROVIDER,
+            category,
+            status,
+        )
+    return None
 
 
 def _generate(prompt: str) -> Optional[str]:
-    """调用 Ollama generate API（更轻量）"""
-    try:
-        resp = requests.post(
-            f"{config.OLLAMA_HOST}/api/generate",
-            json={
-                "model": config.LLM_MODEL,
-                "prompt": prompt,
-                "stream": False,
-                "think": config.LLM_THINK,
-                "options": {"temperature": 0.3, "num_ctx": 8192},
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("response", "").strip()
-    except Exception as e:
-        logger.error("LLM generate 失败: %s", e)
-        return None
+    """Compatibility wrapper for callers that historically used generate."""
+    return _chat(prompt)
 
 
 # ═══════════════════════════════════════════════

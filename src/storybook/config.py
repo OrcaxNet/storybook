@@ -6,6 +6,7 @@ from pathlib import Path
 
 # ── 安装根与 .env ──
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+_PROCESS_ENV = dict(os.environ)
 
 
 def _load_env_file(path: Path) -> None:
@@ -43,6 +44,91 @@ def _load_env_file(path: Path) -> None:
 
 # 启动时自动加载项目根 .env（无则跳过、不报错）；须在读 os.getenv 之前执行
 _load_env_file(BASE_DIR / ".env")
+
+
+def _parse_shell_env_file(path: Path) -> dict[str, str]:
+    """Parse simple shell-env assignments without evaluating shell syntax."""
+
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or not key.replace("_", "a").isalnum() or key[0].isdigit():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _expand_home_path(value: str, home: Path) -> Path:
+    if value == "~":
+        return home
+    if value.startswith("~/"):
+        return home / value[2:]
+    return Path(value)
+
+
+def resolve_llm_config(
+    *,
+    process_env: dict[str, str] | None = None,
+    project_env_path: Path | None = None,
+    home: Path | None = None,
+) -> dict[str, str | bool | None]:
+    """Resolve cloud LLM settings with source precedence and no shell execution.
+
+    Precedence is process environment, the selected LLM env file, project
+    ``.env``, then defaults. Within each source, the documented alias order is
+    preserved (for example ``ANTHROPIC_AUTH_TOKEN`` before ``DEEPSEEK_KEY``).
+    """
+
+    process = dict(_PROCESS_ENV if process_env is None else process_env)
+    project = _parse_shell_env_file(project_env_path or (BASE_DIR / ".env"))
+    selected_file = (
+        process.get("STORYBOOK_LLM_ENV_FILE")
+        or project.get("STORYBOOK_LLM_ENV_FILE")
+        or "~/.chrc/dpsk.sh"
+    )
+    home_path = Path.home() if home is None else Path(home)
+    llm_file = _parse_shell_env_file(_expand_home_path(selected_file, home_path))
+    layers = (process, llm_file, project)
+
+    def pick(*keys: str, default: str | None = None) -> str | None:
+        for layer in layers:
+            for key in keys:
+                value = layer.get(key)
+                if value is not None and value.strip():
+                    return value.strip()
+        return default
+
+    think_value = pick("STORYBOOK_LLM_THINK", default="0") or "0"
+    return {
+        "env_file": str(_expand_home_path(selected_file, home_path)),
+        "base_url": pick(
+            "ANTHROPIC_BASE_URL", default="https://api.deepseek.com/anthropic"
+        ),
+        "api_key": pick("ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_KEY"),
+        "model": pick(
+            "STORYBOOK_LLM_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            default="deepseek-v4-flash",
+        ),
+        "think": think_value.strip().lower() in {"1", "true", "yes", "on"},
+    }
 
 # ── 用户级 Profile 与运行态路径 ──
 # registry 是 CLI、MCP、hook、Cursor/Claude/Codex adapter 的唯一数据目录入口。
@@ -162,14 +248,18 @@ except profiles_module.ProfileError:
 
 # ── Ollama ──
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-LLM_MODEL = os.getenv("STORYBOOK_LLM_MODEL", "qwythos-hermes:latest")
+LLM_PROVIDER = "deepseek_anthropic"
+_LLM_CONFIG = resolve_llm_config()
+LLM_BASE_URL = str(_LLM_CONFIG["base_url"])
+LLM_API_KEY = _LLM_CONFIG["api_key"]
+LLM_MODEL = str(_LLM_CONFIG["model"])
 EMBED_MODEL = os.getenv("STORYBOOK_EMBED_MODEL", "qwen3-embedding:0.6b")
 EMBED_DIM = 1024
 EMBED_VERSION = os.getenv("STORYBOOK_EMBED_VERSION", "story-v2-default-v1")
 EMBED_REPRESENTATION = os.getenv(
     "STORYBOOK_EMBED_REPRESENTATION", "default"
 )
-LLM_THINK = os.getenv("STORYBOOK_LLM_THINK", "0") == "1"  # Qwen3 思考模式；提取类任务关闭可约 9x 加速，准确率不足时设 1
+LLM_THINK = bool(_LLM_CONFIG["think"])
 
 # ── 查询快路径 ──
 # Ollama 的 keep_alive 由每次 embedding 请求续期；进程内 warm window 用于选择

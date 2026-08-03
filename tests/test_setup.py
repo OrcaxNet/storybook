@@ -48,7 +48,6 @@ def isolated_setup(tmp_path, monkeypatch):
         "_ensure_models",
         lambda **kwargs: (
             [
-                {"name": config.LLM_MODEL, "status": "cached"},
                 {"name": config.EMBED_MODEL, "status": "cached"},
             ],
             [],
@@ -842,13 +841,16 @@ def test_model_unavailable_returns_degraded_not_failed(isolated_setup, monkeypat
     assert result["degraded_reasons"] == ["Ollama unavailable"]
 
 
-def _invoke_runtime_status(manager, monkeypatch, *, reachable=True, models=None):
+def _invoke_runtime_status(
+    manager, monkeypatch, *, reachable=True, models=None, credentials=True
+):
     tags = {"models": [{"name": name} for name in (models or ())]}
     monkeypatch.setattr(
         "storybook.setup_manager.health._check_ollama_reachable",
         lambda: (reachable, tags if reachable else None, "offline"),
     )
     monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    monkeypatch.setattr(config, "LLM_API_KEY", "configured" if credentials else None)
     result = CliRunner().invoke(cli, ["status", "--json"])
     assert result.exit_code == 0, result.output
     return json.loads(result.output)
@@ -861,7 +863,7 @@ def test_status_reports_normal_ready_components(isolated_setup, monkeypatch):
     payload = _invoke_runtime_status(
         manager,
         monkeypatch,
-        models=(config.LLM_MODEL, config.EMBED_MODEL),
+        models=(config.EMBED_MODEL,),
     )
 
     assert payload["status"] == "ready"
@@ -882,7 +884,7 @@ def test_status_reports_ollama_unavailable(isolated_setup, monkeypatch):
     payload = _invoke_runtime_status(manager, monkeypatch, reachable=False)
 
     assert payload["status"] == "ready_degraded"
-    assert payload["model"]["status"] == "unavailable"
+    assert payload["model"]["status"] == "degraded"
     assert payload["degraded_reasons"] == ["ollama_unavailable"]
 
 
@@ -891,7 +893,7 @@ def test_status_reports_missing_embedding_model(isolated_setup, monkeypatch):
     manager.execute(requested_agents=("codex",), download_models=False)
 
     payload = _invoke_runtime_status(
-        manager, monkeypatch, models=(config.LLM_MODEL,)
+        manager, monkeypatch, models=()
     )
 
     assert payload["status"] == "ready_degraded"
@@ -907,7 +909,7 @@ def test_status_reports_managed_adapter_missing(isolated_setup, monkeypatch):
     payload = _invoke_runtime_status(
         manager,
         monkeypatch,
-        models=(config.LLM_MODEL, config.EMBED_MODEL),
+        models=(config.EMBED_MODEL,),
     )
 
     assert payload["status"] == "ready_degraded"
@@ -928,12 +930,57 @@ def test_status_reports_invalid_setup_state_without_crashing(
     payload = _invoke_runtime_status(
         manager,
         monkeypatch,
-        models=(config.LLM_MODEL, config.EMBED_MODEL),
+        models=(config.EMBED_MODEL,),
     )
 
     assert payload["status"] == "ready_degraded"
     assert payload["adapter"] == {"status": "not_configured", "checks": []}
     assert payload["degraded_reasons"] == ["setup_state_invalid"]
+
+
+def test_status_reports_mixed_providers_and_missing_llm_credentials(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    payload = _invoke_runtime_status(
+        manager,
+        monkeypatch,
+        models=(config.EMBED_MODEL,),
+        credentials=False,
+    )
+
+    assert payload["model"]["provider"] == "hybrid"
+    assert payload["model"]["llm"] == {
+        "provider": "deepseek_anthropic",
+        "name": config.LLM_MODEL,
+        "status": "credentials_missing",
+    }
+    assert payload["model"]["embedding"]["provider"] == "ollama"
+    assert payload["degraded_reasons"] == ["llm_credentials_missing"]
+
+
+def test_ensure_models_only_checks_and_pulls_embedding(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.delattr(manager, "_ensure_models")
+    checked = []
+    pulled = []
+    monkeypatch.setattr(
+        "storybook.setup_manager._ollama_tags",
+        lambda: checked.append(True) or {},
+    )
+    monkeypatch.setattr(
+        "storybook.setup_manager._pull_model",
+        lambda model, progress=None: pulled.append(model),
+    )
+
+    models, degraded = manager._ensure_models(download=True, progress=None)
+
+    assert checked == [True]
+    assert pulled == [config.EMBED_MODEL]
+    assert models == [
+        {"name": config.EMBED_MODEL, "status": "downloaded", "size": None}
+    ]
+    assert degraded == []
 
 
 def test_noninteractive_purge_requires_second_confirmation():
