@@ -554,7 +554,7 @@ def init():
 def doctor(fix):
     """🩺 环境与健康自检
 
-    检查 Ollama 可达性、LLM/Embedding 模型、向量维度、sqlite-vec 扩展与
+    检查 DeepSeek LLM 配置、Ollama/Embedding 模型、向量维度、sqlite-vec 扩展与
     story_vectors 虚表、向量双写一致性，逐项给出 ✅/❌ 与修复建议。
     加 --fix 自动修复向量双写不一致。
     """
