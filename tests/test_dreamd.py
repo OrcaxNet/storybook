@@ -193,19 +193,26 @@ class TestSnapshot:
             "adapters",
             lambda: {"good": HealthyAdapter(), "denied": DeniedAdapter()},
         )
-        diagnostics = []
+        diagnostics = {}
+        seen_failures = set()
 
         with caplog.at_level(logging.WARNING):
             snapshot = dreamd.scan_session_files(
-                sources=["denied", "good"], diagnostics=diagnostics
+                sources=["denied", "good"], diagnostics=diagnostics,
+                seen_failures=seen_failures,
             )
 
         assert len(snapshot) == 1
-        assert diagnostics == [{
+        assert list(diagnostics.values()) == [{
             "source": "denied",
             "code": "SB_SOURCE_PERMISSION_DENIED",
             "hint": "PermissionError",
+            "count": 1,
+            "active": True,
+            "changes": 0,
+            "recoveries": 0,
         }]
+        assert seen_failures == {"denied"}
         assert "private source path" not in caplog.text
         assert "SB_SOURCE_PERMISSION_DENIED" in caplog.text
 
@@ -243,6 +250,110 @@ class TestDefaultSleep:
 
 
 class TestWatchLoop:
+    def test_repeated_source_failure_keeps_bounded_state_and_healthy_snapshot(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        healthy_file = tmp_path / "good" / "session.jsonl"
+        healthy_file.parent.mkdir()
+        healthy_file.write_text("{}\n", encoding="utf-8")
+
+        class HealthyAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                return [healthy_file]
+
+        class DeniedAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                raise PermissionError("private source path")
+
+        monkeypatch.setattr(
+            dreamd.source_manager,
+            "adapters",
+            lambda: {"good": HealthyAdapter(), "denied": DeniedAdapter()},
+        )
+        monkeypatch.setattr(
+            dreamd, "run_dream_cycle_once", lambda **_kwargs: {"status": "ok"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            out = dreamd.watch_loop(
+                poll_interval=1,
+                max_ticks=1000,
+                sleep_func=_noop_sleep,
+                sources=["denied", "good"],
+            )
+
+        assert out["ticks"] == 1000
+        assert out["cycles"] == 1
+        assert out["diagnostics"] == [{
+            "source": "denied",
+            "code": "SB_SOURCE_PERMISSION_DENIED",
+            "hint": "PermissionError",
+            "count": 1000,
+            "active": True,
+            "changes": 0,
+            "recoveries": 0,
+        }]
+        assert caplog.text.count("watch source degraded") == 1
+        assert "private source path" not in caplog.text
+
+    def test_source_failure_change_and_recovery_are_recorded_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        recovered_file = tmp_path / "source" / "session.jsonl"
+        recovered_file.parent.mkdir()
+        recovered_file.write_text("{}\n", encoding="utf-8")
+
+        class RecoveringAdapter:
+            attempts = 0
+
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise PermissionError("private first failure")
+                if self.attempts == 2:
+                    raise OSError("private changed failure")
+                return [recovered_file]
+
+        adapter = RecoveringAdapter()
+        monkeypatch.setattr(
+            dreamd.source_manager, "adapters", lambda: {"recovering": adapter}
+        )
+        monkeypatch.setattr(
+            dreamd, "run_dream_cycle_once", lambda **_kwargs: {"status": "ok"}
+        )
+
+        with caplog.at_level(logging.INFO):
+            out = dreamd.watch_loop(
+                poll_interval=1,
+                max_ticks=3,
+                sleep_func=_noop_sleep,
+                sources=["recovering"],
+            )
+
+        assert out["cycles"] == 2
+        assert out["diagnostics"] == [{
+            "source": "recovering",
+            "code": "SB_SOURCE_DISCOVERY_FAILED",
+            "hint": "OSError",
+            "count": 1,
+            "active": False,
+            "changes": 1,
+            "recoveries": 1,
+        }]
+        assert caplog.text.count("watch source degraded") == 2
+        assert caplog.text.count("watch source recovered") == 1
+        assert "private first failure" not in caplog.text
+        assert "private changed failure" not in caplog.text
+
     def test_runs_on_first_tick(self, fake_llm, fake_embedder, monkeypatch, tmp_path):
         """首帧追补：发现新会话即采集+加工。"""
         _stub_collect(monkeypatch, collector.generate_sample_sessions(2))

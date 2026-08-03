@@ -236,7 +236,8 @@ def run_dream_cycle_once(
 def scan_session_files(
     projects_path: Optional[Path] = None,
     sources: list[str] | tuple[str, ...] | None = None,
-    diagnostics: Optional[list[dict]] = None,
+    diagnostics: Optional[dict[str, dict]] = None,
+    seen_failures: Optional[set[str]] = None,
 ) -> dict[str, float]:
     """对启用来源做隐私安全的廉价快照 ``{HMAC 文件键: 版本}``。
 
@@ -247,7 +248,11 @@ def scan_session_files(
             available = projects_path.exists()
         except OSError as exc:
             _record_watch_diagnostic(
-                diagnostics, "claude", "SB_SOURCE_DISCOVERY_FAILED", exc
+                diagnostics,
+                seen_failures,
+                "claude",
+                "SB_SOURCE_DISCOVERY_FAILED",
+                exc,
             )
             return {}
         if not available:
@@ -269,6 +274,7 @@ def scan_session_files(
                     if detection.get("status") not in {None, "missing"}:
                         _record_watch_diagnostic(
                             diagnostics,
+                            seen_failures,
                             name,
                             detection.get("code", "SB_SOURCE_UNAVAILABLE"),
                             RuntimeError(detection.get("status", "unavailable")),
@@ -277,11 +283,19 @@ def scan_session_files(
                 discovered.extend((name, path) for path in adapter.discover())
             except PermissionError as exc:
                 _record_watch_diagnostic(
-                    diagnostics, name, "SB_SOURCE_PERMISSION_DENIED", exc
+                    diagnostics,
+                    seen_failures,
+                    name,
+                    "SB_SOURCE_PERMISSION_DENIED",
+                    exc,
                 )
             except Exception as exc:
                 _record_watch_diagnostic(
-                    diagnostics, name, "SB_SOURCE_DISCOVERY_FAILED", exc
+                    diagnostics,
+                    seen_failures,
+                    name,
+                    "SB_SOURCE_DISCOVERY_FAILED",
+                    exc,
                 )
         paths = iter(discovered)
     snap: dict[str, float] = {}
@@ -292,24 +306,66 @@ def scan_session_files(
             snap[key] = stat.st_mtime_ns + stat.st_size
         except OSError as exc:
             _record_watch_diagnostic(
-                diagnostics, source, "SB_SOURCE_FILE_FAILED", exc
+                diagnostics, seen_failures, source, "SB_SOURCE_FILE_FAILED", exc
             )
             continue
     return snap
 
 
 def _record_watch_diagnostic(
-    diagnostics: Optional[list[dict]], source: str, code: str, exc: Exception
+    diagnostics: Optional[dict[str, dict]],
+    seen_failures: Optional[set[str]],
+    source: str,
+    code: str,
+    exc: Exception,
 ) -> None:
-    item = {"source": source, "code": code, "hint": type(exc).__name__}
+    """更新来源的有界故障状态；状态未变化时只计数，不重复告警。"""
+    hint = type(exc).__name__
+    if seen_failures is not None:
+        seen_failures.add(source)
+
+    should_log = True
     if diagnostics is not None:
-        diagnostics.append(item)
-    logger.warning(
-        "watch source degraded: source=%s code=%s hint=%s",
-        source,
-        code,
-        type(exc).__name__,
-    )
+        previous = diagnostics.get(source)
+        if previous is not None and (
+            previous["code"] == code and previous["hint"] == hint
+        ):
+            previous["count"] += 1
+            should_log = not previous["active"]
+            previous["active"] = True
+        else:
+            diagnostics[source] = {
+                "source": source,
+                "code": code,
+                "hint": hint,
+                "count": 1,
+                "active": True,
+                "changes": 0 if previous is None else previous["changes"] + 1,
+                "recoveries": 0 if previous is None else previous["recoveries"],
+            }
+
+    if should_log:
+        logger.warning(
+            "watch source degraded: source=%s code=%s hint=%s",
+            source,
+            code,
+            hint,
+        )
+
+
+def _record_watch_recoveries(
+    diagnostics: dict[str, dict], seen_failures: set[str]
+) -> None:
+    """将本轮未再失败的来源标记为已恢复，并只记录一次恢复事件。"""
+    for source, item in diagnostics.items():
+        if item["active"] and source not in seen_failures:
+            item["active"] = False
+            item["recoveries"] += 1
+            logger.info(
+                "watch source recovered: source=%s previous_code=%s",
+                source,
+                item["code"],
+            )
 
 
 def _snapshot_changed(prev: dict[str, float], curr: dict[str, float]) -> bool:
@@ -364,11 +420,15 @@ def watch_loop(
     ticks = 0
     cycles = 0
     results: list[dict] = []
-    diagnostics: list[dict] = []
+    diagnostic_state: dict[str, dict] = {}
 
     while not stop_event.is_set():
         ticks += 1
-        curr = scan_session_files(projects_path, sources, diagnostics)
+        seen_failures: set[str] = set()
+        curr = scan_session_files(
+            projects_path, sources, diagnostic_state, seen_failures
+        )
+        _record_watch_recoveries(diagnostic_state, seen_failures)
         if _should_run_cycle(prev, curr):
             result = run_dream_cycle_once(
                 import_new=True, verbose=verbose, sources=sources
@@ -386,7 +446,7 @@ def watch_loop(
     logger.info("监听结束：共 %d 轮触发 / %d 次轮询", cycles, ticks)
     return {
         "ticks": ticks, "cycles": cycles, "results": results,
-        "diagnostics": diagnostics,
+        "diagnostics": [diagnostic_state[key] for key in sorted(diagnostic_state)],
     }
 
 
