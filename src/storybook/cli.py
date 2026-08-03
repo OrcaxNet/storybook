@@ -1169,7 +1169,7 @@ def main():
 @click.argument("part", required=False, default="all",
                 type=click.Choice([
                     "all", "retrieval", "processing", "split", "ablation",
-                    "strategy",
+                    "strategy", "exact-term",
                 ]))
 @click.option("--report", "-r", type=click.Path(dir_okay=False, writable=True),
               help="把完整 JSON 报告写入该路径")
@@ -1180,7 +1180,8 @@ def main():
 def eval(part, report, benchmark_path, transform_cache):
     """📐 检索、加工、分裂与 Story v2 embedding 表示消融
 
-    PART 取值：retrieval / processing / split / ablation / strategy / all（默认 all）。
+    PART 取值：retrieval / processing / split / ablation / strategy /
+    exact-term / all（默认 all）。
 
     retrieval 用真实 embedding + 人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、
     阈值敏感性曲线，并判定是否达 PRD「重复 bug 检索准确率≥70%」(recall@3)。
@@ -1190,13 +1191,15 @@ def eval(part, report, benchmark_path, transform_cache):
     cross-tool/cross-language 分组报告质量与时延。
     strategy 比较 direct-vector、hybrid、+graph、+rewrite、+HyDE、+reranker，
     并按 exact/synonym/cross-language/cross-tool/ambiguous 执行默认启用门禁。
+    exact-term 隔离度量精确错误码在纯向量与 Hybrid 下的 recall@3。
 
     需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染用户 Profile 数据库。
     用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
     """
     parts = (
-        "retrieval", "processing", "split", "ablation", "strategy"
-    ) if part == "all" else (part,)
+        "retrieval", "processing", "split", "ablation", "strategy",
+        "exact_term",
+    ) if part == "all" else (part.replace("-", "_"),)
     click.echo(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
 
     bp = benchmark_path

@@ -4,7 +4,7 @@ LLM 处理层 — 封装 DeepSeek Anthropic-compatible Messages API
 """
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
@@ -20,8 +20,16 @@ def _chat(
     *,
     timeout_seconds: float = 120,
     num_predict: int | None = None,
-) -> Optional[str]:
-    """Call DeepSeek's Anthropic-compatible API and return text blocks."""
+    response_schema: dict | None = None,
+) -> Optional[str | dict]:
+    """Call DeepSeek's Anthropic-compatible API.
+
+    When ``response_schema`` is provided, the request forces one tool call and
+    returns its already-decoded ``input`` object.  DeepSeek's Anthropic
+    compatibility layer supports ``input_schema`` and named ``tool_choice``;
+    plain text remains accepted only as a compatibility fallback for older
+    gateways and deterministic test doubles.
+    """
 
     if not config.LLM_API_KEY:
         logger.error(
@@ -40,6 +48,16 @@ def _chat(
     }
     if system:
         payload["system"] = system
+    if response_schema is not None:
+        payload["tools"] = [{
+            "name": "submit_structured_output",
+            "description": "Return the requested structured result.",
+            "input_schema": response_schema,
+        }]
+        payload["tool_choice"] = {
+            "type": "tool",
+            "name": "submit_structured_output",
+        }
 
     try:
         resp = requests.post(
@@ -57,6 +75,15 @@ def _chat(
         blocks = data.get("content") if isinstance(data, dict) else None
         if not isinstance(blocks, list):
             raise ValueError("invalid content")
+        if response_schema is not None:
+            for block in blocks:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == "submit_structured_output"
+                    and _matches_schema(block.get("input"), response_schema)
+                ):
+                    return block["input"]
         text = "".join(
             block.get("text", "")
             for block in blocks
@@ -91,6 +118,144 @@ def _chat(
             status,
         )
     return None
+
+
+def _matches_schema(value: Any, schema: dict) -> bool:
+    """Validate the JSON-schema subset used by Storybook tool outputs."""
+
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    expected = schema.get("type")
+    if expected == "object":
+        if not isinstance(value, dict):
+            return False
+        properties = schema.get("properties", {})
+        if any(key not in value for key in schema.get("required", [])):
+            return False
+        if schema.get("additionalProperties") is False and any(
+            key not in properties for key in value
+        ):
+            return False
+        return all(
+            key not in value or _matches_schema(value[key], child)
+            for key, child in properties.items()
+        )
+    if expected == "array":
+        return isinstance(value, list) and all(
+            _matches_schema(item, schema.get("items", {})) for item in value
+        )
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return True
+
+
+def _decode_json_object(text: str) -> dict | None:
+    """Decode one JSON object without marker slicing.
+
+    ``raw_decode`` permits harmless leading/trailing prose from a legacy
+    gateway while still requiring the decoded value itself to be an object.
+    """
+
+    if not isinstance(text, str):
+        return None
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            decoded, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(decoded, dict):
+            return decoded
+    return None
+
+
+def _structured_call(
+    prompt: str,
+    schema: dict,
+    *,
+    system: str = "",
+    timeout_seconds: float = 120,
+    num_predict: int | None = None,
+) -> dict | None:
+    """Return a schema-valid object from tool input or legacy JSON text."""
+
+    result = _chat(
+        prompt,
+        system=system,
+        timeout_seconds=timeout_seconds,
+        num_predict=num_predict,
+        response_schema=schema,
+    )
+    decoded = result if isinstance(result, dict) else _decode_json_object(result)
+    if decoded is not None and _matches_schema(decoded, schema):
+        return decoded
+    logger.warning(
+        "LLM structured output invalid provider=%s",
+        config.LLM_PROVIDER,
+    )
+    return None
+
+
+def _object_schema(properties: dict[str, dict]) -> dict:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+_KEYWORDS_SCHEMA = _object_schema({
+    "keywords": {"type": "array", "items": {"type": "string"}},
+})
+_MEMORY_SCHEMA = _object_schema({
+    "title": {"type": "string"},
+    "content": {"type": "string"},
+})
+_SPLIT_DECISION_SCHEMA = _object_schema({
+    "should_split": {"type": "boolean"},
+})
+_SPLIT_STORIES_SCHEMA = _object_schema({
+    "stories": {"type": "array", "items": _MEMORY_SCHEMA},
+})
+_QUERY_TRANSFORM_SCHEMA = _object_schema({
+    "rewrite": {"type": "string"},
+    "queries": {"type": "array", "items": {"type": "string"}},
+    "hypothetical_document": {"type": "string"},
+})
+_STORY_SCHEMA = _object_schema({
+    "title": {"type": "string"},
+    "abstract": {"type": "string"},
+    "detail": _object_schema({
+        "problem": {"type": "string"},
+        "actions": {"type": "array", "items": {"type": "string"}},
+        "outcome": {"type": "string"},
+        "pitfalls": {"type": "array", "items": {"type": "string"}},
+        "evidence": {"type": "array", "items": {"type": "string"}},
+        "applicability": _object_schema({
+            "applies_when": {"type": "array", "items": {"type": "string"}},
+            "excludes_when": {"type": "array", "items": {"type": "string"}},
+        }),
+    }),
+    "sources": {
+        "type": "array",
+        "items": _object_schema({
+            "evidence": {"type": "array", "items": {"type": "string"}},
+        }),
+    },
+    "keywords": {"type": "array", "items": {"type": "string"}},
+})
+_STORIES_SCHEMA = _object_schema({
+    "stories": {"type": "array", "items": _STORY_SCHEMA},
+})
 
 
 def _generate(prompt: str) -> Optional[str]:
@@ -139,23 +304,14 @@ def transform_search_query(
 - HyDE 只描述可能的“问题—行动—结果”记忆形态，不声称它真实发生。
 - 只输出 JSON，不输出 Markdown。
 """
-    result = _chat(
+    decoded = _structured_call(
         prompt,
+        _QUERY_TRANSFORM_SCHEMA,
         system="你负责生成可审计、最小化的检索辅助表示。",
         timeout_seconds=timeout_seconds,
         num_predict=384,
     )
-    if not result:
-        return None
-    try:
-        start = result.find("{")
-        end = result.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        decoded = json.loads(result[start:end + 1])
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if not isinstance(decoded, dict):
+    if decoded is None:
         return None
 
     rewrite = _bounded_search_text(decoded.get("rewrite")) if "rewrite" in allowed else ""
@@ -195,27 +351,12 @@ def extract_keywords(text: str) -> list[str]:
 文本：
 {text[:2000]}
 
-以JSON数组格式输出，如：["React", "useEffect", "无限循环"]
-只输出JSON数组，不要其他内容。"""
+以 JSON 对象输出，如：{{"keywords": ["React", "useEffect", "无限循环"]}}。"""
 
-    result = _chat(prompt)
-    if not result:
+    result = _structured_call(prompt, _KEYWORDS_SCHEMA)
+    if result is None:
         return []
-
-    # 尝试解析 JSON
-    try:
-        # 找到 JSON 数组部分
-        start = result.find("[")
-        end = result.rfind("]")
-        if start != -1 and end != -1:
-            keywords = json.loads(result[start:end + 1])
-            return [k.strip() for k in keywords if isinstance(k, str)][:10]
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # fallback: 按逗号/换行分割
-    parts = result.replace("[", "").replace("]", "").replace('"', "").split(",")
-    return [p.strip() for p in parts if p.strip()][:10]
+    return [keyword.strip() for keyword in result["keywords"] if keyword.strip()][:10]
 
 
 def form_stories(session_content: str) -> list[dict]:
@@ -235,7 +376,7 @@ def form_stories(session_content: str) -> list[dict]:
 - 不按字符数硬切分，不丢失失败尝试、证据或环境边界。
 - abstract 是有预算的检索摘要；detail 必须保留完整问题、动作、结果与教训。
 
-只输出 JSON 数组。每项格式：
+输出 JSON 对象，顶层字段为 ``stories`` 数组。每项格式：
 {{
   "title": "简短标题",
   "abstract": "关键结论与适用条件摘要",
@@ -254,22 +395,15 @@ def form_stories(session_content: str) -> list[dict]:
 会话内容：
 {session_content}
 """
-    result = _chat(prompt)
-    if result:
-        try:
-            start = result.find("[")
-            end = result.rfind("]")
-            if start >= 0 and end > start:
-                decoded = json.loads(result[start:end + 1])
-                if isinstance(decoded, list):
-                    stories = [
-                        story_v2.normalize_story_payload(item)
-                        for item in decoded if isinstance(item, dict)
-                    ]
-                    if stories:
-                        return stories
-        except (json.JSONDecodeError, TypeError, ValueError):
-            logger.warning("Story v2 formation JSON 解析失败，使用无损 fallback")
+    result = _structured_call(prompt, _STORIES_SCHEMA)
+    if result is not None:
+        stories = [
+            story_v2.normalize_story_payload(item)
+            for item in result["stories"]
+        ]
+        if stories:
+            return stories
+    logger.warning("Story v2 formation 结构化输出失败，使用无损 fallback")
 
     # Local model failures must not turn persistence into destructive clipping.
     return [story_v2.normalize_story_payload({
@@ -301,26 +435,16 @@ def summarize_session(session_content: str) -> dict:
 会话内容：
 {session_content[:6000]}
 
-请按以下格式输出（严格遵循）：
-TITLE: <简短标题，10-20字>
-CONTENT: <问题-步骤-结果格式的记忆文本>"""
+输出 JSON 对象：
+{{"title": "简短标题，10-20字", "content": "问题-步骤-结果格式的记忆文本"}}"""
 
-    result = _chat(prompt)
-    if not result:
+    result = _structured_call(prompt, _MEMORY_SCHEMA)
+    if result is None:
         return {"title": "未命名记忆", "content": session_content}
-
-    title = "未命名记忆"
-    content = result
-
-    # 解析 TITLE 和 CONTENT
-    if "TITLE:" in result:
-        parts = result.split("CONTENT:", 1)
-        title_part = parts[0].replace("TITLE:", "").strip()
-        title = title_part.split("\n")[0].strip()[:50]
-        if len(parts) > 1:
-            content = parts[1].strip()
-
-    return {"title": title, "content": content}
+    return {
+        "title": result["title"].strip()[:50] or "未命名记忆",
+        "content": result["content"].strip() or session_content,
+    }
 
 
 def merge_stories(old_content: str, new_content: str) -> dict:
@@ -340,23 +464,16 @@ def merge_stories(old_content: str, new_content: str) -> dict:
 新内容：
 {new_content[:2000]}
 
-请按以下格式输出（严格遵循）：
-TITLE: <简短标题，10-20字>
-CONTENT: <合并后的记忆文本>"""
+输出 JSON 对象：
+{{"title": "简短标题，10-20字", "content": "合并后的记忆文本"}}"""
 
-    result = _chat(prompt)
-    if not result:
+    result = _structured_call(prompt, _MEMORY_SCHEMA)
+    if result is None:
         return {"title": "合并记忆", "content": old_content + "\n" + new_content}
-
-    title = "合并记忆"
-    content = result
-    if "TITLE:" in result:
-        parts = result.split("CONTENT:", 1)
-        title = parts[0].replace("TITLE:", "").strip().split("\n")[0].strip()[:50]
-        if len(parts) > 1:
-            content = parts[1].strip()
-
-    return {"title": title, "content": content}
+    return {
+        "title": result["title"].strip()[:50] or "合并记忆",
+        "content": result["content"].strip() or old_content + "\n" + new_content,
+    }
 
 
 def judge_split(merged_text: str) -> bool:
@@ -365,18 +482,18 @@ def judge_split(merged_text: str) -> bool:
     prompt = f"""判断以下技术记忆是否包含两个或以上独立可复用的子步骤。
 
 判断标准：
-- "配置ESLint规则" 和 "修复useEffect依赖" = 2个独立子步骤 → SPLIT:YES
-- "检查依赖数组" 和 "使用useCallback" = 同一问题的连续步骤 → SPLIT:NO
+- "配置ESLint规则" 和 "修复useEffect依赖" = 2个独立子步骤
+- "检查依赖数组" 和 "使用useCallback" = 同一问题的连续步骤
 
 记忆内容：
 {merged_text[:1000]}
 
-只输出 SPLIT:YES 或 SPLIT:NO，不要其他内容。"""
+输出 JSON 对象：{{"should_split": true 或 false}}。"""
 
-    result = _chat(prompt)
-    if not result:
+    result = _structured_call(prompt, _SPLIT_DECISION_SCHEMA)
+    if result is None:
         return False
-    return "SPLIT:YES" in result.upper()
+    return result["should_split"]
 
 
 def split_story(merged_text: str) -> list[dict]:
@@ -392,44 +509,20 @@ def split_story(merged_text: str) -> list[dict]:
 记忆内容：
 {merged_text[:2000]}
 
-请按以下格式输出每个子记忆：
-=== SUB-STORY 1 ===
-TITLE: <标题>
-CONTENT: <内容>
-=== SUB-STORY 2 ===
-TITLE: <标题>
-CONTENT: <内容>"""
+输出 JSON 对象，格式：
+{{"stories": [{{"title": "标题", "content": "内容"}}]}}"""
 
-    result = _chat(prompt)
-    if not result:
+    result = _structured_call(prompt, _SPLIT_STORIES_SCHEMA)
+    if result is None:
         return [{"title": "拆分记忆", "content": merged_text}]
-
-    # 解析子 story
     sub_stories = []
-    parts = result.split("=== SUB-STORY")
-    for idx, part in enumerate(parts[1:], 1):  # 跳过第一个（可能是空或前导文本）
-        lines = part.strip()
-        title = "子记忆"
-        content = lines
-
-        if "TITLE:" in lines:
-            t_parts = lines.split("CONTENT:", 1)
-            title = t_parts[0].replace("TITLE:", "").strip().split("\n")[0].strip().lstrip("0123456789 ===").strip()[:50]
-            if len(t_parts) > 1:
-                content = t_parts[1].strip()
-
-        # 标题兜底：LLM 偶尔输出空标题（如 "TITLE: \nCONTENT: ..."），用内容前缀补上
-        if not title.strip():
-            _fallback = content.strip()
-            for _prefix in ("问题：", "问题:", "TITLE:"):
-                if _fallback.startswith(_prefix):
-                    _fallback = _fallback[len(_prefix):].strip()
-                    break
-            title = _fallback[:24] or f"子记忆 {idx}"
-
+    for index, story in enumerate(result["stories"], start=1):
+        content = story["content"].strip()
+        title = story["title"].strip()[:50]
+        if not title:
+            title = content[:24] or f"子记忆 {index}"
         sub_stories.append({"title": title, "content": content})
-
-    return sub_stories if sub_stories else [{"title": "拆分记忆", "content": merged_text}]
+    return sub_stories or [{"title": "拆分记忆", "content": merged_text}]
 
 
 def extract_problem_summary(raw_content: str) -> str:
