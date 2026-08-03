@@ -23,6 +23,7 @@ CLI 入口 — storybook 命令
   storybook dream --once            跑一次完整做梦周期（采集+加工）后退出；launchd 入口
   storybook dream                   定时守护进程（非 macOS 兜底，每 DREAM_INTERVAL 秒一轮）
   storybook search <query>          搜索记忆
+  storybook search <query> --json   输出结构化搜索结果
   storybook status --performance    最近查询性能摘要
   storybook benchmark               10k Story warm/cold 查询基准
   storybook embedding-backfill      增量构建并切换 embedding 版本
@@ -867,9 +868,10 @@ def dream(once, interval):
     default=None,
     help="覆盖本地有界 reranker 开关",
 )
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
 @click.option("--cwd", type=click.Path(path_type=Path), default=None, hidden=True)
 def search(
-    query, top, context_mode, scope, retrieval_mode, transform, rerank, cwd
+    query, top, context_mode, scope, retrieval_mode, transform, rerank, as_json, cwd
 ):
     """🔍 搜索记忆"""
     store.init_db()
@@ -889,6 +891,9 @@ def search(
         transform_enabled=transform,
         rerank_enabled=rerank,
     )
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
     output = search_module.format_search_result(result)
     click.echo(output)
 

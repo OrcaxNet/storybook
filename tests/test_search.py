@@ -427,9 +427,11 @@ class TestFormatResult:
             ],
         }
         out = search_module.format_search_result(result)
+        assert "📌 #1 标题A" in out
         assert "标题A" in out
         assert "内容A" in out
         assert "k1" in out
+        assert "🔗 #2" in out
         assert "关联B" in out
         assert "找到 1 条匹配记忆" in out
 
