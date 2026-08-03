@@ -323,7 +323,7 @@ storybook process [--session ID]     # 做梦周期：处理所有 pending 会�
 storybook process --watch [--interval N]  # 监听模式：轮询 ~/.claude/projects，有新会话自动采集+加工（长驻）
 storybook dream --once                # 单次完整做梦周期（采集+加工）后退出；launchd/cron 入口
 storybook dream [--interval N]        # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
-storybook search "<query>" [--top 3] [--mode fast|auto|deep] [--no-transform] [--no-rerank]
+storybook search "<query>" [--top 3] [--mode fast|auto|deep] [--no-transform] [--no-rerank] [--json]
                                     # 默认 fast；auto 门控增强；deep 显式高预算
 storybook status --performance       # 最近 100 次查询 p50/p95、cache/fallback 比例
 storybook benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质量基准
@@ -332,6 +332,16 @@ storybook list [--limit 20]          # 列出所有 Story
 storybook show <story_id>            # 查看 Story 详情（含关联记忆）
 storybook prime [--cwd PATH]         # 会话启动主动注入（晨间简报），供 SessionStart hook 调用
 storybook mcp                        # 启动 MCP server（stdio，供 Claude Code 等 agent 运行时召回）
+```
+
+文本搜索会在主命中和“联想到的相关记忆”前展示真实 Story ID。可直接用该 ID 展开详情；脚本或 Agent 则可使用 `--json` 获取同一份检索结果（包括主命中与 related 的 `story_id`）：
+
+```bash
+storybook search "开发一个语音机器人" --top 1
+# 主命中示例：📌 #42 未命名记忆
+storybook show 42
+
+storybook search "开发一个语音机器人" --top 1 --json
 ```
 
 > 命令是 **`import-data`** 而非 `import`（click 把 `import_data` 函数自动连字符化）。无参数/无 flag 时默认走 `--claude`。`--claude` / `--sample` / `--cursor` / `<path>` 四种来源互斥。

@@ -1150,7 +1150,7 @@ def format_search_result(result: dict) -> str:
     for i, m in enumerate(result["top_matches"], 1):
         sim_bar = "█" * int(m["similarity"] * 10) + "░" * (10 - int(m["similarity"] * 10))
         lines.append(f"   ┌─ Top {i} [{sim_bar} {m['similarity']:.1%}] ─────────────────")
-        lines.append(f"   │ 📌 {m['title']}")
+        lines.append(f"   │ 📌 #{m['story_id']} {m['title']}")
         lines.append(f"   │ {m['content'][:200]}")
         lines.append(f"   │ 关键词: {', '.join(m['keywords'])}")
         if m.get("environment"):
@@ -1171,7 +1171,10 @@ def format_search_result(result: dict) -> str:
             for j, r in enumerate(m["related"], 1):
                 weight_bar = "█" * int(r["weight"] * 10) + "░" * (10 - int(r["weight"] * 10))
                 tag = "🔗" if r["edge_type"] == "parent_child" else "💭"
-                lines.append(f"   │   {tag} [{weight_bar} {r['weight']:.2f}] {r['title']}")
+                lines.append(
+                    f"   │   {tag} #{r['story_id']} "
+                    f"[{weight_bar} {r['weight']:.2f}] {r['title']}"
+                )
                 lines.append(f"   │      {r['content'][:100]}")
 
         lines.append(f"   └{'─' * 50}")
