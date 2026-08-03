@@ -17,10 +17,12 @@ _ASSIGNED_SECRET = re.compile(
     r"\s*[:=]\s*(?:bearer\s+)?(?:['\"][^'\"\r\n]+['\"]|[^\s,;}\]\r\n]+)"
 )
 _AUTHORIZATION_HEADER = re.compile(
-    r"(?im)(?P<prefix>\b(?:proxy-)?authorization\s*:\s*)[^\r\n]+"
+    r"(?im)\b(?:proxy-)?authorization\s*[:=]\s*[^\r\n]+"
 )
 _BEARER_SECRET = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _OPENAI_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_INCREMENTAL_GUARD_PREFIX = "boundary-v1"
+_BOUNDARY_BYTES = 64
 
 
 class PrefixMismatchError(ValueError):
@@ -29,7 +31,7 @@ class PrefixMismatchError(ValueError):
 
 def redact_text(value: Any) -> str:
     text = value if isinstance(value, str) else ""
-    text = _AUTHORIZATION_HEADER.sub(r"\g<prefix>[REDACTED]", text)
+    text = _AUTHORIZATION_HEADER.sub("[REDACTED]", text)
     text = _ASSIGNED_SECRET.sub("[REDACTED]", text)
     text = _BEARER_SECRET.sub("[REDACTED]", text)
     return _OPENAI_SECRET.sub("[REDACTED]", text)
@@ -87,19 +89,14 @@ def incremental_jsonl(
 ) -> tuple[list[dict], int, int, str]:
     """Verify the committed prefix, then parse only complete appended records."""
 
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        remaining = offset
-        while remaining:
-            chunk = handle.read(min(1024 * 1024, remaining))
-            if not chunk:
-                raise PrefixMismatchError("checkpoint cursor exceeds file length")
-            digest.update(chunk)
-            remaining -= len(chunk)
-        if digest.hexdigest() != previous_fingerprint:
+        if _incremental_guard(handle, offset) != previous_fingerprint:
             raise PrefixMismatchError("committed source prefix changed")
+        handle.seek(offset)
         raw = handle.read()
-    complete_len = len(raw) if raw.endswith(b"\n") else raw.rfind(b"\n") + 1
+        complete_len = len(raw) if raw.endswith(b"\n") else raw.rfind(b"\n") + 1
+        cursor = offset + complete_len
+        fingerprint = _incremental_guard(handle, cursor)
     complete = raw[:complete_len]
     records: list[dict] = []
     invalid = 0
@@ -115,8 +112,32 @@ def incremental_jsonl(
             records.append(item)
         else:
             invalid += 1
-    digest.update(complete)
-    return records, offset + complete_len, invalid, digest.hexdigest()
+    return records, cursor, invalid, fingerprint
+
+
+def incremental_checkpoint_fingerprint(path: Path, cursor: int) -> str:
+    """Return a constant-I/O identity and boundary guard for an offset."""
+
+    with path.open("rb") as handle:
+        return _incremental_guard(handle, cursor)
+
+
+def _incremental_guard(handle: Any, cursor: int) -> str:
+    stat = os.fstat(handle.fileno())
+    identity = hashlib.sha256(
+        f"{stat.st_dev}:{stat.st_ino}".encode("ascii")
+    ).hexdigest()[:16]
+    digest = hashlib.sha256()
+    digest.update(cursor.to_bytes(8, "big", signed=False))
+    if cursor <= _BOUNDARY_BYTES * 2:
+        handle.seek(0)
+        digest.update(handle.read(cursor))
+    else:
+        handle.seek(0)
+        digest.update(handle.read(_BOUNDARY_BYTES))
+        handle.seek(cursor - _BOUNDARY_BYTES)
+        digest.update(handle.read(_BOUNDARY_BYTES))
+    return f"{_INCREMENTAL_GUARD_PREFIX}:{identity}:{digest.hexdigest()}"
 
 
 def ensure_readable_dir(path: Path) -> None:

@@ -11,7 +11,11 @@ from .base import HistoryAdapter
 from .claude import ClaudeAdapter
 from .cline import ClineAdapter
 from .codex import CodexAdapter
-from .common import PrefixMismatchError, private_file_key
+from .common import (
+    PrefixMismatchError,
+    incremental_checkpoint_fingerprint,
+    private_file_key,
+)
 from .cursor import CursorAdapter
 from .gemini import GeminiAdapter
 
@@ -119,6 +123,9 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
                 if (
                     stat.st_size == checkpoint["cursor"]
                     and stat.st_mtime_ns == checkpoint["mtime_ns"]
+                    and incremental_checkpoint_fingerprint(
+                        path, checkpoint["cursor"]
+                    ) == checkpoint["fingerprint"]
                 ):
                     summary["skipped"] += 1
                     _restore_checkpoint_diagnostic(summary, checkpoint, file_key)
@@ -213,7 +220,11 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
                 name,
                 file_key,
                 cursor=parsed.cursor,
-                fingerprint=parsed.fingerprint,
+                fingerprint=(
+                    incremental_checkpoint_fingerprint(path, parsed.cursor)
+                    if callable(incremental)
+                    else parsed.fingerprint
+                ),
                 adapter_version=item.version,
                 session_row_id=session_row_id,
                 invalid_records=parsed.invalid_records,

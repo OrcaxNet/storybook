@@ -111,6 +111,9 @@ def test_codex_redacts_complete_secret_values_from_content_and_conclusion(tmp_pa
         "Authorization: Basic dXNlcjpwYXNz\n"
         "Proxy-Authorization: Digest username=admin,response=deadbeef\n"
         "Authorization: ApiKey live-secret-123\n"
+        "Authorization=Basic ZXF1YWwtdXNlcjpwYXNz\n"
+        "Proxy-Authorization=Digest username=equal-admin,response=cafebabe\n"
+        "Authorization=ApiKey equal-live-secret-456\n"
         "token=another-secret\nBearer third-secret\n"
         "OPENAI_API_KEY=fourth-secret\n{\"Authorization\":\"fifth-secret\"}"
     )
@@ -132,11 +135,16 @@ def test_codex_redacts_complete_secret_values_from_content_and_conclusion(tmp_pa
     assert "username=admin" not in persisted
     assert "deadbeef" not in persisted
     assert "live-secret-123" not in persisted
+    assert "ZXF1YWwtdXNlcjpwYXNz" not in persisted
+    assert "equal-admin" not in persisted
+    assert "cafebabe" not in persisted
+    assert "equal-live-secret-456" not in persisted
     assert "another-secret" not in persisted
     assert "third-secret" not in persisted
     assert "fourth-secret" not in persisted
     assert "fifth-secret" not in persisted
     assert "[REDACTED]" in persisted
+    assert "[REDACTED]]" not in persisted
 
 
 def test_codex_truncated_tail_and_bad_line_are_isolated_and_resumable(tmp_path):
@@ -223,6 +231,61 @@ def test_codex_append_uses_checkpoint_offset_without_full_parse(tmp_path, monkey
     checkpoint = store.list_source_checkpoints("codex")[0]
     assert checkpoint["cursor"] == path.stat().st_size
     assert checkpoint["session_row_id"] is not None
+
+
+def test_codex_append_reads_only_constant_boundaries_and_new_bytes(tmp_path, monkeypatch):
+    root = tmp_path / ".codex"
+    path = root / "sessions/2026/08/01/io.jsonl"
+    _jsonl(path, _codex_rows("session-io", "/work", "x" * 4000))
+    assert manager.import_source("codex", adapter=CodexAdapter(root))["imported"] == 1
+    before_cursor = path.stat().st_size
+
+    appended = json.dumps({
+        "timestamp": "2026-08-01T00:00:04Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "constant I/O append"}],
+        },
+    }) + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(appended)
+
+    bytes_read = 0
+    original_open = Path.open
+
+    class CountingReader:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def read(self, *args, **kwargs):
+            nonlocal bytes_read
+            data = self.handle.read(*args, **kwargs)
+            bytes_read += len(data)
+            return data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    def counted_open(candidate, *args, **kwargs):
+        handle = original_open(candidate, *args, **kwargs)
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if candidate == path and mode == "rb":
+            return CountingReader(handle)
+        return handle
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    out = manager.import_source("codex", adapter=CodexAdapter(root))
+
+    assert out["updated"] == 1
+    assert bytes_read <= len(appended.encode("utf-8")) + 4 * 64
+    assert bytes_read < before_cursor
 
 
 @pytest.mark.parametrize("replace_file", [False, True])
