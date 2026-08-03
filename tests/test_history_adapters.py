@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from click.testing import CliRunner
 
-from storybook import store
+from storybook import config, store
 from storybook.cli import cli
 from storybook.history_adapters import manager
 from storybook.history_adapters.cline import ClineAdapter
@@ -100,6 +101,36 @@ def test_codex_incremental_import_is_idempotent_and_updates_only_changed_session
     assert "session-a" not in persisted
 
 
+def test_codex_redacts_complete_secret_values_from_content_and_conclusion(tmp_path):
+    root = tmp_path / ".codex"
+    path = root / "sessions/2026/08/01/secret.jsonl"
+    rows = _codex_rows("session-secret", "/private/work")
+    rows[-1]["payload"]["content"][0]["text"] = (
+        "Authorization: topsecret-value\n"
+        "token=another-secret\nBearer third-secret\n"
+        "OPENAI_API_KEY=fourth-secret\n{\"Authorization\":\"fifth-secret\"}"
+    )
+    _jsonl(path, rows)
+
+    out = manager.import_source("codex", adapter=CodexAdapter(root))
+
+    assert out["status"] == "ok"
+    db = store.get_db()
+    try:
+        row = db.execute(
+            "SELECT raw_content, conclusion FROM sessions WHERE source = 'codex'"
+        ).fetchone()
+    finally:
+        db.close()
+    persisted = row["raw_content"] + row["conclusion"]
+    assert "topsecret-value" not in persisted
+    assert "another-secret" not in persisted
+    assert "third-secret" not in persisted
+    assert "fourth-secret" not in persisted
+    assert "fifth-secret" not in persisted
+    assert "[REDACTED]" in persisted
+
+
 def test_codex_truncated_tail_and_bad_line_are_isolated_and_resumable(tmp_path):
     root = tmp_path / ".codex"
     path = root / "sessions/2026/08/01/rollout.jsonl"
@@ -120,6 +151,71 @@ def test_codex_truncated_tail_and_bad_line_are_isolated_and_resumable(tmp_path):
     assert second["updated"] == 0
     assert second["scanned"] == 1
 
+    third = manager.import_source("codex", adapter=CodexAdapter(root))
+    assert third["status"] == "degraded"
+    assert third["invalid"] == 1
+    assert third["errors"][0]["code"] == "SB_SOURCE_JSONL_INVALID"
+
+    monkeypatch_adapter = CodexAdapter(root)
+    original = manager.adapters
+    try:
+        manager.adapters = lambda: {"codex": monkeypatch_adapter}
+        listed = manager.list_sources()
+    finally:
+        manager.adapters = original
+    assert listed[0]["status"] == "SB_SOURCE_JSONL_INVALID"
+
+    _jsonl(path, _codex_rows("session-safe", "/workspace"))
+    repaired = manager.import_source("codex", adapter=CodexAdapter(root))
+    assert repaired["status"] == "ok"
+    assert repaired["invalid"] == 0
+    assert store.list_source_checkpoints("codex")[0]["error_code"] is None
+
+
+def test_codex_permission_denied_is_stable_and_degraded(tmp_path):
+    root = tmp_path / ".codex"
+    sessions = root / "sessions"
+    _jsonl(sessions / "2026/08/01/one.jsonl", _codex_rows("one", "/work"))
+    sessions.chmod(0)
+    try:
+        first = manager.import_source("codex", adapter=CodexAdapter(root))
+        second = manager.import_source("codex", adapter=CodexAdapter(root))
+    finally:
+        sessions.chmod(0o755)
+    for result in (first, second):
+        assert result["status"] == "degraded"
+        assert result["errors"] == [{
+            "code": "SB_SOURCE_PERMISSION_DENIED", "hint": "PermissionError"
+        }]
+
+
+def test_codex_append_uses_checkpoint_offset_without_full_parse(tmp_path, monkeypatch):
+    root = tmp_path / ".codex"
+    path = root / "sessions/2026/08/01/offset.jsonl"
+    adapter = CodexAdapter(root)
+    _jsonl(path, _codex_rows("session-offset", "/work"))
+    assert manager.import_source("codex", adapter=adapter)["imported"] == 1
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "timestamp": "2026-08-01T00:00:04Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "offset-only append"}],
+            },
+        }) + "\n")
+    restarted_adapter = CodexAdapter(root)
+    monkeypatch.setattr(restarted_adapter, "parse", lambda _path: (_ for _ in ()).throw(
+        AssertionError("full parse must not run for append")
+    ))
+
+    out = manager.import_source("codex", adapter=restarted_adapter)
+    assert out["updated"] == 1
+    checkpoint = store.list_source_checkpoints("codex")[0]
+    assert checkpoint["cursor"] == path.stat().st_size
+    assert checkpoint["session_row_id"] is not None
+
 
 def test_gemini_and_cline_supported_fixtures_import(tmp_path):
     gemini_root = tmp_path / ".gemini"
@@ -128,12 +224,15 @@ def test_gemini_and_cline_supported_fixtures_import(tmp_path):
     gemini_path.write_text(json.dumps({
         "sessionId": "gemini-1",
         "startTime": "2026-08-01T00:00:00Z",
-        "summary": "Fix the cache",
+        "summary": "Fix the cache", "projectHash": "project-safe-hash",
         "messages": [
             {"type": "user", "content": "Fix the cache invalidation"},
             {"type": "model", "content": "Added versioned keys"},
         ],
     }), encoding="utf-8")
+    (gemini_path.parent.parent / ".project_root").write_text(
+        "/private/gemini-workspace", encoding="utf-8"
+    )
 
     cline_root = tmp_path / "cline-tasks"
     cline_path = cline_root / "task-1/api_conversation_history.json"
@@ -142,6 +241,9 @@ def test_gemini_and_cline_supported_fixtures_import(tmp_path):
         {"role": "user", "content": [{"type": "text", "text": "Repair the queue\n<environment_details>/secret/path</environment_details>"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "Added bounded retries"}]},
     ]), encoding="utf-8")
+    (cline_path.parent / "task_metadata.json").write_text(json.dumps({
+        "workspace": "/private/cline-workspace", "projectName": "queue-service"
+    }), encoding="utf-8")
 
     gemini = manager.import_source("gemini", adapter=GeminiAdapter(gemini_root))
     cline = manager.import_source("cline", adapter=ClineAdapter([cline_root]))
@@ -149,11 +251,23 @@ def test_gemini_and_cline_supported_fixtures_import(tmp_path):
     assert gemini["imported"] == cline["imported"] == 1
     db = store.get_db()
     try:
-        rows = db.execute("SELECT source, raw_content FROM sessions ORDER BY id").fetchall()
+        rows = db.execute(
+            "SELECT source, raw_content, context_json FROM sessions ORDER BY id"
+        ).fetchall()
     finally:
         db.close()
     assert [row["source"] for row in rows] == ["gemini", "cline"]
     assert "/secret/path" not in rows[1]["raw_content"]
+    contexts = [json.loads(row["context_json"]) for row in rows]
+    assert contexts[0]["tool"]["type"] == "gemini_cli"
+    assert contexts[1]["tool"]["type"] == "cline"
+    assert contexts[0]["tool"]["adapter_version"] == GeminiAdapter.version
+    assert contexts[1]["tool"]["adapter_version"] == ClineAdapter.version
+    assert contexts[0]["workspace"]["cwd_alias"] == "gemini-workspace"
+    assert contexts[1]["workspace"]["cwd_alias"] == "cline-workspace"
+    persisted_context = json.dumps(contexts)
+    assert "/private/gemini-workspace" not in persisted_context
+    assert "/private/cline-workspace" not in persisted_context
 
 
 def test_import_data_codex_json_has_stable_summary(monkeypatch):
@@ -168,6 +282,46 @@ def test_import_data_codex_json_has_stable_summary(monkeypatch):
     result = CliRunner().invoke(cli, ["import-data", "--codex", "--json"])
     assert result.exit_code == 0
     assert json.loads(result.stdout) == expected
+
+
+def test_database_initialization_log_does_not_expose_absolute_path(caplog):
+    caplog.set_level(logging.INFO, logger="storybook.store")
+    store.init_db()
+    assert str(config.DB_PATH) not in caplog.text
+    assert "数据库初始化完成" in caplog.text
+
+
+def test_existing_checkpoint_table_is_upgraded_in_place():
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute("DROP TABLE source_checkpoints")
+        db.execute("""CREATE TABLE source_checkpoints (
+            source TEXT NOT NULL,
+            file_key TEXT NOT NULL,
+            cursor INTEGER NOT NULL DEFAULT 0,
+            fingerprint TEXT NOT NULL,
+            adapter_version TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ok',
+            error_code TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (source, file_key)
+        )""")
+        db.commit()
+    finally:
+        db.close()
+
+    store.init_db()
+
+    db = store.get_db(load_vector_extension=False)
+    try:
+        columns = {
+            row["name"] for row in db.execute(
+                "PRAGMA table_info(source_checkpoints)"
+            ).fetchall()
+        }
+    finally:
+        db.close()
+    assert {"session_row_id", "invalid_records", "mtime_ns"} <= columns
 
 
 def test_source_failure_does_not_block_other_sources(monkeypatch):
@@ -188,4 +342,3 @@ def test_source_failure_does_not_block_other_sources(monkeypatch):
     assert out["status"] == "degraded"
     assert [item["source"] for item in out["sources"]] == ["codex", "gemini"]
     assert out["sources"][1]["status"] == "unavailable"
-

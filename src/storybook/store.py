@@ -60,6 +60,9 @@ CREATE TABLE IF NOT EXISTS source_checkpoints (
     cursor INTEGER NOT NULL DEFAULT 0,
     fingerprint TEXT NOT NULL,
     adapter_version TEXT NOT NULL,
+    session_row_id INTEGER,
+    invalid_records INTEGER NOT NULL DEFAULT 0,
+    mtime_ns INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'ok',
     error_code TEXT,
     updated_at TEXT DEFAULT (datetime('now')),
@@ -335,6 +338,7 @@ def init_db(
     db = get_db(path)
     try:
         db.executescript(_SCHEMA)
+        _ensure_source_checkpoint_columns(db)
         _ensure_identity_columns(db, owning_profile_id)
         _ensure_memory_graph_schema(db)
         _ensure_context_columns(db)
@@ -368,9 +372,28 @@ def init_db(
             (config.EMBED_MODEL, initial_version, initial_representation),
         )
         db.commit()
-        logger.info("数据库初始化完成: %s", path)
+        logger.info("数据库初始化完成")
     finally:
         db.close()
+
+
+def _ensure_source_checkpoint_columns(db: sqlite3.Connection) -> None:
+    """Upgrade checkpoints created by the first adapter implementation."""
+
+    columns = {
+        row["name"]
+        for row in db.execute("PRAGMA table_info(source_checkpoints)").fetchall()
+    }
+    additions = {
+        "session_row_id": "INTEGER",
+        "invalid_records": "INTEGER NOT NULL DEFAULT 0",
+        "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            db.execute(
+                f"ALTER TABLE source_checkpoints ADD COLUMN {name} {declaration}"
+            )
 
 
 def _ensure_story_vectors(db: sqlite3.Connection) -> None:
@@ -1770,6 +1793,48 @@ def upsert_external_session(
             db.close()
 
 
+def append_session_transcript(
+    session_id: int,
+    lines: list[str] | tuple[str, ...],
+    conclusion: str = "",
+    *,
+    cap: int = 6000,
+) -> bool:
+    """Append parsed records to one checkpoint-owned Session without rescanning."""
+
+    additions = [line for line in lines if line]
+    if not additions and not conclusion:
+        return False
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT raw_content, conclusion FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        merged = "\n".join(
+            part for part in (row["raw_content"], *additions) if part
+        )
+        if len(merged) > cap:
+            half = cap // 2
+            merged = merged[:half] + "\n...\n" + merged[-half:]
+        next_conclusion = conclusion or (row["conclusion"] or "")
+        if merged == row["raw_content"] and next_conclusion == (row["conclusion"] or ""):
+            return False
+        db.execute(
+            """UPDATE sessions
+               SET raw_content = ?, conclusion = ?, status = 'pending',
+                   processed_at = NULL
+               WHERE id = ?""",
+            (merged, next_conclusion, session_id),
+        )
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
 def get_source_checkpoint(source: str, file_key: str) -> sqlite3.Row | None:
     db = get_db(load_vector_extension=False)
     try:
@@ -1788,6 +1853,9 @@ def set_source_checkpoint(
     cursor: int,
     fingerprint: str,
     adapter_version: str,
+    session_row_id: int | None = None,
+    invalid_records: int = 0,
+    mtime_ns: int = 0,
     status: str = "ok",
     error_code: str | None = None,
 ) -> None:
@@ -1796,12 +1864,16 @@ def set_source_checkpoint(
         db.execute(
             """INSERT INTO source_checkpoints (
                    source, file_key, cursor, fingerprint, adapter_version,
+                   session_row_id, invalid_records, mtime_ns,
                    status, error_code, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                ON CONFLICT(source, file_key) DO UPDATE SET
                    cursor = excluded.cursor,
                    fingerprint = excluded.fingerprint,
                    adapter_version = excluded.adapter_version,
+                   session_row_id = excluded.session_row_id,
+                   invalid_records = excluded.invalid_records,
+                   mtime_ns = excluded.mtime_ns,
                    status = excluded.status,
                    error_code = excluded.error_code,
                    updated_at = datetime('now')""",
@@ -1811,6 +1883,9 @@ def set_source_checkpoint(
                 cursor,
                 fingerprint,
                 adapter_version,
+                session_row_id,
+                invalid_records,
+                mtime_ns,
                 status,
                 error_code,
             ),

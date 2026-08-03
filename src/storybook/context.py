@@ -33,12 +33,15 @@ except ImportError:  # pragma: no cover - Windows has no fcntl.
 PROVENANCE_VALUES = frozenset({
     "unknown", "detected", "reported", "inferred", "user_confirmed",
 })
-TOOL_TYPES = frozenset({"claude_code", "cursor", "codex", "other"})
+TOOL_TYPES = frozenset({
+    "claude_code", "cursor", "codex", "gemini_cli", "cline", "other"
+})
 INTEGRATION_MODES = frozenset({"mcp", "hook", "log_import", "manual"})
 RUNTIME_KINDS = frozenset({"local", "ssh", "devcontainer", "ci", "unknown"})
 
 _LEAF_FIELDS = (
-    "tool.type", "tool.version", "tool.integration_mode", "tool.installation_id",
+    "tool.type", "tool.version", "tool.adapter", "tool.adapter_version",
+    "tool.integration_mode", "tool.installation_id",
     "device.id", "device.os_family", "device.os_version", "device.arch",
     "device.display_name", "session.id", "session.external_session_hash",
     "session.started_at", "session.locale", "workspace.id",
@@ -50,6 +53,8 @@ _LEAF_FIELDS = (
 _FIELD_ALIASES = {
     "tool_type": "tool.type",
     "tool_version": "tool.version",
+    "tool_adapter": "tool.adapter",
+    "tool_adapter_version": "tool.adapter_version",
     "agent_installation_id": "tool.installation_id",
     "device_id": "device.id",
     "os_family": "device.os_family",
@@ -310,6 +315,10 @@ def _source_tool(source: str | None) -> tuple[str, str]:
         return "cursor", "log_import"
     if value.startswith("codex"):
         return "codex", "log_import"
+    if value.startswith("gemini"):
+        return "gemini_cli", "log_import"
+    if value.startswith("cline"):
+        return "cline", "log_import"
     return "other", "manual"
 
 
@@ -317,7 +326,8 @@ def _empty_envelope(profile_id: str, captured_at: str) -> dict:
     envelope = {
         "profile_id": profile_id,
         "tool": {
-            "type": None, "version": None, "integration_mode": None,
+            "type": None, "version": None, "adapter": None,
+            "adapter_version": None, "integration_mode": None,
             "installation_id": None,
         },
         "device": {
@@ -373,6 +383,8 @@ def capture_context(
     *,
     tool_type: str = "other",
     tool_version: str | None = None,
+    tool_adapter: str | None = None,
+    tool_adapter_version: str | None = None,
     integration_mode: str = "manual",
     external_session_id: str | None = None,
     session_id: str | None = None,
@@ -442,6 +454,10 @@ def capture_context(
         "tool": {
             "type": tool_type,
             "version": str(tool_version) if tool_version else None,
+            "adapter": str(tool_adapter) if tool_adapter else None,
+            "adapter_version": (
+                str(tool_adapter_version) if tool_adapter_version else None
+            ),
             "integration_mode": integration_mode,
             "installation_id": install_id,
         },
@@ -478,7 +494,8 @@ def capture_context(
     })
 
     reported_fields = (
-        "tool.type", "tool.version", "tool.integration_mode",
+        "tool.type", "tool.version", "tool.adapter", "tool.adapter_version",
+        "tool.integration_mode",
         "session.external_session_hash", "session.started_at", "session.locale",
         "workspace.branch",
     )

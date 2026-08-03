@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .. import collector, config, context as context_module
 from .base import HistorySession, ParseResult
-from .common import file_fingerprint
+from .common import ensure_readable_dir, file_fingerprint
 
 
 class CursorAdapter:
@@ -19,6 +19,7 @@ class CursorAdapter:
         self.root = Path(root) if root else config.CURSOR_STORAGE_PATH
 
     def detect(self) -> dict:
+        ensure_readable_dir(self.root)
         available = self.root.is_dir() and any(self.root.glob("*/state.vscdb"))
         return {"available": available, "status": "ready" if available else "missing"}
 
@@ -29,10 +30,16 @@ class CursorAdapter:
         fingerprint = file_fingerprint(path)
         workspace_path = collector._cursor_workspace_path(path)
         adapter_context = context_module.normalize_envelope({
-            "tool": {"type": "cursor", "integration_mode": "log_import"},
+            "tool": {
+                "type": "cursor", "adapter": self.name,
+                "adapter_version": self.version,
+                "integration_mode": "log_import",
+            },
             "workspace": {"path": workspace_path} if workspace_path else {},
             "provenance": {
                 "tool.type": "detected",
+                "tool.adapter": "detected",
+                "tool.adapter_version": "detected",
                 "tool.integration_mode": "detected",
                 "workspace.path": "detected",
             },
@@ -83,4 +90,3 @@ class CursorAdapter:
 
     def diagnostics(self) -> list[dict]:
         return [{"code": "SB_SOURCE_CURSOR_VSCDB", "adapter_version": self.version}]
-

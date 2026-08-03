@@ -82,9 +82,21 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
         detection = item.detect()
         summary["detected"] = bool(detection.get("available"))
         if not summary["detected"]:
+            if detection.get("status") not in {None, "missing"}:
+                summary["status"] = "degraded"
+                summary["errors"].append({
+                    "code": detection.get("code", "SB_SOURCE_UNAVAILABLE"),
+                    "hint": detection.get("hint", detection.get("status")),
+                })
             return summary
         files = item.discover()
-    except (OSError, PermissionError) as exc:
+    except PermissionError as exc:
+        summary["status"] = "degraded"
+        summary["errors"].append({
+            "code": "SB_SOURCE_PERMISSION_DENIED", "hint": type(exc).__name__
+        })
+        return summary
+    except OSError as exc:
         summary["status"] = "degraded"
         summary["errors"].append({"code": "SB_SOURCE_DISCOVERY_FAILED", "hint": type(exc).__name__})
         return summary
@@ -94,18 +106,81 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
     for path in files:
         file_key = private_file_key(name, path)
         try:
-            fingerprint = item.fingerprint(path)
             checkpoint = store.get_source_checkpoint(name, file_key)
-            if checkpoint and checkpoint["fingerprint"] == fingerprint:
-                summary["skipped"] += 1
-                continue
+            stat = path.stat()
+            incremental = getattr(item, "parse_incremental", None)
+            if (
+                checkpoint
+                and callable(incremental)
+                and checkpoint["adapter_version"] == item.version
+                and checkpoint["session_row_id"] is not None
+                and stat.st_size >= checkpoint["cursor"]
+            ):
+                if (
+                    stat.st_size == checkpoint["cursor"]
+                    and stat.st_mtime_ns == checkpoint["mtime_ns"]
+                ):
+                    summary["skipped"] += 1
+                    _restore_checkpoint_diagnostic(summary, checkpoint, file_key)
+                    continue
+                if stat.st_size > checkpoint["cursor"]:
+                    parsed_append = incremental(
+                        path,
+                        checkpoint["cursor"],
+                        checkpoint["fingerprint"],
+                    )
+                    summary["scanned"] += 1
+                    changed = store.append_session_transcript(
+                        checkpoint["session_row_id"],
+                        parsed_append.lines,
+                        parsed_append.conclusion,
+                    )
+                    summary["updated" if changed else "skipped"] += 1
+                    invalid_records = (
+                        checkpoint["invalid_records"]
+                        + parsed_append.invalid_records
+                    )
+                    error_code = (
+                        parsed_append.diagnostics[0]
+                        if parsed_append.diagnostics
+                        else checkpoint["error_code"]
+                    )
+                    if invalid_records and not error_code:
+                        error_code = "SB_SOURCE_JSONL_INVALID"
+                    summary["invalid"] += invalid_records
+                    if error_code:
+                        summary["errors"].append({
+                            "code": error_code, "file": file_key,
+                            "hint": "invalid_records_persist_until_file_rewrite",
+                        })
+                    store.set_source_checkpoint(
+                        name,
+                        file_key,
+                        cursor=parsed_append.cursor,
+                        fingerprint=parsed_append.fingerprint,
+                        adapter_version=item.version,
+                        session_row_id=checkpoint["session_row_id"],
+                        invalid_records=invalid_records,
+                        mtime_ns=stat.st_mtime_ns,
+                        status="degraded" if invalid_records else "ok",
+                        error_code=error_code,
+                    )
+                    continue
+
+            if checkpoint and not callable(incremental):
+                fingerprint = item.fingerprint(path)
+                if checkpoint["fingerprint"] == fingerprint:
+                    summary["skipped"] += 1
+                    _restore_checkpoint_diagnostic(summary, checkpoint, file_key)
+                    continue
             parsed = item.parse(path)
             summary["scanned"] += 1
             summary["invalid"] += parsed.invalid_records
             if not parsed.sessions:
                 summary["invalid"] += 1 if not parsed.invalid_records else 0
+            session_row_id = None
             for session in parsed.sessions:
-                _, action = store.upsert_external_session(
+                session_row_id, action = store.upsert_external_session(
                     session_source,
                     session.external_id,
                     session.raw_content,
@@ -120,16 +195,33 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
                     summary["updated"] += 1
                 else:
                     summary["skipped"] += 1
+            error_code = parsed.diagnostics[0] if parsed.diagnostics else None
+            if parsed.invalid_records and not error_code:
+                error_code = "SB_SOURCE_INVALID_RECORD"
+            if error_code:
+                summary["errors"].append({
+                    "code": error_code, "file": file_key,
+                    "hint": "source_file_requires_repair",
+                })
             store.set_source_checkpoint(
                 name,
                 file_key,
                 cursor=parsed.cursor,
                 fingerprint=parsed.fingerprint,
                 adapter_version=item.version,
+                session_row_id=session_row_id,
+                invalid_records=parsed.invalid_records,
+                mtime_ns=stat.st_mtime_ns,
                 status="degraded" if parsed.invalid_records else "ok",
-                error_code=parsed.diagnostics[0] if parsed.diagnostics else None,
+                error_code=error_code,
             )
-        except (OSError, PermissionError, sqlite3.Error) as exc:
+        except PermissionError as exc:
+            summary["errors"].append({
+                "code": "SB_SOURCE_PERMISSION_DENIED",
+                "file": file_key,
+                "hint": type(exc).__name__,
+            })
+        except (OSError, sqlite3.Error) as exc:
             summary["errors"].append({
                 "code": "SB_SOURCE_FILE_FAILED",
                 "file": file_key,
@@ -143,6 +235,20 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
             })
     summary["status"] = "degraded" if summary["errors"] or summary["invalid"] else "ok"
     return summary
+
+
+def _restore_checkpoint_diagnostic(
+    summary: dict, checkpoint: sqlite3.Row, file_key: str
+) -> None:
+    if checkpoint["status"] != "degraded" and not checkpoint["error_code"]:
+        return
+    invalid = max(1, int(checkpoint["invalid_records"] or 0))
+    summary["invalid"] += invalid
+    summary["errors"].append({
+        "code": checkpoint["error_code"] or "SB_SOURCE_CHECKPOINT_DEGRADED",
+        "file": file_key,
+        "hint": "persisted_source_diagnostic",
+    })
 
 
 def import_enabled(selected: tuple[str, ...] | list[str] | None = None) -> dict:

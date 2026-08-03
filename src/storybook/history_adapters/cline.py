@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 import sys
 from pathlib import Path
 
 from .base import HistorySession, ParseResult
-from .common import bounded_transcript, content_text, file_fingerprint
+from .common import (
+    bounded_transcript, content_text, ensure_readable_dir, file_fingerprint
+)
 
 
 def _roots(home: Path) -> list[Path]:
@@ -29,6 +32,8 @@ class ClineAdapter:
         self.roots = list(roots) if roots is not None else _roots(Path.home())
 
     def detect(self) -> dict:
+        for root in self.roots:
+            ensure_readable_dir(root)
         available = any(root.is_dir() and any(root.glob("*/api_conversation_history.json")) for root in self.roots)
         return {"available": available, "status": "ready" if available else "missing"}
 
@@ -65,12 +70,21 @@ class ClineAdapter:
                 last_assistant = text
         if not first_user:
             return ParseResult((), len(raw), fingerprint, 1, ("SB_SOURCE_SCHEMA_UNKNOWN",))
+        metadata_path = path.with_name("task_metadata.json")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata = metadata if isinstance(metadata, dict) else {}
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            metadata = {}
+        metadata["captured_at"] = datetime.fromtimestamp(
+            path.stat().st_mtime, timezone.utc
+        ).isoformat().replace("+00:00", "Z")
         session = HistorySession(
             external_id=path.parent.name,
             raw_content=bounded_transcript(lines),
             problem_desc=first_user[:200],
             conclusion=last_assistant[:300],
-            context=self.context({}),
+            context=self.context(metadata),
         )
         return ParseResult((session,), len(raw), fingerprint)
 
@@ -82,13 +96,28 @@ class ClineAdapter:
 
     def context(self, metadata: dict) -> dict:
         return {
-            "tool": {"type": "cline", "integration_mode": "log_import"},
+            "tool": {
+                "type": "cline", "adapter": self.name,
+                "adapter_version": self.version,
+                "integration_mode": "log_import",
+            },
+            "workspace": {
+                "path": metadata.get("workspace") or metadata.get("cwd"),
+                "project_label": metadata.get("projectName"),
+            },
+            "runtime": {"kind": "unknown"},
+            "captured_at": metadata.get("captured_at"),
             "provenance": {
                 "tool.type": "detected",
+                "tool.adapter": "detected",
+                "tool.adapter_version": "detected",
                 "tool.integration_mode": "detected",
+                "workspace.path": "reported",
+                "workspace.project_label": "reported",
+                "runtime.kind": "unknown",
+                "captured_at": "detected",
             },
         }
 
     def diagnostics(self) -> list[dict]:
         return [{"code": "SB_SOURCE_CLINE_HISTORY", "adapter_version": self.version}]
-

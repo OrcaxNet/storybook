@@ -25,6 +25,16 @@ class ParseResult:
     diagnostics: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class IncrementalParseResult:
+    lines: tuple[str, ...]
+    conclusion: str
+    cursor: int
+    fingerprint: str
+    invalid_records: int = 0
+    diagnostics: tuple[str, ...] = ()
+
+
 class HistoryAdapter(Protocol):
     name: str
     display_name: str
@@ -37,4 +47,3 @@ class HistoryAdapter(Protocol):
     def fingerprint(self, path: Path) -> str: ...
     def context(self, metadata: dict) -> dict: ...
     def diagnostics(self) -> list[dict]: ...
-
