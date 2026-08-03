@@ -59,6 +59,7 @@ from . import context as context_module
 from .profiles import ProfileError
 from .migration import MigrationError
 from .setup_manager import SetupError, SetupManager
+from .history_adapters import manager as source_manager
 
 
 def setup_logging(verbose: bool = False):
@@ -180,6 +181,11 @@ def setup_command(assume_yes, dry_run, as_json, agents, skip_models):
     for smoke in result["smoke_tests"]:
         click.echo(
             f"  {'PASS' if smoke['ok'] else 'FAIL'}      {smoke['name']}: {smoke['detail']}"
+        )
+    for history in result.get("history_ingestion", []):
+        click.echo(
+            f"  HISTORY   {history['name']}: {history['status']} "
+            f"({history['adapter_version']})"
         )
     for reason in result["degraded_reasons"]:
         click.echo(f"  DEGRADED  {reason}")
@@ -659,35 +665,49 @@ def prime(cwd, first_prompt, top_k, token_budget, output_format):
 @click.argument("path", required=False)
 @click.option("--claude", is_flag=True, help="从 Claude Code 采集")
 @click.option("--cursor", is_flag=True, help="从 Cursor 自动采集")
+@click.option("--codex", is_flag=True, help="从 Codex 自动采集")
+@click.option(
+    "--source",
+    type=click.Choice(source_manager.SOURCE_NAMES),
+    help="从指定 Agent history adapter 增量采集",
+)
 @click.option("--sample", is_flag=True, help="生成模拟数据")
 @click.option("--n", default=100, help="模拟数据数量(配合--sample)")
-def import_data(path, claude, cursor, sample, n):
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON summary")
+def import_data(path, claude, cursor, codex, source, sample, n, as_json):
     """导入会话日志"""
     store.init_db()
+
+    selectors = [bool(path), claude, cursor, codex, bool(source), sample]
+    if sum(selectors) > 1:
+        raise click.UsageError(
+            "<path>, --source, --claude, --cursor, --codex, --sample 互斥"
+        )
+
+    selected_source = source or (
+        "codex" if codex else "cursor" if cursor else "claude" if claude else None
+    )
+    if selected_source:
+        result = source_manager.import_enabled([selected_source])
+        if as_json:
+            click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            item = result["sources"][0]
+            click.echo(
+                f"✅ {selected_source}: files={item.get('files', 0)} "
+                f"scanned={item.get('scanned', 0)} imported={item.get('imported', 0)} "
+                f"updated={item.get('updated', 0)} skipped={item.get('skipped', 0)} "
+                f"invalid={item.get('invalid', 0)} status={item.get('status')}"
+            )
+        if result["status"] == "degraded":
+            raise click.exceptions.Exit(2)
+        return
 
     if sample:
         click.echo(f"📊 生成 {n} 条模拟会话数据...")
         sessions = collector.generate_sample_sessions(n)
         count = collector.import_sessions(sessions)
         click.echo(f"✅ 导入 {count} 条模拟会话")
-
-    elif cursor:
-        click.echo("📥 从 Cursor 采集会话...")
-        sessions = collector.collect_cursor_sessions()
-        if not sessions:
-            click.echo("⚠️  未找到 Cursor 会话数据。使用 --sample 生成模拟数据")
-            return
-        count = collector.import_sessions(sessions)
-        click.echo(f"✅ 导入 {count} 条 Cursor 会话")
-
-    elif claude:
-        click.echo("📥 从 Claude Code 采集会话...")
-        sessions = collector.collect_claude_sessions()
-        if not sessions:
-            click.echo("⚠️  未找到新的 Claude Code 会话（可能已全部导入）")
-            return
-        count = collector.import_sessions(sessions)
-        click.echo(f"✅ 导入 {count} 条 Claude Code 会话")
 
     elif path:
         click.echo(f"📥 从路径导入: {path}")
@@ -743,28 +763,78 @@ def import_data(path, claude, cursor, sample, n):
         click.echo(f"✅ 导入 {count} 条会话")
 
     else:
-        # 默认数据源：Claude Code（用 --sample/--cursor/<path> 切换其他来源）
-        click.echo("📥 从 Claude Code 采集会话（默认数据源）...")
-        sessions = collector.collect_claude_sessions()
-        if not sessions:
-            click.echo("⚠️  未找到新的 Claude Code 会话（可能已全部导入，或 ~/.claude/projects 不存在）")
-            click.echo("   其他来源: --sample 生成模拟数据, --cursor 采 Cursor, 或 <file_path>")
-            return
-        count = collector.import_sessions(sessions)
-        click.echo(f"✅ 导入 {count} 条 Claude Code 会话")
+        # Backward-compatible default remains Claude; dream defaults to all
+        # enabled and detected sources.
+        result = source_manager.import_enabled(["claude"])
+        if as_json:
+            click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            item = result["sources"][0]
+            click.echo(
+                f"✅ claude: imported={item.get('imported', 0)} "
+                f"updated={item.get('updated', 0)} skipped={item.get('skipped', 0)}"
+            )
+
+
+@cli.group(name="sources")
+def sources_group():
+    """管理本机 Agent 历史来源。"""
+
+
+@sources_group.command(name="list")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+def sources_list(as_json):
+    """显示来源检测、启用、版本和最近导入状态。"""
+    store.init_db()
+    items = source_manager.list_sources()
+    if as_json:
+        click.echo(json.dumps({"sources": items}, ensure_ascii=False, indent=2))
+        return
+    for item in items:
+        click.echo(
+            f"{item['name']:<8} available={str(item['available']).lower():<5} "
+            f"enabled={str(item['enabled']).lower():<5} status={item['status']} "
+            f"version={item['adapter_version']}"
+        )
+
+
+@sources_group.command(name="enable")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+def sources_enable(name):
+    source_manager.set_enabled(name, True)
+    click.echo(f"enabled: {name}")
+
+
+@sources_group.command(name="disable")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+def sources_disable(name):
+    source_manager.set_enabled(name, False)
+    click.echo(f"disabled: {name}")
+
+
+@sources_group.command(name="reset-checkpoint")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+@click.option("--yes", is_flag=True, help="确认删除来源 checkpoint")
+def sources_reset_checkpoint(name, yes):
+    if not yes:
+        raise click.UsageError("重置 checkpoint 需要 --yes")
+    store.init_db()
+    count = store.delete_source_checkpoints(name)
+    click.echo(f"reset {count} checkpoint(s): {name}")
 
 
 @cli.command(name="process")
 @click.option("--session", "-s", type=int, help="处理指定会话ID")
 @click.option("--watch", is_flag=True,
-              help="监听模式：轮询 ~/.claude/projects，有新会话自动加工（长驻，Ctrl-C 退出）")
+              help="监听模式：轮询已启用来源，有新会话自动加工（长驻，Ctrl-C 退出）")
 @click.option("--interval", default=None, type=int,
               help="--watch 轮询间隔（秒），默认读 config.WATCH_POLL_INTERVAL（60）")
-def process_cmd(session, watch, interval):
+@click.option("--source", type=click.Choice(source_manager.SOURCE_NAMES), help="只监听指定来源")
+def process_cmd(session, watch, interval, source):
     """🌙 处理会话(做梦)
 
     不带 flag：加工所有 pending 会话（受并发锁保护，与 --watch / launchd 互不重叠）。
-    --watch：长驻监听，发现新 Claude 会话即自动采集 + 加工。
+    --watch：长驻监听，发现已启用来源的新会话即自动采集 + 加工。
     """
     store.init_db()
 
@@ -773,8 +843,14 @@ def process_cmd(session, watch, interval):
         stop = threading.Event()
         dreamd.install_signal_handlers(stop)
         poll = interval if interval is not None else config.WATCH_POLL_INTERVAL
-        click.echo(f"🌙 监听模式启动：每 {poll}s 轮询 {config.CLAUDE_PROJECTS_PATH}（Ctrl-C 退出）")
-        dreamd.watch_loop(poll_interval=poll, stop_event=stop, verbose=True)
+        scope = source or "all enabled sources"
+        click.echo(f"🌙 监听模式启动：每 {poll}s 轮询 {scope}（Ctrl-C 退出）")
+        dreamd.watch_loop(
+            poll_interval=poll,
+            stop_event=stop,
+            verbose=True,
+            sources=[source] if source else None,
+        )
         return
 
     if session:
@@ -804,32 +880,51 @@ def process_cmd(session, watch, interval):
               help="只跑一次完整做梦周期（采集+加工）后退出；launchd 定时任务用此入口")
 @click.option("--interval", default=None, type=int,
               help="守护进程循环间隔（秒），默认读 config.DREAM_INTERVAL（14400 = 4 小时）")
-def dream(once, interval):
+@click.option("--source", type=click.Choice(source_manager.SOURCE_NAMES), help="只处理指定来源")
+def dream(once, interval, source):
     """🌙 做梦周期自动化：定时触发或文件监听，让记忆在后台自动整理。
 
-    --once：单次完整周期（采集 Claude 会话 + 加工 pending）后退出。launchd / cron 调用此入口。
+    --once：单次完整周期（采集启用来源 + 加工 pending）后退出。launchd / cron 调用此入口。
     不带 --once：定时守护进程（非 macOS 兜底），每 interval 秒一轮，Ctrl-C / SIGTERM 退出。
     """
     store.init_db()
     dreamd.setup_dream_logging()
 
     if once:
-        result = dreamd.run_dream_cycle_once(import_new=True, verbose=True)
+        result = dreamd.run_dream_cycle_once(
+            import_new=True,
+            verbose=True,
+            sources=[source] if source else None,
+        )
         if result["status"] == "skipped":
             click.echo("⏳ 另一个做梦周期正在运行，已跳过")
         else:
             click.echo(
-                f"🌙 做梦周期完成：采集 {result['imported']} 条，"
+                f"🌙 做梦周期完成（{result['status']}）：新增 {result['imported']} 条，"
+                f"更新 {result.get('updated', 0)} 条，"
                 f"加工 {result['total']} 条（成功 {result['success']} / 失败 {result['failed']}），"
                 f"用时 {result['duration_s']}s"
             )
+            for item in result.get("sources", []):
+                if item.get("detected") or item.get("status") == "degraded":
+                    click.echo(
+                        f"  {item['source']}: {item['status']} "
+                        f"imported={item.get('imported', 0)} "
+                        f"updated={item.get('updated', 0)} "
+                        f"invalid={item.get('invalid', 0)}"
+                    )
         return
 
     stop = threading.Event()
     dreamd.install_signal_handlers(stop)
     iv = interval if interval is not None else config.DREAM_INTERVAL
     click.echo(f"🌙 做梦守护进程启动：每 {iv}s 触发一次（Ctrl-C 退出）")
-    dreamd.dream_daemon(interval=iv, stop_event=stop, verbose=False)
+    dreamd.dream_daemon(
+        interval=iv,
+        stop_event=stop,
+        verbose=False,
+        sources=[source] if source else None,
+    )
 
 
 @cli.command()

@@ -1,7 +1,7 @@
 """做梦周期自动化（dreamd）测试：并发锁、单次周期、监听循环、定时守护。
 
 全部 mock Ollama（复用 conftest 的 fake_llm / fake_embedder），并 monkeypatch
-``collector.collect_claude_sessions`` 避免扫描真实 ``~/.claude/projects``。
+统一来源管理器，避免扫描真实 Agent 历史目录。
 锁文件随 ``config.DB_PATH`` 重定向到 tmp_path，测试间天然隔离。
 """
 from __future__ import annotations
@@ -56,14 +56,20 @@ class TestDreamLock:
 # ═══════════════════════════════════════════════
 
 def _stub_collect(monkeypatch, sessions):
-    """把 collector.collect_claude_sessions 替换为返回固定会话列表的桩。"""
+    """把统一来源采集替换为返回固定会话列表的桩。"""
     calls = {"n": 0}
 
     def _fake(*_a, **_kw):
         calls["n"] += 1
-        return list(sessions)
+        count = collector.import_sessions(list(sessions))
+        return {
+            "status": "ok",
+            "imported": count,
+            "updated": 0,
+            "sources": [{"source": "claude", "status": "ok", "imported": count}],
+        }
 
-    monkeypatch.setattr(collector, "collect_claude_sessions", _fake)
+    monkeypatch.setattr(dreamd.source_manager, "import_enabled", _fake)
     return calls
 
 
@@ -103,7 +109,7 @@ class TestRunDreamCycleOnce:
         assert result["status"] == "ok"
         assert result["imported"] == 0
         assert result["total"] == 2
-        assert calls["n"] == 0, "import_new=False 不应调用 collect_claude_sessions"
+        assert calls["n"] == 0, "import_new=False 不应调用来源采集"
         assert store.count_stories() == 2
 
     def test_skipped_when_locked(self, fake_llm, fake_embedder, monkeypatch):
@@ -145,8 +151,11 @@ class TestSnapshot:
         f = proj / "abc.jsonl"
         f.write_text("{}", encoding="utf-8")
         snap = dreamd.scan_session_files(tmp_path / "projects")
-        assert str(f) in snap
-        assert snap[str(f)] == f.stat().st_mtime
+        assert len(snap) == 1
+        key, value = next(iter(snap.items()))
+        assert key.startswith("hmac-sha256:")
+        assert str(f) not in key
+        assert value == f.stat().st_mtime_ns + f.stat().st_size
 
     def test_snapshot_changed_detects_new_and_modified(self):
         a = {"/p/s1.jsonl": 1.0}
@@ -228,7 +237,15 @@ class TestWatchLoop:
         projects.mkdir()
         # 两次采集分别返回 0 条与 2 条，模拟「第二轮才有新会话」
         seq = iter([[], collector.generate_sample_sessions(2)])
-        monkeypatch.setattr(collector, "collect_claude_sessions", lambda *_a, **_kw: list(next(seq)))
+        def collect_next(*_a, **_kw):
+            sessions = list(next(seq))
+            count = collector.import_sessions(sessions)
+            return {
+                "status": "ok", "imported": count, "updated": 0,
+                "sources": [{"source": "claude", "status": "ok", "imported": count}],
+            }
+
+        monkeypatch.setattr(dreamd.source_manager, "import_enabled", collect_next)
 
         # 在第一帧与第二帧之间创建一个新 jsonl，使快照变化 -> 第二帧触发
         def create_file_on_first_sleep(_stop, _secs):
