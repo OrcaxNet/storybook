@@ -326,11 +326,14 @@ def run_exact_term_hybrid_ablation(
         if not shared_vector:
             return {
                 "query_count": 0,
+                "expected_query_count": len(EXACT_TERM_CASES),
                 "embed_failures": 1,
                 "top_k": top_k,
                 "vector_recall_at_k": 0.0,
                 "hybrid_recall_at_k": 0.0,
                 "absolute_gain": 0.0,
+                "evaluation_status": "unavailable",
+                "evaluation_complete": False,
                 "passes_improvement_gate": False,
                 "per_query": [],
                 "corpus_contract": EXACT_TERM_CORPUS_CONTRACT,
@@ -388,14 +391,24 @@ def run_exact_term_hybrid_ablation(
     hybrid_recall = (
         sum(row["hybrid_recall"] for row in rows) / count if count else 0.0
     )
+    evaluation_complete = (
+        count == len(EXACT_TERM_CASES) and embed_failures == 0
+    )
     return {
         "query_count": count,
+        "expected_query_count": len(EXACT_TERM_CASES),
         "embed_failures": embed_failures,
         "top_k": top_k,
         "vector_recall_at_k": round(vector_recall, 4),
         "hybrid_recall_at_k": round(hybrid_recall, 4),
         "absolute_gain": round(hybrid_recall - vector_recall, 4),
-        "passes_improvement_gate": hybrid_recall > vector_recall,
+        "evaluation_status": (
+            "complete" if evaluation_complete else "incomplete"
+        ),
+        "evaluation_complete": evaluation_complete,
+        "passes_improvement_gate": (
+            evaluation_complete and hybrid_recall > vector_recall
+        ),
         "per_query": rows,
         "corpus_contract": EXACT_TERM_CORPUS_CONTRACT,
     }
@@ -1599,12 +1612,19 @@ def format_report(report: EvalReport) -> str:
         lines.append("─" * 64)
         lines.append("⑥ 精确术语 Hybrid 消融")
         lines.append("─" * 64)
-        if exact["query_count"] == 0:
+        if exact["evaluation_status"] == "unavailable":
             lines.append(
                 "  ⚠️ 评测不可用：无法生成语料 embedding "
                 f"(embed failures={exact['embed_failures']})"
             )
             lines.append("  改善门禁: 未评估（无有效查询）")
+        elif not exact["evaluation_complete"]:
+            lines.append(
+                "  ⚠️ 评测不完整：有效 queries="
+                f"{exact['query_count']}/{exact['expected_query_count']} "
+                f"(embed failures={exact['embed_failures']})"
+            )
+            lines.append("  改善门禁: 未评估（样本不完整）")
         else:
             lines.append(
                 f"  queries={exact['query_count']} | recall@{exact['top_k']}: "

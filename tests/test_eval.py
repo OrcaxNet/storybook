@@ -96,6 +96,8 @@ class TestExactTermHybridAblation:
         assert result["vector_recall_at_k"] == 0.375
         assert result["hybrid_recall_at_k"] == 1.0
         assert result["absolute_gain"] == 0.625
+        assert result["evaluation_status"] == "complete"
+        assert result["evaluation_complete"] is True
         assert result["passes_improvement_gate"] is True
 
     def test_embedding_failure_has_stable_report_contract(self, fake_embedder):
@@ -108,11 +110,14 @@ class TestExactTermHybridAblation:
 
         assert report.exact_term == {
             "query_count": 0,
+            "expected_query_count": 8,
             "embed_failures": 1,
             "top_k": 3,
             "vector_recall_at_k": 0.0,
             "hybrid_recall_at_k": 0.0,
             "absolute_gain": 0.0,
+            "evaluation_status": "unavailable",
+            "evaluation_complete": False,
             "passes_improvement_gate": False,
             "per_query": [],
             "corpus_contract": (
@@ -122,6 +127,28 @@ class TestExactTermHybridAblation:
         }
         assert "评测不可用" in text
         assert "未评估（无有效查询）" in text
+
+    def test_partial_query_embedding_failure_cannot_pass_gate(
+        self, fake_embedder
+    ):
+        shared = "generic incident recovery with a verified remediation"
+        fake_embedder.register(shared, basis(0))
+        fake_embedder.register("SQLITE_BUSY", basis(0))
+        for token in runner_module.EXACT_TERM_CASES[1:]:
+            fake_embedder.register(token, None)
+
+        report = eval_module.run_all(parts=("exact_term",))
+        text = eval_module.format_report(report)
+
+        assert report.exact_term["query_count"] == 1
+        assert report.exact_term["expected_query_count"] == 8
+        assert report.exact_term["embed_failures"] == 7
+        assert report.exact_term["evaluation_status"] == "incomplete"
+        assert report.exact_term["evaluation_complete"] is False
+        assert report.exact_term["passes_improvement_gate"] is False
+        assert "评测不完整" in text
+        assert "有效 queries=1/8" in text
+        assert "未评估（样本不完整）" in text
 
 
 # ═══════════════════════════════════════════════
