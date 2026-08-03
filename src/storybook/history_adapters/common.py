@@ -16,12 +16,20 @@ _ASSIGNED_SECRET = re.compile(
     r"['\"]?"
     r"\s*[:=]\s*(?:bearer\s+)?(?:['\"][^'\"\r\n]+['\"]|[^\s,;}\]\r\n]+)"
 )
+_AUTHORIZATION_HEADER = re.compile(
+    r"(?im)(?P<prefix>\b(?:proxy-)?authorization\s*:\s*)[^\r\n]+"
+)
 _BEARER_SECRET = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _OPENAI_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 
 
+class PrefixMismatchError(ValueError):
+    """The bytes committed by a checkpoint no longer match the source file."""
+
+
 def redact_text(value: Any) -> str:
     text = value if isinstance(value, str) else ""
+    text = _AUTHORIZATION_HEADER.sub(r"\g<prefix>[REDACTED]", text)
     text = _ASSIGNED_SECRET.sub("[REDACTED]", text)
     text = _BEARER_SECRET.sub("[REDACTED]", text)
     return _OPENAI_SECRET.sub("[REDACTED]", text)
@@ -77,10 +85,19 @@ def complete_jsonl(path: Path) -> tuple[list[dict], int, int, str]:
 def incremental_jsonl(
     path: Path, offset: int, previous_fingerprint: str
 ) -> tuple[list[dict], int, int, str]:
-    """Read only complete JSONL records appended after a committed offset."""
+    """Verify the committed prefix, then parse only complete appended records."""
 
+    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        handle.seek(offset)
+        remaining = offset
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise PrefixMismatchError("checkpoint cursor exceeds file length")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if digest.hexdigest() != previous_fingerprint:
+            raise PrefixMismatchError("committed source prefix changed")
         raw = handle.read()
     complete_len = len(raw) if raw.endswith(b"\n") else raw.rfind(b"\n") + 1
     complete = raw[:complete_len]
@@ -98,8 +115,6 @@ def incremental_jsonl(
             records.append(item)
         else:
             invalid += 1
-    digest = hashlib.sha256()
-    digest.update(previous_fingerprint.encode("ascii", errors="ignore"))
     digest.update(complete)
     return records, offset + complete_len, invalid, digest.hexdigest()
 

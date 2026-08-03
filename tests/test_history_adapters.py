@@ -4,6 +4,7 @@ import json
 import logging
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from storybook import config, store
@@ -107,6 +108,9 @@ def test_codex_redacts_complete_secret_values_from_content_and_conclusion(tmp_pa
     rows = _codex_rows("session-secret", "/private/work")
     rows[-1]["payload"]["content"][0]["text"] = (
         "Authorization: topsecret-value\n"
+        "Authorization: Basic dXNlcjpwYXNz\n"
+        "Proxy-Authorization: Digest username=admin,response=deadbeef\n"
+        "Authorization: ApiKey live-secret-123\n"
         "token=another-secret\nBearer third-secret\n"
         "OPENAI_API_KEY=fourth-secret\n{\"Authorization\":\"fifth-secret\"}"
     )
@@ -124,6 +128,10 @@ def test_codex_redacts_complete_secret_values_from_content_and_conclusion(tmp_pa
         db.close()
     persisted = row["raw_content"] + row["conclusion"]
     assert "topsecret-value" not in persisted
+    assert "dXNlcjpwYXNz" not in persisted
+    assert "username=admin" not in persisted
+    assert "deadbeef" not in persisted
+    assert "live-secret-123" not in persisted
     assert "another-secret" not in persisted
     assert "third-secret" not in persisted
     assert "fourth-secret" not in persisted
@@ -215,6 +223,69 @@ def test_codex_append_uses_checkpoint_offset_without_full_parse(tmp_path, monkey
     checkpoint = store.list_source_checkpoints("codex")[0]
     assert checkpoint["cursor"] == path.stat().st_size
     assert checkpoint["session_row_id"] is not None
+
+
+@pytest.mark.parametrize("replace_file", [False, True])
+def test_codex_longer_rewrite_invalidates_prefix_and_reparses(
+    tmp_path, monkeypatch, replace_file
+):
+    root = tmp_path / ".codex"
+    path = root / "sessions/2026/08/01/rewrite.jsonl"
+    adapter = CodexAdapter(root)
+    rows = _codex_rows("session-rewrite", "/work")
+    _jsonl(path, rows)
+    assert manager.import_source("codex", adapter=adapter)["imported"] == 1
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("not-json\n")
+    degraded = manager.import_source("codex", adapter=CodexAdapter(root))
+    assert degraded["status"] == "degraded"
+    assert degraded["invalid"] == 1
+
+    rows.append({
+        "timestamp": "2026-08-01T00:00:04Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "healthy replacement record that is longer than the bad line",
+            }],
+        },
+    })
+    if replace_file:
+        replacement = path.with_name("replacement.jsonl")
+        _jsonl(replacement, rows)
+        replacement.replace(path)
+    else:
+        _jsonl(path, rows)
+    reparsing_adapter = CodexAdapter(root)
+    parse_calls = 0
+    original_parse = reparsing_adapter.parse
+
+    def tracked_parse(candidate):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parse(candidate)
+
+    monkeypatch.setattr(reparsing_adapter, "parse", tracked_parse)
+    repaired = manager.import_source("codex", adapter=reparsing_adapter)
+
+    assert repaired["status"] == "ok"
+    assert repaired["invalid"] == 0
+    assert repaired["updated"] == 1
+    assert parse_calls == 1
+    checkpoint = store.list_source_checkpoints("codex")[0]
+    assert checkpoint["cursor"] == path.stat().st_size
+    assert checkpoint["error_code"] is None
+    db = store.get_db()
+    try:
+        conclusion = db.execute(
+            "SELECT conclusion FROM sessions WHERE source = 'codex'"
+        ).fetchone()["conclusion"]
+    finally:
+        db.close()
+    assert conclusion == "healthy replacement record that is longer than the bad line"
 
 
 def test_gemini_and_cline_supported_fixtures_import(tmp_path):

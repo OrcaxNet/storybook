@@ -11,7 +11,7 @@ from .base import HistoryAdapter
 from .claude import ClaudeAdapter
 from .cline import ClineAdapter
 from .codex import CodexAdapter
-from .common import private_file_key
+from .common import PrefixMismatchError, private_file_key
 from .cursor import CursorAdapter
 from .gemini import GeminiAdapter
 
@@ -124,48 +124,54 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
                     _restore_checkpoint_diagnostic(summary, checkpoint, file_key)
                     continue
                 if stat.st_size > checkpoint["cursor"]:
-                    parsed_append = incremental(
-                        path,
-                        checkpoint["cursor"],
-                        checkpoint["fingerprint"],
-                    )
-                    summary["scanned"] += 1
-                    changed = store.append_session_transcript(
-                        checkpoint["session_row_id"],
-                        parsed_append.lines,
-                        parsed_append.conclusion,
-                    )
-                    summary["updated" if changed else "skipped"] += 1
-                    invalid_records = (
-                        checkpoint["invalid_records"]
-                        + parsed_append.invalid_records
-                    )
-                    error_code = (
-                        parsed_append.diagnostics[0]
-                        if parsed_append.diagnostics
-                        else checkpoint["error_code"]
-                    )
-                    if invalid_records and not error_code:
-                        error_code = "SB_SOURCE_JSONL_INVALID"
-                    summary["invalid"] += invalid_records
-                    if error_code:
-                        summary["errors"].append({
-                            "code": error_code, "file": file_key,
-                            "hint": "invalid_records_persist_until_file_rewrite",
-                        })
-                    store.set_source_checkpoint(
-                        name,
-                        file_key,
-                        cursor=parsed_append.cursor,
-                        fingerprint=parsed_append.fingerprint,
-                        adapter_version=item.version,
-                        session_row_id=checkpoint["session_row_id"],
-                        invalid_records=invalid_records,
-                        mtime_ns=stat.st_mtime_ns,
-                        status="degraded" if invalid_records else "ok",
-                        error_code=error_code,
-                    )
-                    continue
+                    try:
+                        parsed_append = incremental(
+                            path,
+                            checkpoint["cursor"],
+                            checkpoint["fingerprint"],
+                        )
+                    except PrefixMismatchError:
+                        # A rewrite or replacement can grow the file too. Reparse
+                        # safely instead of seeking into the middle of a record.
+                        pass
+                    else:
+                        summary["scanned"] += 1
+                        changed = store.append_session_transcript(
+                            checkpoint["session_row_id"],
+                            parsed_append.lines,
+                            parsed_append.conclusion,
+                        )
+                        summary["updated" if changed else "skipped"] += 1
+                        invalid_records = (
+                            checkpoint["invalid_records"]
+                            + parsed_append.invalid_records
+                        )
+                        error_code = (
+                            parsed_append.diagnostics[0]
+                            if parsed_append.diagnostics
+                            else checkpoint["error_code"]
+                        )
+                        if invalid_records and not error_code:
+                            error_code = "SB_SOURCE_JSONL_INVALID"
+                        summary["invalid"] += invalid_records
+                        if error_code:
+                            summary["errors"].append({
+                                "code": error_code, "file": file_key,
+                                "hint": "invalid_records_persist_until_file_rewrite",
+                            })
+                        store.set_source_checkpoint(
+                            name,
+                            file_key,
+                            cursor=parsed_append.cursor,
+                            fingerprint=parsed_append.fingerprint,
+                            adapter_version=item.version,
+                            session_row_id=checkpoint["session_row_id"],
+                            invalid_records=invalid_records,
+                            mtime_ns=stat.st_mtime_ns,
+                            status="degraded" if invalid_records else "ok",
+                            error_code=error_code,
+                        )
+                        continue
 
             if checkpoint and not callable(incremental):
                 fingerprint = item.fingerprint(path)
