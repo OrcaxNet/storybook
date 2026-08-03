@@ -351,6 +351,15 @@ storybook search "开发一个语音机器人" --top 1 --json
 
 Agent history 为 local-first：单来源损坏会在 summary 标记 `degraded`，但不阻断其他来源。MCP 接入与 history ingestion 是两个独立状态。支持矩阵、schema/version 证据及隐私边界见 [Agent History Adapter compatibility](docs/AGENT_HISTORY_ADAPTERS.md)。
 
+Codex JSONL 按 **append-only 增量源**处理：热路径只读取固定上限的文件身份/guard 证据和 checkpoint cursor 后新增的完整记录，复杂度为 `O(delta + C)`，不会为验证全部历史而每轮重读整个文件。文件被原子替换、inode/device 改变、尺寸缩短，或 guard 覆盖的边界发生变化时，会安全回退全量解析。对于同 inode 且继续增长、只改写 guard 未读取的历史中部字节，Storybook 不承诺自动发现；这不属于 supported 来源契约。
+
+若上游工具或用户改写了既有历史，使用以下命令删除该来源的 checkpoint；下一轮 import/dream 会完整重建 checkpoint，其他来源不受影响：
+
+```bash
+storybook sources reset-checkpoint codex --yes
+storybook import-data --source codex
+```
+
 ### ContextEnvelope 与环境感知召回
 
 每条新 Session 都保存 `tool/device/session/workspace/runtime/captured_at/provenance`；每个未知叶子字段使用 `null`（`runtime.kind` 使用枚举 `unknown`）并标记 `provenance=unknown`。Claude/Cursor adapter 采集 `detected/reported/inferred/user_confirmed` 来源，原始外部 session ID 使用 Profile 本地 HMAC，绝对路径、hostname、remote host 与 repo URL 只保留哈希或短别名。
@@ -372,7 +381,7 @@ storybook stats                         # 看看沉淀了多少 Story
 
 | 入口 | 用途 | 平台 |
 |------|------|------|
-| `storybook process --watch` | 反应式监听：轮询 `~/.claude/projects`，有新会话自动采集 + 加工（长驻，Ctrl-C 退出） | 全平台 |
+| `storybook process --watch` | 反应式监听：轮询全部已启用来源（可用 `--source` 限定），有新会话自动采集 + 加工（长驻，Ctrl-C 退出） | 全平台 |
 | `storybook dream --once` | 单次完整周期（采集 + 加工）后退出——**定时调度器的入口** | 全平台 |
 | `storybook dream` | 定时守护进程，每 `DREAM_INTERVAL` 秒一轮（Ctrl-C / SIGTERM 退出） | 非 macOS 兜底 |
 
@@ -589,7 +598,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `STORYBOOK_GRAPH_TOKEN_BUDGET` | `1600` | 图扩散候选摘要与路径预算 |
 | `STORYBOOK_LLM_THINK` | `0` | DeepSeek thinking：`0`=关，`1`=显式开启 |
 | `STORYBOOK_DREAM_INTERVAL` | `14400` | `dream` 守护进程 / launchd 定时间隔（秒），默认 4 小时 |
-| `STORYBOOK_WATCH_POLL_INTERVAL` | `60` | `process --watch` 轮询 `~/.claude/projects` 的间隔（秒） |
+| `STORYBOOK_WATCH_POLL_INTERVAL` | `60` | `process --watch` 轮询已启用 Agent history 来源的间隔（秒） |
 
 关键阈值（`config.py`）：
 

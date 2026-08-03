@@ -19,7 +19,7 @@ CLI 入口 — storybook 命令
   storybook import --sample [N]     生成N条模拟数据(默认100)
   storybook process                 处理所有pending会话(做梦)
   storybook process --session ID    处理指定会话
-  storybook process --watch         监听 ~/.claude/projects，有新会话自动加工（长驻）
+  storybook process --watch         监听全部已启用来源，有新会话自动加工（长驻）
   storybook dream --once            跑一次完整做梦周期（采集+加工）后退出；launchd 入口
   storybook dream                   定时守护进程（非 macOS 兜底，每 DREAM_INTERVAL 秒一轮）
   storybook search <query>          搜索记忆
