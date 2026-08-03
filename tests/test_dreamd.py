@@ -167,6 +167,48 @@ class TestSnapshot:
         assert dreamd._snapshot_changed(a, c)
         assert not dreamd._snapshot_changed(a, dict(a))
 
+    def test_adapter_discovery_failure_does_not_hide_healthy_source(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        healthy_file = tmp_path / "good" / "session.jsonl"
+        healthy_file.parent.mkdir()
+        healthy_file.write_text("{}\n", encoding="utf-8")
+
+        class HealthyAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                return [healthy_file]
+
+        class DeniedAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                raise PermissionError("private source path")
+
+        monkeypatch.setattr(
+            dreamd.source_manager,
+            "adapters",
+            lambda: {"good": HealthyAdapter(), "denied": DeniedAdapter()},
+        )
+        diagnostics = []
+
+        with caplog.at_level(logging.WARNING):
+            snapshot = dreamd.scan_session_files(
+                sources=["denied", "good"], diagnostics=diagnostics
+            )
+
+        assert len(snapshot) == 1
+        assert diagnostics == [{
+            "source": "denied",
+            "code": "SB_SOURCE_PERMISSION_DENIED",
+            "hint": "PermissionError",
+        }]
+        assert "private source path" not in caplog.text
+        assert "SB_SOURCE_PERMISSION_DENIED" in caplog.text
+
     def test_should_run_cycle_first_tick_always_runs(self):
         """首帧总跑（追补未导入会话），其后仅变化时跑。"""
         assert dreamd._should_run_cycle(None, {}) is True

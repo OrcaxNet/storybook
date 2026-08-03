@@ -236,35 +236,80 @@ def run_dream_cycle_once(
 def scan_session_files(
     projects_path: Optional[Path] = None,
     sources: list[str] | tuple[str, ...] | None = None,
+    diagnostics: Optional[list[dict]] = None,
 ) -> dict[str, float]:
     """对启用来源做隐私安全的廉价快照 ``{HMAC 文件键: 版本}``。
 
     用于 ``--watch`` 判定「是否有变化」，避免每轮都跑完整采集。路径不存在返回 ``{}``。
     """
     if projects_path is not None:
-        if not projects_path.exists():
+        try:
+            available = projects_path.exists()
+        except OSError as exc:
+            _record_watch_diagnostic(
+                diagnostics, "claude", "SB_SOURCE_DISCOVERY_FAILED", exc
+            )
             return {}
-        paths = projects_path.glob("*/*.jsonl")
+        if not available:
+            return {}
+        paths = (("claude", path) for path in projects_path.glob("*/*.jsonl"))
     else:
         selected = sources or [
             name for name, enabled in source_manager.load_settings().items() if enabled
         ]
         registered = source_manager.adapters()
-        paths = (
-            path
-            for name in selected
-            if name in registered
-            for path in registered[name].discover()
-        )
+        discovered: list[tuple[str, Path]] = []
+        for name in selected:
+            adapter = registered.get(name)
+            if adapter is None:
+                continue
+            try:
+                detection = adapter.detect()
+                if not detection.get("available"):
+                    if detection.get("status") not in {None, "missing"}:
+                        _record_watch_diagnostic(
+                            diagnostics,
+                            name,
+                            detection.get("code", "SB_SOURCE_UNAVAILABLE"),
+                            RuntimeError(detection.get("status", "unavailable")),
+                        )
+                    continue
+                discovered.extend((name, path) for path in adapter.discover())
+            except PermissionError as exc:
+                _record_watch_diagnostic(
+                    diagnostics, name, "SB_SOURCE_PERMISSION_DENIED", exc
+                )
+            except Exception as exc:
+                _record_watch_diagnostic(
+                    diagnostics, name, "SB_SOURCE_DISCOVERY_FAILED", exc
+                )
+        paths = iter(discovered)
     snap: dict[str, float] = {}
-    for path in paths:
+    for source, path in paths:
         try:
             stat = path.stat()
             key = source_manager.private_file_key("watch", path)
             snap[key] = stat.st_mtime_ns + stat.st_size
-        except OSError:
+        except OSError as exc:
+            _record_watch_diagnostic(
+                diagnostics, source, "SB_SOURCE_FILE_FAILED", exc
+            )
             continue
     return snap
+
+
+def _record_watch_diagnostic(
+    diagnostics: Optional[list[dict]], source: str, code: str, exc: Exception
+) -> None:
+    item = {"source": source, "code": code, "hint": type(exc).__name__}
+    if diagnostics is not None:
+        diagnostics.append(item)
+    logger.warning(
+        "watch source degraded: source=%s code=%s hint=%s",
+        source,
+        code,
+        type(exc).__name__,
+    )
 
 
 def _snapshot_changed(prev: dict[str, float], curr: dict[str, float]) -> bool:
@@ -319,10 +364,11 @@ def watch_loop(
     ticks = 0
     cycles = 0
     results: list[dict] = []
+    diagnostics: list[dict] = []
 
     while not stop_event.is_set():
         ticks += 1
-        curr = scan_session_files(projects_path, sources)
+        curr = scan_session_files(projects_path, sources, diagnostics)
         if _should_run_cycle(prev, curr):
             result = run_dream_cycle_once(
                 import_new=True, verbose=verbose, sources=sources
@@ -338,7 +384,10 @@ def watch_loop(
         sleep_func(stop_event, float(poll_interval))
 
     logger.info("监听结束：共 %d 轮触发 / %d 次轮询", cycles, ticks)
-    return {"ticks": ticks, "cycles": cycles, "results": results}
+    return {
+        "ticks": ticks, "cycles": cycles, "results": results,
+        "diagnostics": diagnostics,
+    }
 
 
 # ═══════════════════════════════════════════════
