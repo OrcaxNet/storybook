@@ -2,7 +2,7 @@
 
 > 离线 Coding 记忆系统 —— 把每一次 AI 编程会话在"梦境"里整理成一条 Story，再连成一张可被联想唤醒的记忆网。
 >
-> An offline coding memory system that consolidates AI-coding sessions into structured *Stories* via a "dream cycle" and links them into a weighted association graph. All LLM / embedding work runs through a **local Ollama** — fully offline.
+> A local-first coding memory system that consolidates AI-coding sessions into structured *Stories* via a "dream cycle" and links them into a weighted association graph. Generative work uses DeepSeek; embeddings remain local in Ollama.
 
 ## 这是什么 / What it is
 
@@ -10,7 +10,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 
 检索时，Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。Auto 仅在 zero/low-confidence、复合、跨语言或强环境歧义时进入独立预算的 Query Transformation/HyDE 第二阶段；Deep 必须由调用方显式选择。每条结果返回来源路径与分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
 
-整个系统**完全离线**：LLM 与 embedding 都走本地 Ollama，不依赖任何云端服务。
+系统采用**混合 provider**：生成式 LLM 通过 DeepSeek Anthropic-compatible Messages API，1024 维 embedding 与索引仍完全留在本机 Ollama。Fast 查询不调用生成式 LLM；只有做梦加工以及门控后的 Auto/Deep transformation 会把对应文本发送给 DeepSeek。
 
 ## ✨ 特性
 
@@ -21,7 +21,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
 - 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/lexical/fusion/transform/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 与离线策略消融同时守护质量/时延
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
-- 🏠 **完全离线**：只需本地 Ollama，零云端依赖
+- 🏠 **本地优先**：Profile、原始证据、数据库与 embedding 留在本机；云端生成调用可明确门控并快速降级
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
 - 🌅 **晨间简报**：会话启动时基于 cwd / 首条提问**主动召回**相关记忆并注入上下文（`SessionStart` hook 或 `prime_context` MCP 工具），实现"下意识回忆"--更贴近初衷；token 预算内、相关度不足时**静默不注入**
 
@@ -49,7 +49,7 @@ collector → store → processor (用 llm + embeddings) → search
 
 Fast：query normalization → vector + FTS/关键词 → 加权 RRF → 环境软加权 → 有界 Graph RAG → 本地 top-N rerank。Fast 不调用生成式 LLM；`graph_enabled=false` 可关闭图扩散。
 
-Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambiguous_ranking`、`long_compound_query`、`cross_language`、`environment_ambiguity` 等稳定原因决定是否调用一次本地 LLM，生成 rewrite、multi-query 或 HyDE 辅助表示。第二阶段有独立 deadline，超时后原 Fast 结果立即作为 fallback 返回。Deep 显式启用三种 transformation、更高 Graph 预算及 5s 总预算。
+Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambiguous_ranking`、`long_compound_query`、`cross_language`、`environment_ambiguity` 等稳定原因决定是否调用一次 DeepSeek LLM，生成 rewrite、multi-query 或 HyDE 辅助表示。第二阶段有独立 deadline，超时后原 Fast 结果立即作为 fallback 返回。Deep 显式启用三种 transformation、更高 Graph 预算及 5s 总预算。
 
 本地 reranker 只处理有界 top-N，具有独立超时、连续失败熔断与冷却恢复；故障时返回 fusion/graph 排名并标明 `reranker_timeout` / `reranker_unavailable` / `reranker_circuit_open`，不会伪装成“无记忆”。
 
@@ -76,14 +76,12 @@ storybook embedding-backfill --model qwen3-embedding:0.6b \
 ## 🔧 环境要求
 
 - **Python 3.11+**（推荐用 [uv](https://github.com/astral-sh/uv) 建 venv）
-- **Ollama** 运行于 `http://localhost:11434`（可用 `OLLAMA_HOST` 覆盖），并拉取两个模型：
-  - LLM：`qwythos-hermes:latest`（可用 `STORYBOOK_LLM_MODEL` 覆盖）
-  - Embedding：`qwen3-embedding:0.6b`，**1024 维**（可用 `STORYBOOK_EMBED_MODEL` 覆盖）；需与 `config.EMBED_DIM` 一致
+- **DeepSeek API 凭据**：优先 `ANTHROPIC_AUTH_TOKEN`，兼容 `DEEPSEEK_KEY`；默认读取 `~/.chrc/dpsk.sh`
+- **Ollama** 运行于 `http://localhost:11434`（可用 `OLLAMA_HOST` 覆盖），仅需拉取 embedding 模型 `qwen3-embedding:0.6b`，**1024 维**（可用 `STORYBOOK_EMBED_MODEL` 覆盖）；需与 `config.EMBED_DIM` 一致
 - 依赖：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
 
 ```bash
 # 拉模型
-ollama pull qwythos-hermes:latest
 ollama pull qwen3-embedding:0.6b
 ```
 
@@ -110,7 +108,7 @@ PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 ### 一键 setup 与安全卸载
 
 `storybook setup` 会先展示完整改动计划，再创建用户级 Profile/schema、检测并接入
-Claude Code、Cursor、Codex，检查或下载本地 Ollama 模型，最后执行 schema、embedding、
+Claude Code、Cursor、Codex，只检查或下载本地 Ollama embedding 模型，最后执行 schema、embedding、
 adapter、recall smoke test。三类 Agent 都复用同一个 `storybook mcp` stdio server；Claude
 Code 还会安装幂等的 `SessionStart` recall hook。无需手工编辑 JSON/TOML。
 
@@ -189,7 +187,7 @@ storybook migration delete-backup <migration_id> --yes      # 用户显式永久
 ## 🧪 测试
 
 测试套件覆盖 `store` / `processor` / `search` 三个核心模块的关键路径与边界，
-**完全不依赖 Ollama**——所有 LLM / embedding 调用均被 mock 桩替换，本地一键可重复运行。
+**完全不依赖真实 DeepSeek/Ollama**——所有 LLM / embedding 调用均被 mock 桩替换，本地一键可重复运行。
 
 ```bash
 # 1. 安装测试依赖（与运行时依赖一并）
@@ -202,7 +200,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 .venv/bin/pytest --cov=storybook --cov-report=term-missing
 ```
 
-测试不启动 Ollama、不联网：把 `OLLAMA_HOST` 指向任意地址都不影响结果。
+测试不启动 Ollama、不访问 DeepSeek：HTTP 与 embedding 均使用 mock。
 用例要点：
 
 - **store**：Session/Story CRUD、`_edge_pair` 无向边归一、`search_by_vector` 的 `1 - dist²/2`
@@ -274,10 +272,10 @@ storybook status --performance
 storybook status --performance --json
 ```
 
-`status --json` 同时返回当前 `profile`、Ollama `model`、setup 管理的
+`status --json` 同时返回当前 `profile`、混合 provider `model`、setup 管理的
 `adapter`、`sync` 与计数字段。组件全部可用时 `status=ready`；Profile、模型或
 已配置 adapter 不可用时返回 `status=ready_degraded`，并通过稳定的
-`degraded_reasons`（例如 `ollama_unavailable`、`model_missing:embedding`、
+`degraded_reasons`（例如 `llm_credentials_missing`、`ollama_unavailable`、`model_missing:embedding`、
 `adapter_unavailable:codex`）解释降级，不把可用的本地数据库误报为整体失败。
 
 完整性能基准复用 `data/retrieval_benchmark.json` 的人工 ground truth，并在隔离临时库中构造固定 seed 的 10k Story 数据集。默认跑 50 条固定查询、每条重复 20 次、并发 1 和 5，报告机器/模型状态/规模/重复次数、所有阶段的 p50/p95/p99，以及按 exact/synonym/cross_lang 分组的 recall@1/3/5 和 MRR。基准不会污染用户数据库，也不会把原始 query、Story 内容、绝对路径或仓库 URL 写入报告。
@@ -553,14 +551,17 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 
 ## ⚙️ 配置
 
-所有路径、模型名、阈值都集中在 `src/storybook/config.py`。环境变量样例见 `.env.example`。`config.py` 启动时自动加载项目根 `.env`（无则跳过）；命令行 / 已存在的环境变量优先级高于 `.env`，故 launchd 等无 shell 的场景也无需手动 `export`。
+所有路径、模型名、阈值都集中在 `src/storybook/config.py`。环境变量样例见 `.env.example`。生成式 LLM 配置按“进程环境变量 > `STORYBOOK_LLM_ENV_FILE` > 项目 `.env` > 默认值”解析；文件只读取简单 `export KEY=value`/`KEY=value` 文本，绝不 `source` 或执行。未指定文件时默认发现 `~/.chrc/dpsk.sh`，不存在则静默跳过，适用于 launchd 等无 shell 环境。
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `STORYBOOK_PROFILE` | registry 当前项 | 仅当前进程选择 Profile（UUID 或显示名），不改 registry |
 | `STORYBOOK_HOME` | 平台用户目录 | 显式收拢/隔离 registry、数据、缓存与日志 |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama 服务地址 |
-| `STORYBOOK_LLM_MODEL` | `qwythos-hermes:latest` | 做梦加工用的 LLM |
+| `STORYBOOK_LLM_ENV_FILE` | `~/.chrc/dpsk.sh` | DeepSeek shell-env 配置文件（纯文本解析） |
+| `ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic-compatible Base URL |
+| `ANTHROPIC_AUTH_TOKEN` / `DEEPSEEK_KEY` | 无 | API key 与兼容回退变量；不会写入日志/status |
+| `STORYBOOK_LLM_MODEL` | `deepseek-v4-flash` | 生成模型；其次读取 `ANTHROPIC_DEFAULT_HAIKU_MODEL` |
 | `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
 | `STORYBOOK_EMBED_VERSION` | `story-v2-default-v1` | 活跃表示的不可变版本标识 |
 | `STORYBOOK_EMBED_REPRESENTATION` | `default` | 默认 `title + abstract + applicability` |
@@ -579,7 +580,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `STORYBOOK_GRAPH_MAX_HOPS` / `MAX_PATHS` / `FAN_OUT` | `2` / `64` / `8` | 图扩散结构预算 |
 | `STORYBOOK_GRAPH_TIME_BUDGET_MS` | `100` | 图扩散墙钟预算，用尽时返回 `truncated=true` |
 | `STORYBOOK_GRAPH_TOKEN_BUDGET` | `1600` | 图扩散候选摘要与路径预算 |
-| `STORYBOOK_LLM_THINK` | `0` | Qwen3 思考模式：`0`=关（提取类任务约 9× 加速），`1`=开（检索准确率不足时再开） |
+| `STORYBOOK_LLM_THINK` | `0` | DeepSeek thinking：`0`=关，`1`=显式开启 |
 | `STORYBOOK_DREAM_INTERVAL` | `14400` | `dream` 守护进程 / launchd 定时间隔（秒），默认 4 小时 |
 | `STORYBOOK_WATCH_POLL_INTERVAL` | `60` | `process --watch` 轮询 `~/.claude/projects` 的间隔（秒） |
 
@@ -600,7 +601,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `PRIME_TOKEN_BUDGET` | 2000 | 晨间简报 token 预算上限（≤2k，避免污染上下文） |
 | `PRIME_CONTENT_EXCERPT_CHARS` | 140 | 晨间简报中每条 Story 摘要最大字符数 |
 
-记忆形成 LLM 使用 temp 0.3、`num_ctx` 8192 与 120s 超时；查询 transformation 把 Auto/Deep 的独立短 deadline 同时传入 HTTP 客户端。
+记忆形成 LLM 使用 temp 0.3、调用方既有 `max_tokens` 上限与 120s 超时；查询 transformation 把 Auto/Deep 的独立短 deadline 同时传入 DeepSeek HTTP 客户端。401/402/429/5xx、超时、非 JSON 或空内容均保持原有 fallback。
 
 ## 📁 项目结构
 
@@ -614,7 +615,7 @@ storybook/
 │   ├── collector.py    # 会话采集（Claude Code / Cursor / JSON / 模拟）
 │   ├── store.py        # SQLite + sqlite-vec 存储层
 │   ├── processor.py    # 做梦周期（dream cycle）
-│   ├── llm.py          # Ollama LLM 调用
+│   ├── llm.py          # DeepSeek Anthropic-compatible Messages API
 │   ├── embeddings.py   # Ollama embedding 调用
 │   ├── search.py       # 版本化缓存 + 向量/词法降级 + 关联激活
 │   ├── query_cache.py  # index_version 隔离的向量/结果 LRU+TTL 缓存
@@ -627,7 +628,7 @@ storybook/
 ├── data/               # benchmark/报告等仓库资源（不再存运行时主数据库）
 ├── scripts/            # launchd plist 模板 + install_launchd.sh + systemd 单元模板
 ├── docs/TECH_DESIGN.md # 原始设计文档
-├── tests/              # pytest 测试套件（store/processor/search/dreamd + 集成，全 mock Ollama）
+├── tests/              # pytest 测试套件（store/processor/search/dreamd + 集成，全 mock provider）
 ├── test_logs/          # 示例 JSON 数据
 ├── hermes_sessions.json
 ├── .env.example
@@ -636,8 +637,8 @@ storybook/
 
 ## 📝 说明
 
-- **完全离线**：所有 LLM / embedding 走本地 Ollama，不发送任何数据到云端。
-- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖 Ollama（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
+- **隐私边界**：Profile、数据库、原始证据和 embedding 均留在本机；生成式操作会把其 prompt 发送到 DeepSeek，Fast 查询不会。
+- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖真实 provider（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
 - **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「🔌 MCP 接入」）。
 - **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / Ollama 不可用时静默不注入（见上文「🌅 会话启动注入」）。
 - `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「🧪 测试」与「🌙 做梦周期自动化」）。

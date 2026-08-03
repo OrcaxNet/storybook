@@ -1,4 +1,4 @@
-# 离线 Coding 记忆系统 MVP — 技术方案
+# Local-first Coding 记忆系统 MVP — 技术方案
 
 ## 一、环境基线（已确认）
 
@@ -7,7 +7,7 @@
 | OS | macOS (Apple Silicon) |
 | Python | 3.9.6 (系统) / 3.14 (Homebrew)；用 uv 创建 3.11 venv |
 | Ollama | ✅ 已安装运行 |
-| LLM 模型 | `qwythos-hermes:latest` (Qwen3架构, 131K上下文) |
+| LLM 模型 | DeepSeek API `deepseek-v4-flash`（Anthropic-compatible Messages API） |
 | Embedding 模型 | `qwen3-embedding:0.6b` (1024维, 639MB) |
 | SQLite | ✅ 系统自带 |
 | Cursor | ❌ 未安装（MVP用模拟数据，后续装Cursor后自动适配） |
@@ -54,7 +54,7 @@
 | 层 | 选型 | 理由 |
 |----|------|------|
 | **存储** | SQLite + `sqlite-vec` | 单文件、零运维；sqlite-vec 是 sqlite-ivm 作者新项目，2024年最热的 SQLite 向量扩展，GitHub 4k+ stars |
-| **LLM** | Ollama `qwythos-hermes` | 本地已部署，131K上下文，无需API费用，完全离线 |
+| **LLM** | DeepSeek `deepseek-v4-flash` | 生成式加工低延迟；失败保持本地 fallback，默认关闭 thinking |
 | **Embedding** | Ollama `qwen3-embedding:0.6b` | 本地已部署，1024维，中英文表现优秀 |
 | **CLI框架** | `click` | Python CLI 事实标准，比 argparse 好用，比 typer 轻量 |
 | **定时调度** | macOS `launchd` (plist) | 原生、可靠、不依赖额外进程；也提供 Python 内置 `schedule` 作为备选 |
@@ -346,7 +346,7 @@ coding-memory/
 │       ├── config.py          # 配置管理
 │       ├── store.py           # SQLite存储层
 │       ├── embeddings.py      # Ollama embedding封装
-│       ├── llm.py             # Ollama LLM封装 (摘要/关键词/分裂)
+│       ├── llm.py             # DeepSeek Messages API 封装 (摘要/关键词/分裂)
 │       ├── collector.py       # Cursor日志采集
 │       ├── processor.py       # 「做梦」核心流程
 │       ├── search.py          # 检索激活
@@ -366,7 +366,7 @@ coding-memory/
 
 | 模块 | 职责 | 核心接口 |
 |------|------|---------|
-| `config.py` | 配置管理 | `DB_PATH`, `OLLAMA_HOST`, `LLM_MODEL`, `EMBED_MODEL`, 阈值常量 |
+| `config.py` | 配置管理 | `DB_PATH`, DeepSeek LLM 配置, `OLLAMA_HOST`, `EMBED_MODEL`, 阈值常量 |
 | `store.py` | 存储CRUD | `init_db()`, `add_session()`, `get_pending_sessions()`, `add_story()`, `update_story()`, `add_edge()`, `update_edge_weight()`, `search_vectors()` |
 | `embeddings.py` | 语义向量 | `embed(text) -> List[float]`, `cosine_similarity(v1, v2) -> float` |
 | `llm.py` | LLM处理 | `extract_keywords(text) -> List[str]`, `summarize_session(session) -> str`, `merge_stories(old, new) -> str`, `judge_split(merged) -> bool`, `split_story(merged) -> List[dict]` |

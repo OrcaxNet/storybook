@@ -282,7 +282,7 @@ class SetupManager:
         return SetupPlan(
             profile=profile_plan,
             adapters=tuple(adapter_plans),
-            models=(config.LLM_MODEL, config.EMBED_MODEL),
+            models=(config.EMBED_MODEL,),
             legacy_databases=self._legacy_databases(),
         )
 
@@ -461,7 +461,7 @@ class SetupManager:
     def _ensure_models(
         self, *, download: bool, progress: Progress | None
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        required = (config.LLM_MODEL, config.EMBED_MODEL)
+        required = (config.EMBED_MODEL,)
         try:
             installed = _ollama_tags()
         except Exception as exc:  # noqa: BLE001 -- 网络/daemon 统一降级
@@ -707,35 +707,40 @@ class SetupManager:
             }
             sync_state = profile.sync_state
 
+        llm_ready = bool(config.LLM_API_KEY)
+        llm_payload = {
+            "provider": config.LLM_PROVIDER,
+            "name": config.LLM_MODEL,
+            "status": "ready" if llm_ready else "credentials_missing",
+        }
+        if not llm_ready:
+            degraded_reasons.append("llm_credentials_missing")
+
         ollama_ok, tags, _ = health._check_ollama_reachable()
         if not ollama_ok:
             model_payload = {
-                "provider": "ollama",
-                "status": "unavailable",
-                "llm": {"name": config.LLM_MODEL, "status": "unavailable"},
+                "provider": "hybrid",
+                "status": "degraded",
+                "llm": llm_payload,
                 "embedding": {
+                    "provider": "ollama",
                     "name": config.EMBED_MODEL,
                     "status": "unavailable",
                 },
             }
             degraded_reasons.append("ollama_unavailable")
         else:
-            llm_ready = health._model_pulled(tags, config.LLM_MODEL)
             embedding_ready = health._model_pulled(tags, config.EMBED_MODEL)
             model_payload = {
-                "provider": "ollama",
+                "provider": "hybrid",
                 "status": "ready" if llm_ready and embedding_ready else "degraded",
-                "llm": {
-                    "name": config.LLM_MODEL,
-                    "status": "ready" if llm_ready else "missing",
-                },
+                "llm": llm_payload,
                 "embedding": {
+                    "provider": "ollama",
                     "name": config.EMBED_MODEL,
                     "status": "ready" if embedding_ready else "missing",
                 },
             }
-            if not llm_ready:
-                degraded_reasons.append("model_missing:llm")
             if not embedding_ready:
                 degraded_reasons.append("model_missing:embedding")
 
