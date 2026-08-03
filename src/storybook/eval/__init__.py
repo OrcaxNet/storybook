@@ -21,6 +21,7 @@ from .metrics import (
 from .runner import (
     run_retrieval_eval, run_processing_eval, run_split_eval,
     run_embedding_ablation, run_retrieval_strategy_ablation,
+    run_exact_term_hybrid_ablation,
     pre_generated_transform_provider, run_all,
     format_report, EvalReport,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "recall_at_k", "precision_at_k", "mrr", "merge_branch_accuracy", "threshold_sweep",
     "run_retrieval_eval", "run_processing_eval", "run_split_eval",
     "run_embedding_ablation", "run_retrieval_strategy_ablation",
+    "run_exact_term_hybrid_ablation",
     "pre_generated_transform_provider", "run_all",
     "format_report", "EvalReport",
 ]

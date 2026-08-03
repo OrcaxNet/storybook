@@ -392,7 +392,7 @@ coding-memory/
 会话内容：
 {session_content}
 
-只输出 JSON 数组。
+通过强制命名 tool call 按 JSON Schema 返回 `{stories: [...]}`；旧网关 JSON 文本仅作兼容 fallback。
 ```
 
 **关键词提取 Prompt：**

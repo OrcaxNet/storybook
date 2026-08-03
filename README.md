@@ -226,8 +226,9 @@ PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段�
 作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染用户 Profile 数据库。
 
 ```bash
-storybook eval all                              # 跑全部五轮评测（默认）
+storybook eval all                              # 跑全部六轮评测（默认）
 storybook eval retrieval                        # 仅检索评测
+storybook eval exact-term                       # 精确代码 token：纯向量 vs Hybrid
 storybook eval all --report data/eval_reports/baseline.json   # 落盘 JSON 报告，便于阈值调整前后对比
 python scripts/eval.py retrieval                # 等价独立脚本（未做 editable 安装时用）
 python scripts/generate_eval_transforms.py --variant ambiguous --timeout 30 \
@@ -245,6 +246,7 @@ storybook eval strategy --transform-cache data/eval_reports/query-only-transform
 3. **split** — 真实 embedding + 确定性 LLM 桩，度量分裂路径结构正确性（父向量移除、父子边 1.0、子向量入索引、子 story 可检索）。
 4. **ablation** — 比较 legacy、默认 `title+abstract+applicability`、全文单向量、title/abstract/applicability 分字段多向量；按 exact/synonym/cross-tool/cross-language 报告 recall@3/MRR 与索引/查询时延。
 5. **strategy** — 比较 direct-vector、hybrid、+graph、raw-query `+reranker` 控制组、+rewrite、+HyDE、+reranker；按 exact/synonym/cross-language/cross-tool/ambiguous 报告 recall@3/MRR/p95。Transformation provider 只能收到原始 query、策略名和 timeout，`topic_id` 只在排序完成后计分；预生成文件按 query SHA-256 索引并拒绝 `topic_id`/目标 Story 字段。报告分别标记 `live_generated`、`query_only_pre_generated`、`oracle_upper_bound`，oracle 永不参与默认选型，预生成质量证据也必须有独立在线时延证据。只有 hard-query 质量提升、overall 非劣、ground-truth 隔离和 fast/deep 在线时延门槛全部通过的策略才标记 `eligible_for_default=true`。
+6. **exact-term** — 构造 compact semantic vector 相同、仅 detail/keywords 中精确错误码不同的隔离语料，直接对比 vector-only 与 FTS5/BM25 + vector RRF 的 recall@3，验证代码 token 不被语义向量吞没。
 
 Story v2 固定报告（2026-08-02，`data/eval_reports/story-v2-ablation-2026-08-02.json`）：四种表示在 24 topic × 4 分组上 recall@3/MRR 均为 100%；默认表示相对 legacy 为 `0.00pp`，通过“下降不超过 2pp”门槛。默认单向量索引均值 84.4ms/story，明显低于全文 205.2ms 与多向量 223.7ms；多向量检索 p95 0.94ms，高于默认 0.34ms，因此选择默认表示。
 
@@ -617,7 +619,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `PRIME_TOKEN_BUDGET` | 2000 | 晨间简报 token 预算上限（≤2k，避免污染上下文） |
 | `PRIME_CONTENT_EXCERPT_CHARS` | 140 | 晨间简报中每条 Story 摘要最大字符数 |
 
-记忆形成 LLM 使用 temp 0.3、调用方既有 `max_tokens` 上限与 120s 超时；查询 transformation 把 Auto/Deep 的独立短 deadline 同时传入 DeepSeek HTTP 客户端。401/402/429/5xx、超时、非 JSON 或空内容均保持原有 fallback。
+记忆形成 LLM 使用 temp 0.3、调用方既有 `max_tokens` 上限与 120s 超时；`extract_keywords`、Story v2 formation、`summarize_session`、`merge_stories`、`judge_split`、`split_story` 与 query transformation 均通过 DeepSeek Anthropic-compatible 的强制命名 tool call + `input_schema` 返回结构化对象，并在本地再次校验类型。旧网关的 JSON 文本仍可兼容解析；401/402/429/5xx、超时、schema 不匹配或空内容均保持原有业务 fallback。
 
 ## 📁 项目结构
 

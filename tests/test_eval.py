@@ -84,6 +84,21 @@ class TestMetrics:
         assert [c["recall@3"] for c in curve] == [1.0, 1.0, 0.0]
 
 
+class TestExactTermHybridAblation:
+    def test_hybrid_improves_exact_token_recall_over_tied_vectors(
+        self, fake_embedder
+    ):
+        fake_embedder.set_default(basis(0))
+
+        result = eval_module.run_exact_term_hybrid_ablation()
+
+        assert result["query_count"] == 8
+        assert result["vector_recall_at_k"] == 0.375
+        assert result["hybrid_recall_at_k"] == 1.0
+        assert result["absolute_gain"] == 0.625
+        assert result["passes_improvement_gate"] is True
+
+
 # ═══════════════════════════════════════════════
 #  检索评测（确定性向量驱动）
 # ═══════════════════════════════════════════════

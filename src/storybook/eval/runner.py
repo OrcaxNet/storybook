@@ -49,6 +49,16 @@ TRANSFORM_EVIDENCE_SOURCES = frozenset({
     "query_only_pre_generated",
     "oracle_upper_bound",
 })
+EXACT_TERM_CASES = (
+    "SQLITE_BUSY",
+    "ERR_MODULE_NOT_FOUND",
+    "ECONNRESET",
+    "ORA-00060",
+    "E11000",
+    "SIGSEGV",
+    "HTTP_429",
+    "OOMKILLED",
+)
 
 
 # ═══════════════════════════════════════════════
@@ -287,6 +297,103 @@ def run_retrieval_eval(
         "negatives": neg_rows,
         "threshold_sweep": curve,
         "passes_70_percent_recall_at_3": passes_70,
+    }
+
+
+def run_exact_term_hybrid_ablation(
+    db_path: Optional[Path] = None,
+    *,
+    top_k: int = 3,
+) -> dict:
+    """Measure exact-code-token recall for vector-only versus hybrid search.
+
+    Every Story deliberately shares the same semantic title/abstract vector;
+    its distinguishing error token lives in ``content`` and ``keywords``.
+    This models a real Story v2 boundary: the default compact embedding omits
+    full detail, while FTS indexes it.  Ground truth is the Story containing
+    the queried token, and the isolated database is discarded after the run.
+    """
+
+    top_k = max(1, int(top_k))
+    with _isolated_db(db_path):
+        shared_vector = embeddings.embed(
+            "generic incident recovery with a verified remediation"
+        )
+        if not shared_vector:
+            return {
+                "query_count": 0,
+                "embed_failures": 1,
+                "vector_recall_at_k": 0.0,
+                "hybrid_recall_at_k": 0.0,
+                "top_k": top_k,
+                "per_query": [],
+            }
+        targets = {}
+        for token in EXACT_TERM_CASES:
+            targets[token] = store.add_story(
+                title="Incident recovery note",
+                abstract="A verified remediation for a production incident.",
+                content=f"Observed exact diagnostic token {token}.",
+                keywords=[token],
+                embedding=shared_vector,
+                source_session_ids=[],
+            )
+
+        rows = []
+        embed_failures = 0
+        candidate_limit = len(targets)
+        for token, target_story_id in targets.items():
+            query_vector = embeddings.embed(token)
+            if not query_vector:
+                embed_failures += 1
+                continue
+            vector_rows = [
+                item for item in store.search_by_vector(
+                    query_vector, top_k=candidate_limit
+                )
+                if item["similarity"] >= config.SIM_THRESHOLD_SEARCH
+            ]
+            lexical_rows = store.search_by_lexical(
+                token,
+                top_k=candidate_limit,
+                timeout_seconds=max(0.5, config.QUERY_FALLBACK_TIMEOUT_SECONDS),
+            )
+            hybrid_rows = adaptive.fuse_rankings(
+                vector_rows, lexical_rows, limit=candidate_limit
+            )
+            vector_ids = [item["story_id"] for item in vector_rows]
+            hybrid_ids = [item["story_id"] for item in hybrid_rows]
+            rows.append({
+                "query": token,
+                "target_story_id": target_story_id,
+                "vector_recall": M.recall_at_k(
+                    vector_ids, [target_story_id], top_k
+                ),
+                "hybrid_recall": M.recall_at_k(
+                    hybrid_ids, [target_story_id], top_k
+                ),
+            })
+
+    count = len(rows)
+    vector_recall = (
+        sum(row["vector_recall"] for row in rows) / count if count else 0.0
+    )
+    hybrid_recall = (
+        sum(row["hybrid_recall"] for row in rows) / count if count else 0.0
+    )
+    return {
+        "query_count": count,
+        "embed_failures": embed_failures,
+        "top_k": top_k,
+        "vector_recall_at_k": round(vector_recall, 4),
+        "hybrid_recall_at_k": round(hybrid_recall, 4),
+        "absolute_gain": round(hybrid_recall - vector_recall, 4),
+        "passes_improvement_gate": hybrid_recall > vector_recall,
+        "per_query": rows,
+        "corpus_contract": (
+            "shared compact semantic vector; exact token only in FTS-indexed "
+            "content/keywords"
+        ),
     }
 
 
@@ -1283,12 +1390,13 @@ def run_split_eval(
 class EvalReport:
     """质量、加工、分裂与表示消融的汇总容器。"""
     def __init__(self, retrieval=None, processing=None, split=None,
-                 ablation=None, strategy=None, meta=None):
+                 ablation=None, strategy=None, exact_term=None, meta=None):
         self.retrieval = retrieval
         self.processing = processing
         self.split = split
         self.ablation = ablation
         self.strategy = strategy
+        self.exact_term = exact_term
         self.meta = meta or {}
 
     def to_dict(self) -> dict:
@@ -1299,12 +1407,16 @@ class EvalReport:
             "split": self.split,
             "ablation": self.ablation,
             "strategy": self.strategy,
+            "exact_term": self.exact_term,
         }
 
 
 def run_all(
     db_path: Optional[Path] = None,
-    parts: tuple = ("retrieval", "processing", "split", "ablation", "strategy"),
+    parts: tuple = (
+        "retrieval", "processing", "split", "ablation", "strategy",
+        "exact_term",
+    ),
     benchmark_path: Path | str = None,
     *,
     transform_provider=None,
@@ -1332,6 +1444,8 @@ def run_all(
             transform_provider=transform_provider,
             transform_source=transform_source,
         )
+    if "exact_term" in parts:
+        report.exact_term = run_exact_term_hybrid_ablation(db_path=db_path)
     return report
 
 
@@ -1473,6 +1587,23 @@ def format_report(report: EvalReport) -> str:
         lines.append(
             f"  默认选型: {strategy_report['selected_default']} | "
             f"质量+时延门禁: {'✅' if strategy_report['passes_default_gate'] else '❌'}"
+        )
+        lines.append("")
+
+    if report.exact_term:
+        exact = report.exact_term
+        lines.append("─" * 64)
+        lines.append("⑥ 精确术语 Hybrid 消融")
+        lines.append("─" * 64)
+        lines.append(
+            f"  queries={exact['query_count']} | recall@{exact['top_k']}: "
+            f"vector={exact['vector_recall_at_k']:.2%} -> "
+            f"hybrid={exact['hybrid_recall_at_k']:.2%} "
+            f"(Δ={exact['absolute_gain']:+.2%})"
+        )
+        lines.append(
+            "  改善门禁: "
+            + ("✅" if exact["passes_improvement_gate"] else "❌")
         )
         lines.append("")
 
