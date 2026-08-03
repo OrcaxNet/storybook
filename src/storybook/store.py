@@ -2,6 +2,7 @@
 存储层 — SQLite + sqlite-vec 向量存储，所有 CRUD 集中于此
 """
 import json
+import copy
 import sqlite3
 import logging
 import os
@@ -49,6 +50,23 @@ CREATE TABLE IF NOT EXISTS sessions (
     status TEXT DEFAULT 'pending',
     created_at TEXT DEFAULT (datetime('now')),
     processed_at TEXT
+);
+
+-- Per-source/file ingestion cursor. ``file_key`` is a Profile-local HMAC,
+-- never an absolute path or external session identifier.
+CREATE TABLE IF NOT EXISTS source_checkpoints (
+    source TEXT NOT NULL,
+    file_key TEXT NOT NULL,
+    cursor INTEGER NOT NULL DEFAULT 0,
+    fingerprint TEXT NOT NULL,
+    adapter_version TEXT NOT NULL,
+    session_row_id INTEGER,
+    invalid_records INTEGER NOT NULL DEFAULT 0,
+    mtime_ns INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'ok',
+    error_code TEXT,
+    updated_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (source, file_key)
 );
 
 -- Story 表（结构化记忆单元）
@@ -320,6 +338,7 @@ def init_db(
     db = get_db(path)
     try:
         db.executescript(_SCHEMA)
+        _ensure_source_checkpoint_columns(db)
         _ensure_identity_columns(db, owning_profile_id)
         _ensure_memory_graph_schema(db)
         _ensure_context_columns(db)
@@ -353,9 +372,28 @@ def init_db(
             (config.EMBED_MODEL, initial_version, initial_representation),
         )
         db.commit()
-        logger.info("数据库初始化完成: %s", path)
+        logger.info("数据库初始化完成")
     finally:
         db.close()
+
+
+def _ensure_source_checkpoint_columns(db: sqlite3.Connection) -> None:
+    """Upgrade checkpoints created by the first adapter implementation."""
+
+    columns = {
+        row["name"]
+        for row in db.execute("PRAGMA table_info(source_checkpoints)").fetchall()
+    }
+    additions = {
+        "session_row_id": "INTEGER",
+        "invalid_records": "INTEGER NOT NULL DEFAULT 0",
+        "mtime_ns": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            db.execute(
+                f"ALTER TABLE source_checkpoints ADD COLUMN {name} {declaration}"
+            )
 
 
 def _ensure_story_vectors(db: sqlite3.Connection) -> None:
@@ -1658,6 +1696,226 @@ def add_session(source: str, raw_content: str, problem_desc: str = "",
         )
         db.commit()
         return cur.lastrowid
+    finally:
+        db.close()
+
+
+def upsert_external_session(
+    source: str,
+    external_session_id: str,
+    raw_content: str,
+    problem_desc: str = "",
+    code_snippets: str = "[]",
+    conclusion: str = "",
+    context: dict | None = None,
+) -> tuple[int, str]:
+    """Insert or refresh one adapter-owned session.
+
+    Returns ``(session_id, action)`` where action is ``created``, ``updated`` or
+    ``unchanged``. The external identity is normalized by
+    :mod:`context` into a Profile-local HMAC before lookup/persistence.  An
+    appended transcript refreshes only its existing row and marks it pending so
+    the next dream cycle can evolve the affected Story.
+    """
+
+    external_hash = context_module.external_session_hash(external_session_id)
+    db = get_db()
+    try:
+        row = db.execute(
+            """SELECT id, global_id, raw_content, problem_desc, code_snippets, conclusion
+               FROM sessions
+               WHERE source = ? AND external_session_hash = ?
+               ORDER BY id LIMIT 1""",
+            (source, external_hash),
+        ).fetchone()
+        if row is None:
+            db.close()
+            db = None
+            session_context = copy.deepcopy(context or {})
+            session_context.setdefault("session", {})[
+                "external_session_id"
+            ] = external_session_id
+            return (
+                add_session(
+                    source,
+                    raw_content,
+                    problem_desc,
+                    code_snippets,
+                    conclusion,
+                    session_context,
+                ),
+                "created",
+            )
+
+        if (
+            row["raw_content"] == raw_content
+            and (row["problem_desc"] or "") == problem_desc
+            and (row["code_snippets"] or "[]") == code_snippets
+            and (row["conclusion"] or "") == conclusion
+        ):
+            return row["id"], "unchanged"
+
+        session_context = copy.deepcopy(context or {})
+        session_context.setdefault("session", {})[
+            "external_session_id"
+        ] = external_session_id
+        envelope = context_module.normalize_envelope(
+            session_context,
+            profile_id=config.PROFILE_ID,
+            session_id=row["global_id"],
+            source=source,
+        )
+        _upsert_context_dimensions(db, envelope)
+        db.execute(
+            """UPDATE sessions
+               SET raw_content = ?, problem_desc = ?, code_snippets = ?,
+                   conclusion = ?, device_id = ?, agent_installation_id = ?,
+                   workspace_id = ?, runtime_json = ?, context_json = ?,
+                   status = 'pending', processed_at = NULL
+               WHERE id = ?""",
+            (
+                raw_content,
+                problem_desc,
+                code_snippets,
+                conclusion,
+                envelope["device"]["id"],
+                envelope["tool"]["installation_id"],
+                envelope["workspace"]["id"],
+                json.dumps(envelope["runtime"], ensure_ascii=False, sort_keys=True),
+                json.dumps(envelope, ensure_ascii=False, sort_keys=True),
+                row["id"],
+            ),
+        )
+        db.commit()
+        return row["id"], "updated"
+    finally:
+        if db is not None:
+            db.close()
+
+
+def append_session_transcript(
+    session_id: int,
+    lines: list[str] | tuple[str, ...],
+    conclusion: str = "",
+    *,
+    cap: int = 6000,
+) -> bool:
+    """Append parsed records to one checkpoint-owned Session without rescanning."""
+
+    additions = [line for line in lines if line]
+    if not additions and not conclusion:
+        return False
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT raw_content, conclusion FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        merged = "\n".join(
+            part for part in (row["raw_content"], *additions) if part
+        )
+        if len(merged) > cap:
+            half = cap // 2
+            merged = merged[:half] + "\n...\n" + merged[-half:]
+        next_conclusion = conclusion or (row["conclusion"] or "")
+        if merged == row["raw_content"] and next_conclusion == (row["conclusion"] or ""):
+            return False
+        db.execute(
+            """UPDATE sessions
+               SET raw_content = ?, conclusion = ?, status = 'pending',
+                   processed_at = NULL
+               WHERE id = ?""",
+            (merged, next_conclusion, session_id),
+        )
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def get_source_checkpoint(source: str, file_key: str) -> sqlite3.Row | None:
+    db = get_db(load_vector_extension=False)
+    try:
+        return db.execute(
+            "SELECT * FROM source_checkpoints WHERE source = ? AND file_key = ?",
+            (source, file_key),
+        ).fetchone()
+    finally:
+        db.close()
+
+
+def set_source_checkpoint(
+    source: str,
+    file_key: str,
+    *,
+    cursor: int,
+    fingerprint: str,
+    adapter_version: str,
+    session_row_id: int | None = None,
+    invalid_records: int = 0,
+    mtime_ns: int = 0,
+    status: str = "ok",
+    error_code: str | None = None,
+) -> None:
+    db = get_db(load_vector_extension=False)
+    try:
+        db.execute(
+            """INSERT INTO source_checkpoints (
+                   source, file_key, cursor, fingerprint, adapter_version,
+                   session_row_id, invalid_records, mtime_ns,
+                   status, error_code, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(source, file_key) DO UPDATE SET
+                   cursor = excluded.cursor,
+                   fingerprint = excluded.fingerprint,
+                   adapter_version = excluded.adapter_version,
+                   session_row_id = excluded.session_row_id,
+                   invalid_records = excluded.invalid_records,
+                   mtime_ns = excluded.mtime_ns,
+                   status = excluded.status,
+                   error_code = excluded.error_code,
+                   updated_at = datetime('now')""",
+            (
+                source,
+                file_key,
+                cursor,
+                fingerprint,
+                adapter_version,
+                session_row_id,
+                invalid_records,
+                mtime_ns,
+                status,
+                error_code,
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def list_source_checkpoints(source: str | None = None) -> list[sqlite3.Row]:
+    db = get_db(load_vector_extension=False)
+    try:
+        if source:
+            return db.execute(
+                "SELECT * FROM source_checkpoints WHERE source = ? ORDER BY updated_at DESC",
+                (source,),
+            ).fetchall()
+        return db.execute(
+            "SELECT * FROM source_checkpoints ORDER BY source, updated_at DESC"
+        ).fetchall()
+    finally:
+        db.close()
+
+
+def delete_source_checkpoints(source: str) -> int:
+    db = get_db(load_vector_extension=False)
+    try:
+        cur = db.execute("DELETE FROM source_checkpoints WHERE source = ?", (source,))
+        db.commit()
+        return cur.rowcount
     finally:
         db.close()
 

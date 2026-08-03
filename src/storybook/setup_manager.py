@@ -567,6 +567,38 @@ class SetupManager:
         tests.append({"name": "recall", "ok": recall_ok, "detail": recall_detail})
         return tests
 
+    def _history_ingestion_status(self, selected: set[str]) -> list[dict[str, Any]]:
+        """Report local history independently from MCP/config integration."""
+
+        from .history_adapters.claude import ClaudeAdapter as ClaudeHistoryAdapter
+        from .history_adapters.codex import CodexAdapter as CodexHistoryAdapter
+        from .history_adapters.cursor import CursorAdapter as CursorHistoryAdapter
+
+        codex_root = self.context.environ.get("CODEX_HOME", "").strip()
+        probes = {
+            "claude": ClaudeHistoryAdapter(self.context.home / ".claude" / "projects"),
+            "cursor": CursorHistoryAdapter(
+                self.context.home / "Library" / "Application Support" / "Cursor"
+                / "User" / "workspaceStorage"
+            ),
+            "codex": CodexHistoryAdapter(
+                Path(codex_root).expanduser() if codex_root else self.context.home / ".codex"
+            ),
+        }
+        result = []
+        for name in sorted(selected):
+            probe = probes.get(name)
+            if probe is None:
+                continue
+            detection = probe.detect()
+            result.append({
+                "name": name,
+                "available": bool(detection.get("available")),
+                "status": detection.get("status", "unknown"),
+                "adapter_version": probe.version,
+            })
+        return result
+
     def execute(
         self,
         *,
@@ -671,6 +703,7 @@ class SetupManager:
                 "sync_state": config.SYNC_STATE,
             },
             "adapters": adapter_results,
+            "history_ingestion": self._history_ingestion_status(selected),
             "models": models,
             "smoke_tests": smoke,
             "legacy_databases": list(plan.legacy_databases),

@@ -1,11 +1,12 @@
 """做梦周期自动化（dreamd）测试：并发锁、单次周期、监听循环、定时守护。
 
 全部 mock Ollama（复用 conftest 的 fake_llm / fake_embedder），并 monkeypatch
-``collector.collect_claude_sessions`` 避免扫描真实 ``~/.claude/projects``。
+统一来源管理器，避免扫描真实 Agent 历史目录。
 锁文件随 ``config.DB_PATH`` 重定向到 tmp_path，测试间天然隔离。
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from storybook import dreamd, collector, store, processor
+from storybook.history_adapters.codex import CodexAdapter
 from ._helpers import basis
 
 
@@ -56,14 +58,20 @@ class TestDreamLock:
 # ═══════════════════════════════════════════════
 
 def _stub_collect(monkeypatch, sessions):
-    """把 collector.collect_claude_sessions 替换为返回固定会话列表的桩。"""
+    """把统一来源采集替换为返回固定会话列表的桩。"""
     calls = {"n": 0}
 
     def _fake(*_a, **_kw):
         calls["n"] += 1
-        return list(sessions)
+        count = collector.import_sessions(list(sessions))
+        return {
+            "status": "ok",
+            "imported": count,
+            "updated": 0,
+            "sources": [{"source": "claude", "status": "ok", "imported": count}],
+        }
 
-    monkeypatch.setattr(collector, "collect_claude_sessions", _fake)
+    monkeypatch.setattr(dreamd.source_manager, "import_enabled", _fake)
     return calls
 
 
@@ -103,7 +111,7 @@ class TestRunDreamCycleOnce:
         assert result["status"] == "ok"
         assert result["imported"] == 0
         assert result["total"] == 2
-        assert calls["n"] == 0, "import_new=False 不应调用 collect_claude_sessions"
+        assert calls["n"] == 0, "import_new=False 不应调用来源采集"
         assert store.count_stories() == 2
 
     def test_skipped_when_locked(self, fake_llm, fake_embedder, monkeypatch):
@@ -145,8 +153,11 @@ class TestSnapshot:
         f = proj / "abc.jsonl"
         f.write_text("{}", encoding="utf-8")
         snap = dreamd.scan_session_files(tmp_path / "projects")
-        assert str(f) in snap
-        assert snap[str(f)] == f.stat().st_mtime
+        assert len(snap) == 1
+        key, value = next(iter(snap.items()))
+        assert key.startswith("hmac-sha256:")
+        assert str(f) not in key
+        assert value == f.stat().st_mtime_ns + f.stat().st_size
 
     def test_snapshot_changed_detects_new_and_modified(self):
         a = {"/p/s1.jsonl": 1.0}
@@ -155,6 +166,55 @@ class TestSnapshot:
         assert dreamd._snapshot_changed(a, b)
         assert dreamd._snapshot_changed(a, c)
         assert not dreamd._snapshot_changed(a, dict(a))
+
+    def test_adapter_discovery_failure_does_not_hide_healthy_source(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        healthy_file = tmp_path / "good" / "session.jsonl"
+        healthy_file.parent.mkdir()
+        healthy_file.write_text("{}\n", encoding="utf-8")
+
+        class HealthyAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                return [healthy_file]
+
+        class DeniedAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                raise PermissionError("private source path")
+
+        monkeypatch.setattr(
+            dreamd.source_manager,
+            "adapters",
+            lambda: {"good": HealthyAdapter(), "denied": DeniedAdapter()},
+        )
+        diagnostics = {}
+        seen_failures = set()
+
+        with caplog.at_level(logging.WARNING):
+            snapshot = dreamd.scan_session_files(
+                sources=["denied", "good"], diagnostics=diagnostics,
+                seen_failures=seen_failures,
+            )
+
+        assert len(snapshot) == 1
+        assert list(diagnostics.values()) == [{
+            "source": "denied",
+            "code": "SB_SOURCE_PERMISSION_DENIED",
+            "hint": "PermissionError",
+            "count": 1,
+            "active": True,
+            "changes": 0,
+            "recoveries": 0,
+        }]
+        assert seen_failures == {"denied"}
+        assert "private source path" not in caplog.text
+        assert "SB_SOURCE_PERMISSION_DENIED" in caplog.text
 
     def test_should_run_cycle_first_tick_always_runs(self):
         """首帧总跑（追补未导入会话），其后仅变化时跑。"""
@@ -190,6 +250,110 @@ class TestDefaultSleep:
 
 
 class TestWatchLoop:
+    def test_repeated_source_failure_keeps_bounded_state_and_healthy_snapshot(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        healthy_file = tmp_path / "good" / "session.jsonl"
+        healthy_file.parent.mkdir()
+        healthy_file.write_text("{}\n", encoding="utf-8")
+
+        class HealthyAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                return [healthy_file]
+
+        class DeniedAdapter:
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                raise PermissionError("private source path")
+
+        monkeypatch.setattr(
+            dreamd.source_manager,
+            "adapters",
+            lambda: {"good": HealthyAdapter(), "denied": DeniedAdapter()},
+        )
+        monkeypatch.setattr(
+            dreamd, "run_dream_cycle_once", lambda **_kwargs: {"status": "ok"}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            out = dreamd.watch_loop(
+                poll_interval=1,
+                max_ticks=1000,
+                sleep_func=_noop_sleep,
+                sources=["denied", "good"],
+            )
+
+        assert out["ticks"] == 1000
+        assert out["cycles"] == 1
+        assert out["diagnostics"] == [{
+            "source": "denied",
+            "code": "SB_SOURCE_PERMISSION_DENIED",
+            "hint": "PermissionError",
+            "count": 1000,
+            "active": True,
+            "changes": 0,
+            "recoveries": 0,
+        }]
+        assert caplog.text.count("watch source degraded") == 1
+        assert "private source path" not in caplog.text
+
+    def test_source_failure_change_and_recovery_are_recorded_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        recovered_file = tmp_path / "source" / "session.jsonl"
+        recovered_file.parent.mkdir()
+        recovered_file.write_text("{}\n", encoding="utf-8")
+
+        class RecoveringAdapter:
+            attempts = 0
+
+            def detect(self):
+                return {"available": True, "status": "ready"}
+
+            def discover(self):
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise PermissionError("private first failure")
+                if self.attempts == 2:
+                    raise OSError("private changed failure")
+                return [recovered_file]
+
+        adapter = RecoveringAdapter()
+        monkeypatch.setattr(
+            dreamd.source_manager, "adapters", lambda: {"recovering": adapter}
+        )
+        monkeypatch.setattr(
+            dreamd, "run_dream_cycle_once", lambda **_kwargs: {"status": "ok"}
+        )
+
+        with caplog.at_level(logging.INFO):
+            out = dreamd.watch_loop(
+                poll_interval=1,
+                max_ticks=3,
+                sleep_func=_noop_sleep,
+                sources=["recovering"],
+            )
+
+        assert out["cycles"] == 2
+        assert out["diagnostics"] == [{
+            "source": "recovering",
+            "code": "SB_SOURCE_DISCOVERY_FAILED",
+            "hint": "OSError",
+            "count": 1,
+            "active": False,
+            "changes": 1,
+            "recoveries": 1,
+        }]
+        assert caplog.text.count("watch source degraded") == 2
+        assert caplog.text.count("watch source recovered") == 1
+        assert "private first failure" not in caplog.text
+        assert "private changed failure" not in caplog.text
+
     def test_runs_on_first_tick(self, fake_llm, fake_embedder, monkeypatch, tmp_path):
         """首帧追补：发现新会话即采集+加工。"""
         _stub_collect(monkeypatch, collector.generate_sample_sessions(2))
@@ -228,7 +392,15 @@ class TestWatchLoop:
         projects.mkdir()
         # 两次采集分别返回 0 条与 2 条，模拟「第二轮才有新会话」
         seq = iter([[], collector.generate_sample_sessions(2)])
-        monkeypatch.setattr(collector, "collect_claude_sessions", lambda *_a, **_kw: list(next(seq)))
+        def collect_next(*_a, **_kw):
+            sessions = list(next(seq))
+            count = collector.import_sessions(sessions)
+            return {
+                "status": "ok", "imported": count, "updated": 0,
+                "sources": [{"source": "claude", "status": "ok", "imported": count}],
+            }
+
+        monkeypatch.setattr(dreamd.source_manager, "import_enabled", collect_next)
 
         # 在第一帧与第二帧之间创建一个新 jsonl，使快照变化 -> 第二帧触发
         def create_file_on_first_sleep(_stop, _secs):
@@ -247,6 +419,69 @@ class TestWatchLoop:
         assert out["results"][1]["status"] == "ok"
         assert out["results"][1]["imported"] == 2
         assert store.count_stories() == 2
+
+    def test_codex_watch_triggers_after_first_tick_and_restart(
+        self, fake_llm, fake_embedder, monkeypatch, tmp_path
+    ):
+        root = tmp_path / ".codex"
+        path = root / "sessions/2026/08/01/watch.jsonl"
+        path.parent.mkdir(parents=True)
+        rows = [
+            {
+                "timestamp": "2026-08-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "watch-session", "cwd": "/work",
+                    "timestamp": "2026-08-01T00:00:00Z",
+                    "cli_version": "0.145.0",
+                },
+            },
+            {
+                "timestamp": "2026-08-01T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "watch codex"}],
+                },
+            },
+        ]
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            dreamd.source_manager,
+            "adapters",
+            lambda: {"codex": CodexAdapter(root)},
+        )
+        sequence = iter(["first watch append", "restart watch append"])
+
+        def append_on_sleep(_stop, _secs):
+            message = next(sequence)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "timestamp": "2026-08-01T00:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": message}],
+                    },
+                }) + "\n")
+
+        first = dreamd.watch_loop(
+            poll_interval=1, max_ticks=2, sleep_func=append_on_sleep,
+            sources=["codex"],
+        )
+        restarted = dreamd.watch_loop(
+            poll_interval=1, max_ticks=2, sleep_func=append_on_sleep,
+            sources=["codex"],
+        )
+
+        assert first["cycles"] == 2
+        assert first["results"][0]["imported"] == 1
+        assert first["results"][1]["updated"] == 1
+        assert restarted["cycles"] == 2
+        assert restarted["results"][0]["updated"] == 0
+        assert restarted["results"][1]["updated"] == 1
 
     def test_skips_cycle_when_locked(self, fake_llm, fake_embedder, monkeypatch, tmp_path):
         """锁被占用时，监听触发的周期被跳过。"""

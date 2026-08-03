@@ -3,7 +3,7 @@
 
 三类自动化入口（均复用 :func:`run_dream_cycle_once`，受同一把文件锁保护，互不重叠）：
 
-- ``storybook process --watch``  : 反应式监听。轮询 ``~/.claude/projects``，发现新会话即触发加工（长驻）。
+- ``storybook process --watch``  : 反应式监听。轮询启用来源，发现新会话即触发加工（长驻）。
 - ``storybook dream --once``     : 单次完整做梦周期（采集 + 加工）后退出；launchd 定时任务用此入口。
 - ``storybook dream``            : 定时守护进程（非 macOS 兜底）。每 ``DREAM_INTERVAL`` 秒跑一次周期。
 
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import config
-from . import collector
+from .history_adapters import manager as source_manager
 from . import processor
 from . import store
 
@@ -169,10 +169,14 @@ def setup_dream_logging(log_path: Optional[Path] = None) -> Path:
 #  单次做梦周期
 # ═══════════════════════════════════════════════
 
-def run_dream_cycle_once(import_new: bool = True, verbose: bool = False) -> dict:
+def run_dream_cycle_once(
+    import_new: bool = True,
+    verbose: bool = False,
+    sources: list[str] | tuple[str, ...] | None = None,
+) -> dict:
     """跑一次完整做梦周期，全程持有独占锁。
 
-    1. （``import_new=True``）从 Claude Code 增量采集新会话并导入；
+    1. （``import_new=True``）从启用来源增量采集新会话并导入；
     2. 加工所有 pending 会话（``processor.process_all_pending``）。
 
     返回 ``{"status", "imported", "total", "success", "failed", "duration_s"}``：
@@ -183,16 +187,26 @@ def run_dream_cycle_once(import_new: bool = True, verbose: bool = False) -> dict
     try:
         with acquire_dream_lock(blocking=False):
             imported = 0
+            updated = 0
+            source_results: list[dict] = []
+            ingestion_status = "ok"
             if import_new:
-                sessions = collector.collect_claude_sessions()
-                if sessions:
-                    imported = collector.import_sessions(sessions)
-                    logger.info("采集并导入 %d 条新会话", imported)
+                ingestion = source_manager.import_enabled(sources)
+                imported = ingestion["imported"]
+                updated = ingestion["updated"]
+                source_results = ingestion["sources"]
+                ingestion_status = ingestion["status"]
+                logger.info("多来源采集完成: imported=%d updated=%d", imported, updated)
             summary = processor.process_all_pending(verbose=verbose)
             duration = time.monotonic() - start
             result = {
-                "status": "ok" if summary["total"] else "empty",
+                "status": (
+                    "degraded" if ingestion_status == "degraded"
+                    else ("ok" if summary["total"] else "empty")
+                ),
                 "imported": imported,
+                "updated": updated,
+                "sources": source_results,
                 "total": summary["total"],
                 "success": summary["success"],
                 "failed": summary["failed"],
@@ -206,6 +220,8 @@ def run_dream_cycle_once(import_new: bool = True, verbose: bool = False) -> dict
         return {
             "status": "skipped",
             "imported": 0,
+            "updated": 0,
+            "sources": [],
             "total": 0,
             "success": 0,
             "failed": 0,
@@ -217,21 +233,139 @@ def run_dream_cycle_once(import_new: bool = True, verbose: bool = False) -> dict
 #  反应式监听（process --watch）
 # ═══════════════════════════════════════════════
 
-def scan_session_files(projects_path: Optional[Path] = None) -> dict[str, float]:
-    """对 Claude 会话 jsonl 做廉价快照 ``{路径: mtime}``。
+def scan_session_files(
+    projects_path: Optional[Path] = None,
+    sources: list[str] | tuple[str, ...] | None = None,
+    diagnostics: Optional[dict[str, dict]] = None,
+    seen_failures: Optional[set[str]] = None,
+) -> dict[str, float]:
+    """对启用来源做隐私安全的廉价快照 ``{HMAC 文件键: 版本}``。
 
     用于 ``--watch`` 判定「是否有变化」，避免每轮都跑完整采集。路径不存在返回 ``{}``。
     """
-    projects_path = projects_path or config.CLAUDE_PROJECTS_PATH
-    if not projects_path or not projects_path.exists():
-        return {}
-    snap: dict[str, float] = {}
-    for jsonl in projects_path.glob("*/*.jsonl"):
+    if projects_path is not None:
         try:
-            snap[str(jsonl)] = jsonl.stat().st_mtime
-        except OSError:
+            available = projects_path.exists()
+        except OSError as exc:
+            _record_watch_diagnostic(
+                diagnostics,
+                seen_failures,
+                "claude",
+                "SB_SOURCE_DISCOVERY_FAILED",
+                exc,
+            )
+            return {}
+        if not available:
+            return {}
+        paths = (("claude", path) for path in projects_path.glob("*/*.jsonl"))
+    else:
+        selected = sources or [
+            name for name, enabled in source_manager.load_settings().items() if enabled
+        ]
+        registered = source_manager.adapters()
+        discovered: list[tuple[str, Path]] = []
+        for name in selected:
+            adapter = registered.get(name)
+            if adapter is None:
+                continue
+            try:
+                detection = adapter.detect()
+                if not detection.get("available"):
+                    if detection.get("status") not in {None, "missing"}:
+                        _record_watch_diagnostic(
+                            diagnostics,
+                            seen_failures,
+                            name,
+                            detection.get("code", "SB_SOURCE_UNAVAILABLE"),
+                            RuntimeError(detection.get("status", "unavailable")),
+                        )
+                    continue
+                discovered.extend((name, path) for path in adapter.discover())
+            except PermissionError as exc:
+                _record_watch_diagnostic(
+                    diagnostics,
+                    seen_failures,
+                    name,
+                    "SB_SOURCE_PERMISSION_DENIED",
+                    exc,
+                )
+            except Exception as exc:
+                _record_watch_diagnostic(
+                    diagnostics,
+                    seen_failures,
+                    name,
+                    "SB_SOURCE_DISCOVERY_FAILED",
+                    exc,
+                )
+        paths = iter(discovered)
+    snap: dict[str, float] = {}
+    for source, path in paths:
+        try:
+            stat = path.stat()
+            key = source_manager.private_file_key("watch", path)
+            snap[key] = stat.st_mtime_ns + stat.st_size
+        except OSError as exc:
+            _record_watch_diagnostic(
+                diagnostics, seen_failures, source, "SB_SOURCE_FILE_FAILED", exc
+            )
             continue
     return snap
+
+
+def _record_watch_diagnostic(
+    diagnostics: Optional[dict[str, dict]],
+    seen_failures: Optional[set[str]],
+    source: str,
+    code: str,
+    exc: Exception,
+) -> None:
+    """更新来源的有界故障状态；状态未变化时只计数，不重复告警。"""
+    hint = type(exc).__name__
+    if seen_failures is not None:
+        seen_failures.add(source)
+
+    should_log = True
+    if diagnostics is not None:
+        previous = diagnostics.get(source)
+        if previous is not None and (
+            previous["code"] == code and previous["hint"] == hint
+        ):
+            previous["count"] += 1
+            should_log = not previous["active"]
+            previous["active"] = True
+        else:
+            diagnostics[source] = {
+                "source": source,
+                "code": code,
+                "hint": hint,
+                "count": 1,
+                "active": True,
+                "changes": 0 if previous is None else previous["changes"] + 1,
+                "recoveries": 0 if previous is None else previous["recoveries"],
+            }
+
+    if should_log:
+        logger.warning(
+            "watch source degraded: source=%s code=%s hint=%s",
+            source,
+            code,
+            hint,
+        )
+
+
+def _record_watch_recoveries(
+    diagnostics: dict[str, dict], seen_failures: set[str]
+) -> None:
+    """将本轮未再失败的来源标记为已恢复，并只记录一次恢复事件。"""
+    for source, item in diagnostics.items():
+        if item["active"] and source not in seen_failures:
+            item["active"] = False
+            item["recoveries"] += 1
+            logger.info(
+                "watch source recovered: source=%s previous_code=%s",
+                source,
+                item["code"],
+            )
 
 
 def _snapshot_changed(prev: dict[str, float], curr: dict[str, float]) -> bool:
@@ -266,8 +400,9 @@ def watch_loop(
     max_ticks: Optional[int] = None,
     sleep_func: Optional[Callable[[threading.Event, float], None]] = None,
     verbose: bool = False,
+    sources: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
-    """反应式监听：轮询 ``~/.claude/projects``，有新会话自动触发做梦周期。
+    """反应式监听：轮询启用来源，有新会话自动触发做梦周期。
 
     - 首帧追补一次（导入尚未采集的会话）；其后仅当快照变化时触发。
     - 每次触发走 :func:`run_dream_cycle_once`，受文件锁保护；与 launchd / 手动 process 互不重叠。
@@ -276,21 +411,28 @@ def watch_loop(
     返回 ``{"ticks", "cycles", "results"}``。
     """
     poll_interval = poll_interval if poll_interval is not None else config.WATCH_POLL_INTERVAL
-    projects_path = projects_path or config.CLAUDE_PROJECTS_PATH
     stop_event = stop_event or threading.Event()
     sleep_func = sleep_func or _default_sleep
 
-    logger.info("监听启动：每 %ds 轮询 %s", poll_interval, projects_path)
+    scope = projects_path if projects_path is not None else (sources or "enabled sources")
+    logger.info("监听启动：每 %ds 轮询 %s", poll_interval, scope)
     prev: Optional[dict[str, float]] = None
     ticks = 0
     cycles = 0
     results: list[dict] = []
+    diagnostic_state: dict[str, dict] = {}
 
     while not stop_event.is_set():
         ticks += 1
-        curr = scan_session_files(projects_path)
+        seen_failures: set[str] = set()
+        curr = scan_session_files(
+            projects_path, sources, diagnostic_state, seen_failures
+        )
+        _record_watch_recoveries(diagnostic_state, seen_failures)
         if _should_run_cycle(prev, curr):
-            result = run_dream_cycle_once(import_new=True, verbose=verbose)
+            result = run_dream_cycle_once(
+                import_new=True, verbose=verbose, sources=sources
+            )
             results.append(result)
             cycles += 1
             logger.info("监听触发: %s", result)
@@ -302,7 +444,10 @@ def watch_loop(
         sleep_func(stop_event, float(poll_interval))
 
     logger.info("监听结束：共 %d 轮触发 / %d 次轮询", cycles, ticks)
-    return {"ticks": ticks, "cycles": cycles, "results": results}
+    return {
+        "ticks": ticks, "cycles": cycles, "results": results,
+        "diagnostics": [diagnostic_state[key] for key in sorted(diagnostic_state)],
+    }
 
 
 # ═══════════════════════════════════════════════
@@ -315,6 +460,7 @@ def dream_daemon(
     max_cycles: Optional[int] = None,
     sleep_func: Optional[Callable[[threading.Event, float], None]] = None,
     verbose: bool = False,
+    sources: list[str] | tuple[str, ...] | None = None,
 ) -> dict:
     """定时守护进程：每 ``interval`` 秒跑一次完整做梦周期。
 
@@ -330,7 +476,9 @@ def dream_daemon(
     results: list[dict] = []
 
     while not stop_event.is_set():
-        result = run_dream_cycle_once(import_new=True, verbose=verbose)
+        result = run_dream_cycle_once(
+            import_new=True, verbose=verbose, sources=sources
+        )
         results.append(result)
         cycles += 1
         if max_cycles is not None and cycles >= max_cycles:
