@@ -98,6 +98,31 @@ class TestExactTermHybridAblation:
         assert result["absolute_gain"] == 0.625
         assert result["passes_improvement_gate"] is True
 
+    def test_embedding_failure_has_stable_report_contract(self, fake_embedder):
+        fake_embedder.register(
+            "generic incident recovery with a verified remediation", None
+        )
+
+        report = eval_module.run_all(parts=("exact_term",))
+        text = eval_module.format_report(report)
+
+        assert report.exact_term == {
+            "query_count": 0,
+            "embed_failures": 1,
+            "top_k": 3,
+            "vector_recall_at_k": 0.0,
+            "hybrid_recall_at_k": 0.0,
+            "absolute_gain": 0.0,
+            "passes_improvement_gate": False,
+            "per_query": [],
+            "corpus_contract": (
+                "shared compact semantic vector; exact token only in "
+                "FTS-indexed content/keywords"
+            ),
+        }
+        assert "评测不可用" in text
+        assert "未评估（无有效查询）" in text
+
 
 # ═══════════════════════════════════════════════
 #  检索评测（确定性向量驱动）

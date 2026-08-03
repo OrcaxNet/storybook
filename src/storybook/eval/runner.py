@@ -59,6 +59,10 @@ EXACT_TERM_CASES = (
     "HTTP_429",
     "OOMKILLED",
 )
+EXACT_TERM_CORPUS_CONTRACT = (
+    "shared compact semantic vector; exact token only in FTS-indexed "
+    "content/keywords"
+)
 
 
 # ═══════════════════════════════════════════════
@@ -323,10 +327,13 @@ def run_exact_term_hybrid_ablation(
             return {
                 "query_count": 0,
                 "embed_failures": 1,
+                "top_k": top_k,
                 "vector_recall_at_k": 0.0,
                 "hybrid_recall_at_k": 0.0,
-                "top_k": top_k,
+                "absolute_gain": 0.0,
+                "passes_improvement_gate": False,
                 "per_query": [],
+                "corpus_contract": EXACT_TERM_CORPUS_CONTRACT,
             }
         targets = {}
         for token in EXACT_TERM_CASES:
@@ -390,10 +397,7 @@ def run_exact_term_hybrid_ablation(
         "absolute_gain": round(hybrid_recall - vector_recall, 4),
         "passes_improvement_gate": hybrid_recall > vector_recall,
         "per_query": rows,
-        "corpus_contract": (
-            "shared compact semantic vector; exact token only in FTS-indexed "
-            "content/keywords"
-        ),
+        "corpus_contract": EXACT_TERM_CORPUS_CONTRACT,
     }
 
 
@@ -1595,16 +1599,23 @@ def format_report(report: EvalReport) -> str:
         lines.append("─" * 64)
         lines.append("⑥ 精确术语 Hybrid 消融")
         lines.append("─" * 64)
-        lines.append(
-            f"  queries={exact['query_count']} | recall@{exact['top_k']}: "
-            f"vector={exact['vector_recall_at_k']:.2%} -> "
-            f"hybrid={exact['hybrid_recall_at_k']:.2%} "
-            f"(Δ={exact['absolute_gain']:+.2%})"
-        )
-        lines.append(
-            "  改善门禁: "
-            + ("✅" if exact["passes_improvement_gate"] else "❌")
-        )
+        if exact["query_count"] == 0:
+            lines.append(
+                "  ⚠️ 评测不可用：无法生成语料 embedding "
+                f"(embed failures={exact['embed_failures']})"
+            )
+            lines.append("  改善门禁: 未评估（无有效查询）")
+        else:
+            lines.append(
+                f"  queries={exact['query_count']} | recall@{exact['top_k']}: "
+                f"vector={exact['vector_recall_at_k']:.2%} -> "
+                f"hybrid={exact['hybrid_recall_at_k']:.2%} "
+                f"(Δ={exact['absolute_gain']:+.2%})"
+            )
+            lines.append(
+                "  改善门禁: "
+                + ("✅" if exact["passes_improvement_gate"] else "❌")
+            )
         lines.append("")
 
     lines.append("=" * 64)
