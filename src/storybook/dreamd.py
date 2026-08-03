@@ -310,11 +310,11 @@ def watch_loop(
     返回 ``{"ticks", "cycles", "results"}``。
     """
     poll_interval = poll_interval if poll_interval is not None else config.WATCH_POLL_INTERVAL
-    projects_path = projects_path or config.CLAUDE_PROJECTS_PATH
     stop_event = stop_event or threading.Event()
     sleep_func = sleep_func or _default_sleep
 
-    logger.info("监听启动：每 %ds 轮询 %s", poll_interval, projects_path)
+    scope = projects_path if projects_path is not None else (sources or "enabled sources")
+    logger.info("监听启动：每 %ds 轮询 %s", poll_interval, scope)
     prev: Optional[dict[str, float]] = None
     ticks = 0
     cycles = 0

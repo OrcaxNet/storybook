@@ -284,7 +284,7 @@ def test_codex_append_reads_only_constant_boundaries_and_new_bytes(tmp_path, mon
     out = manager.import_source("codex", adapter=CodexAdapter(root))
 
     assert out["updated"] == 1
-    assert bytes_read <= len(appended.encode("utf-8")) + 4 * 64
+    assert bytes_read <= len(appended.encode("utf-8")) + 2 * 5 * 64
     assert bytes_read < before_cursor
 
 
@@ -349,6 +349,56 @@ def test_codex_longer_rewrite_invalidates_prefix_and_reparses(
     finally:
         db.close()
     assert conclusion == "healthy replacement record that is longer than the bad line"
+
+
+def test_codex_middle_prefix_rewrite_invalidates_append_guard(tmp_path, monkeypatch):
+    root = tmp_path / ".codex"
+    path = root / "sessions/2026/08/01/middle.jsonl"
+    rows = _codex_rows("session-middle", "/work", "x" * 3000)
+    _jsonl(path, rows)
+    assert manager.import_source("codex", adapter=CodexAdapter(root))["imported"] == 1
+    before_cursor = path.stat().st_size
+
+    with path.open("r+b") as handle:
+        handle.seek(before_cursor // 2)
+        original = handle.read(1)
+        assert original == b"x"
+        handle.seek(before_cursor // 2)
+        handle.write(b"y")
+        handle.seek(0, 2)
+        handle.write((json.dumps({
+            "timestamp": "2026-08-01T00:00:05Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "middle rewrite found"}],
+            },
+        }) + "\n").encode("utf-8"))
+
+    adapter = CodexAdapter(root)
+    parse_calls = 0
+    original_parse = adapter.parse
+
+    def tracked_parse(candidate):
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parse(candidate)
+
+    monkeypatch.setattr(adapter, "parse", tracked_parse)
+    repaired = manager.import_source("codex", adapter=adapter)
+
+    assert repaired["status"] == "ok"
+    assert repaired["updated"] == 1
+    assert parse_calls == 1
+    db = store.get_db()
+    try:
+        row = db.execute(
+            "SELECT raw_content, conclusion FROM sessions WHERE source = 'codex'"
+        ).fetchone()
+    finally:
+        db.close()
+    assert "y" in row["raw_content"]
+    assert row["conclusion"] == "middle rewrite found"
 
 
 def test_gemini_and_cline_supported_fixtures_import(tmp_path):

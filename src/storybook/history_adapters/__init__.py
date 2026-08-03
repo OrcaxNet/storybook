@@ -11,4 +11,3 @@ from .manager import (
 __all__ = [
     "SOURCE_NAMES", "import_enabled", "import_source", "list_sources", "set_enabled"
 ]
-

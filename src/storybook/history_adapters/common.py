@@ -21,8 +21,9 @@ _AUTHORIZATION_HEADER = re.compile(
 )
 _BEARER_SECRET = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _OPENAI_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
-_INCREMENTAL_GUARD_PREFIX = "boundary-v1"
+_INCREMENTAL_GUARD_PREFIX = "boundary-v2"
 _BOUNDARY_BYTES = 64
+_GUARD_SAMPLE_COUNT = 5
 
 
 class PrefixMismatchError(ValueError):
@@ -129,14 +130,16 @@ def _incremental_guard(handle: Any, cursor: int) -> str:
     ).hexdigest()[:16]
     digest = hashlib.sha256()
     digest.update(cursor.to_bytes(8, "big", signed=False))
-    if cursor <= _BOUNDARY_BYTES * 2:
+    if cursor <= _BOUNDARY_BYTES * _GUARD_SAMPLE_COUNT:
         handle.seek(0)
         digest.update(handle.read(cursor))
     else:
-        handle.seek(0)
-        digest.update(handle.read(_BOUNDARY_BYTES))
-        handle.seek(cursor - _BOUNDARY_BYTES)
-        digest.update(handle.read(_BOUNDARY_BYTES))
+        span = cursor - _BOUNDARY_BYTES
+        for index in range(_GUARD_SAMPLE_COUNT):
+            position = span * index // (_GUARD_SAMPLE_COUNT - 1)
+            handle.seek(position)
+            digest.update(position.to_bytes(8, "big", signed=False))
+            digest.update(handle.read(_BOUNDARY_BYTES))
     return f"{_INCREMENTAL_GUARD_PREFIX}:{identity}:{digest.hexdigest()}"
 
 

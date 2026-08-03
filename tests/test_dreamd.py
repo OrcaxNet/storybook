@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from storybook import dreamd, collector, store, processor
+from storybook.history_adapters.codex import CodexAdapter
 from ._helpers import basis
 
 
@@ -264,6 +266,69 @@ class TestWatchLoop:
         assert out["results"][1]["status"] == "ok"
         assert out["results"][1]["imported"] == 2
         assert store.count_stories() == 2
+
+    def test_codex_watch_triggers_after_first_tick_and_restart(
+        self, fake_llm, fake_embedder, monkeypatch, tmp_path
+    ):
+        root = tmp_path / ".codex"
+        path = root / "sessions/2026/08/01/watch.jsonl"
+        path.parent.mkdir(parents=True)
+        rows = [
+            {
+                "timestamp": "2026-08-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "watch-session", "cwd": "/work",
+                    "timestamp": "2026-08-01T00:00:00Z",
+                    "cli_version": "0.145.0",
+                },
+            },
+            {
+                "timestamp": "2026-08-01T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "watch codex"}],
+                },
+            },
+        ]
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            dreamd.source_manager,
+            "adapters",
+            lambda: {"codex": CodexAdapter(root)},
+        )
+        sequence = iter(["first watch append", "restart watch append"])
+
+        def append_on_sleep(_stop, _secs):
+            message = next(sequence)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "timestamp": "2026-08-01T00:00:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": message}],
+                    },
+                }) + "\n")
+
+        first = dreamd.watch_loop(
+            poll_interval=1, max_ticks=2, sleep_func=append_on_sleep,
+            sources=["codex"],
+        )
+        restarted = dreamd.watch_loop(
+            poll_interval=1, max_ticks=2, sleep_func=append_on_sleep,
+            sources=["codex"],
+        )
+
+        assert first["cycles"] == 2
+        assert first["results"][0]["imported"] == 1
+        assert first["results"][1]["updated"] == 1
+        assert restarted["cycles"] == 2
+        assert restarted["results"][0]["updated"] == 0
+        assert restarted["results"][1]["updated"] == 1
 
     def test_skips_cycle_when_locked(self, fake_llm, fake_embedder, monkeypatch, tmp_path):
         """锁被占用时，监听触发的周期被跳过。"""

@@ -34,4 +34,3 @@ For JSONL, only newline-terminated records are consumed. A truncated tail stays
 eligible for the next scan. Corrupt complete records increment `invalid` without
 blocking valid records or other sources. Unknown schemas return stable
 `SB_SOURCE_*` codes and are never guessed into Sessions.
-
