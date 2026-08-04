@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 import threading
 import time
 import subprocess
@@ -19,6 +20,19 @@ class _Response:
 
     def json(self):
         return self._payload
+
+
+def _git_repository(path, remote):
+    path.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", str(path)], check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "remote", "add", "origin", remote],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_decay_archives_low_value_and_protects_frequent_story():
@@ -194,6 +208,84 @@ def test_git_root_and_subdirectory_share_project_identity(tmp_path):
 
     assert context.project_identity(root_context) == context.project_identity(child_context)
     assert root_context["workspace"]["project_label"] == repository.name
+
+
+def test_imported_path_and_realtime_subdirectory_use_remote_project_identity(tmp_path):
+    repository = tmp_path / "payments"
+    child = repository / "src" / "package"
+    _git_repository(repository, "https://github.com/acme/payments.git")
+    child.mkdir(parents=True)
+
+    imported = context.normalize_envelope({"workspace": {"path": str(repository)}})
+    realtime = context.capture_context(workspace_path=child)
+
+    assert context.project_identity(imported) == context.project_identity(realtime)
+    assert imported["workspace"]["repo_fingerprint"].startswith("sha256:")
+    assert imported["workspace"]["path_fingerprint"].startswith("hmac-sha256:")
+    assert str(repository) not in str(imported)
+
+
+def test_imported_story_is_recalled_from_realtime_project_context(
+    tmp_path, fake_embedder
+):
+    repository = tmp_path / "payments"
+    child = repository / "services" / "api"
+    _git_repository(repository, "https://github.com/acme/payments.git")
+    child.mkdir(parents=True)
+    imported = context.normalize_envelope({"workspace": {"path": str(repository)}})
+    realtime = context.capture_context(workspace_path=child)
+    session_id = store.add_session("codex", "imported", context=imported)
+    story_id = store.add_story(
+        "payment retry", "imported retry policy", ["retry"], basis(0),
+        source_session_ids=[session_id],
+    )
+    fake_embedder.register("retry", basis(0))
+
+    result = search.search(
+        "retry", top_k=1, context=realtime, scope="project", graph_enabled=False
+    )
+
+    assert [item["story_id"] for item in result["top_matches"]] == [story_id]
+
+
+def test_realtime_project_context_recalls_legacy_path_fingerprint_story(
+    tmp_path, fake_embedder
+):
+    repository = tmp_path / "payments"
+    _git_repository(repository, "https://github.com/acme/payments.git")
+    realtime = context.capture_context(workspace_path=repository)
+    legacy_path = context.workspace_path_hash(repository)
+    legacy = context.normalize_envelope({
+        "workspace": {
+            "id": str(uuid.uuid5(uuid.UUID(config.PROFILE_ID), legacy_path)),
+            "repo_fingerprint": legacy_path,
+        }
+    })
+    session_id = store.add_session("codex", "legacy", context=legacy)
+    story_id = store.add_story(
+        "legacy retry", "legacy path-only memory", ["legacy"], basis(0),
+        source_session_ids=[session_id],
+    )
+    fake_embedder.register("legacy", basis(0))
+
+    assert context.project_identity(legacy) != context.project_identity(realtime)
+    assert context.story_matches_project(realtime, [legacy])
+    result = search.search(
+        "legacy", top_k=1, context=realtime, scope="project", graph_enabled=False
+    )
+    assert [item["story_id"] for item in result["top_matches"]] == [story_id]
+
+
+def test_remote_project_identity_keeps_different_repositories_isolated(tmp_path):
+    payments = tmp_path / "payments"
+    catalog = tmp_path / "catalog"
+    _git_repository(payments, "https://github.com/acme/payments.git")
+    _git_repository(catalog, "https://github.com/acme/catalog.git")
+
+    payments_context = context.capture_context(workspace_path=payments)
+    catalog_import = context.normalize_envelope({"workspace": {"path": str(catalog)}})
+
+    assert not context.story_matches_project(payments_context, [catalog_import])
 
 
 def test_llm_and_embedding_cache_skip_duplicate_provider_calls(monkeypatch):

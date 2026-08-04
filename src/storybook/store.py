@@ -3416,24 +3416,26 @@ def search_by_vector_numpy(
     query_embedding: list[float],
     top_k: int = 5,
     *,
+    project_identities: frozenset[str] | set[str] | tuple[str, ...] | None = None,
     project_identity: tuple[str, str] | None = None,
 ) -> list[dict]:
     """Exact numpy search, optionally constrained before ranking to one project."""
+    if project_identities is None and project_identity is not None:
+        project_identities = frozenset((project_identity[1],))
     db = get_db()
     try:
         project_clause = ""
         project_params: list[object] = []
-        if project_identity is not None:
-            kind, value = project_identity
-            json_path = (
-                "$.workspace.repo_fingerprint"
-                if kind == "repo" else "$.workspace.id"
-            )
+        if project_identities:
+            values = tuple(sorted(project_identities))
+            placeholders = ", ".join("?" for _ in values)
             project_clause = """AND EXISTS (
                 SELECT 1 FROM json_each(stories.environment_summary_json) env
-                WHERE json_extract(env.value, ?) = ?
-            )"""
-            project_params = [json_path, value]
+                WHERE json_extract(env.value, '$.workspace.repo_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.path_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.id') IN ({values})
+            )""".format(values=placeholders)
+            project_params = [*values, *values, *values]
         rows = db.execute(
             f"""SELECT id, title, abstract, content, keywords, embedding,
                       applicability_json, environment_summary_json
@@ -3456,8 +3458,8 @@ def search_by_vector_numpy(
             environments = context_module.merge_environments(
                 r["environment_summary_json"], []
             )
-            if project_identity and not context_module.environment_matches_project_identity(
-                project_identity, environments
+            if project_identities and not context_module.environment_matches_project_identities(
+                project_identities, environments
             ):
                 continue
             vec = np.frombuffer(r["embedding"], dtype=np.float32)
@@ -3490,6 +3492,7 @@ def search_by_lexical(
     top_k: int = 5,
     *,
     timeout_seconds: float = 0.5,
+    project_identities: frozenset[str] | set[str] | tuple[str, ...] | None = None,
     project_identity: tuple[str, str] | None = None,
 ) -> list[dict]:
     """FTS5 + 参数化关键词子串的低时延降级检索。
@@ -3499,6 +3502,8 @@ def search_by_lexical(
     保证调用方给定的 deadline。
     """
 
+    if project_identities is None and project_identity is not None:
+        project_identities = frozenset((project_identity[1],))
     terms = _lexical_terms(query)
     if not terms or top_k <= 0:
         return []
@@ -3514,17 +3519,16 @@ def search_by_lexical(
         candidates: dict[int, sqlite3.Row] = {}
         project_clause = ""
         project_params: list[object] = []
-        if project_identity is not None:
-            kind, value = project_identity
-            json_path = (
-                "$.workspace.repo_fingerprint"
-                if kind == "repo" else "$.workspace.id"
-            )
+        if project_identities:
+            values = tuple(sorted(project_identities))
+            placeholders = ", ".join("?" for _ in values)
             project_clause = """AND EXISTS (
                 SELECT 1 FROM json_each(s.environment_summary_json) env
-                WHERE json_extract(env.value, ?) = ?
-            )"""
-            project_params = [json_path, value]
+                WHERE json_extract(env.value, '$.workspace.repo_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.path_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.id') IN ({values})
+            )""".format(values=placeholders)
+            project_params = [*values, *values, *values]
         fts_query = " OR ".join(f'"{term}"' for term in terms)
         try:
             rows = db.execute(

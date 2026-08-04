@@ -369,7 +369,7 @@ storybook import-data --source codex
 
 每条新 Session 都保存 `tool/device/session/workspace/runtime/captured_at/provenance`；每个未知叶子字段使用 `null`（`runtime.kind` 使用枚举 `unknown`）并标记 `provenance=unknown`。Claude/Cursor adapter 采集 `detected/reported/inferred/user_confirmed` 来源，原始外部 session ID 使用 Profile 本地 HMAC，绝对路径、hostname、remote host 与 repo URL 只保留哈希或短别名。
 
-Story 合并多个 Session 时会保留全部来源环境，不由最后一次会话覆盖。搜索的语义相似度始终是主信号：默认 `scope=profile` 仅以 workspace/tool/runtime/OS 等环境信号做有界软加权，冲突结果仍可召回并带 `warnings`；只有调用方显式指定 `scope=strict` 才过滤环境冲突。`storybook show` 展示来源环境以及 `applies_when` / `excludes_when`。
+Story 合并多个 Session 时会保留全部来源环境，不由最后一次会话覆盖。历史导入和实时采集都会从 cwd 解析 Git 根目录与 origin：远端仓库哈希作为主身份，同时保留根目录的 Profile 本地 HMAC 作为兼容身份，因此旧版仅含路径指纹的 Story 仍可在 `scope=project` 下召回，且绝对路径不会落库。搜索的语义相似度始终是主信号：默认 `scope=profile` 仅以 workspace/tool/runtime/OS 等环境信号做有界软加权，冲突结果仍可召回并带 `warnings`；只有调用方显式指定 `scope=strict` 才过滤环境冲突。`storybook show` 展示来源环境以及 `applies_when` / `excludes_when`。
 
 ### 快速体验（无真实会话）
 
