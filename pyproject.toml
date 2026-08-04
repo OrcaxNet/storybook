@@ -1,6 +1,6 @@
 [project]
 name = "storybook"
-version = "0.1.0"
+version = "0.1.1"
 description = "Storybook - 离线Coding记忆系统，模拟夜间记忆梳理的程序员记忆库"
 requires-python = ">=3.11"
 dependencies = [

@@ -1,6 +1,7 @@
 """Black-box contracts for the POSIX user-local installer."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.server
 import os
@@ -150,7 +151,12 @@ def main():
 
 
 def _use_real_python_wheel(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
-    _, env = _fake_tools(tmp_path)
+    tools, env = _fake_tools(tmp_path)
+    # Keep the fake downloader, but never let fake preflight tools leak into a
+    # real venv. In particular, ensurepip's vendored distro calls `uname -rs`
+    # on Linux, which the installer preflight stub deliberately does not model.
+    (tools / "python3").unlink()
+    (tools / "uname").unlink()
     wheel = tmp_path / "storybook-0.0.0-py3-none-any.whl"
     _write_probe_wheel(wheel, "v1")
     checksum = Path(env["FAKE_CHECKSUM"])
@@ -456,7 +462,18 @@ def test_path_missing_onboarding_exports_stable_launcher_to_book_init(tmp_path):
                 pytest.fail(output.decode(errors="replace"))
             ready, _, _ = select.select([master], [], [], 0.1)
             if ready:
-                output.extend(os.read(master, 8192))
+                try:
+                    chunk = os.read(master, 8192)
+                except OSError as exc:
+                    # Linux PTYs report EIO when the slave closes; treat that
+                    # as EOF so a premature child exit reports captured output.
+                    if exc.errno != errno.EIO:
+                        raise
+                    chunk = b""
+                if not chunk:
+                    process.wait(timeout=5)
+                    pytest.fail(output.decode(errors="replace"))
+                output.extend(chunk)
         os.write(master, b"\n")
         assert process.wait(timeout=20) == 0
     finally:
