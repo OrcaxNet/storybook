@@ -9,6 +9,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import click
 from click.testing import CliRunner
 
 from storybook import config
@@ -67,6 +68,7 @@ def isolated_setup(tmp_path, monkeypatch):
     finally:
         config.PROFILE_REGISTRY = old_registry
         config.refresh_profile(create=False)
+        config.refresh_model_config()
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -839,6 +841,131 @@ def test_model_unavailable_returns_degraded_not_failed(isolated_setup, monkeypat
 
     assert result["status"] == "degraded"
     assert result["degraded_reasons"] == ["Ollama unavailable"]
+
+
+def test_legacy_storybook_init_and_admin_init_db_share_low_level_behavior(monkeypatch):
+    calls = []
+    monkeypatch.setattr("storybook.cli.store.init_db", lambda: calls.append("init"))
+
+    legacy = CliRunner().invoke(cli, ["init"], prog_name="storybook")
+    admin = CliRunner().invoke(cli, ["admin", "init-db"], prog_name="book")
+
+    assert legacy.exit_code == 0, legacy.output
+    assert admin.exit_code == 0, admin.output
+    assert calls == ["init", "init"]
+
+
+def test_book_init_json_reuses_setup_contract(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+
+    result = CliRunner().invoke(
+        cli,
+        ["init", "--yes", "--json", "--skip-models", "--agent", "codex"],
+        prog_name="book",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ready"
+    assert payload["next_command"].startswith("book search")
+    assert payload["profile"]["id"]
+    assert payload["model_config"]["embedding"]["provider"] == "ollama"
+
+
+def test_book_help_hides_setup_compatibility_alias():
+    result = CliRunner().invoke(cli, ["--help"], prog_name="book")
+
+    assert result.exit_code == 0, result.output
+    assert "  init " in result.output
+    assert "  setup " not in result.output
+
+
+def test_book_init_interactive_api_secret_is_ephemeral_and_hidden(
+    isolated_setup, monkeypatch
+):
+    manager, roots = isolated_setup
+    sentinel = "SECRET-SENTINEL-NEVER-PERSIST"
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+
+    def probe(value):
+        assert manager.environ["TEST_BOOK_KEY"] == sentinel
+        return [
+            {"name": "generation", "ok": True, "detail": "ready"},
+            {"name": "embedding-provider", "ok": True, "detail": "ready"},
+        ]
+
+    monkeypatch.setattr(manager, "_probe_provider", probe)
+    original_stream = click.get_text_stream
+
+    class TtyInput:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def isatty(self):
+            return True
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    monkeypatch.setattr(
+        click,
+        "get_text_stream",
+        lambda name: TtyInput(original_stream(name)) if name == "stdin" else original_stream(name),
+    )
+    user_input = "\n".join([
+        "api",
+        "https://models.example.test",
+        "generation-v1",
+        "embedding-v1",
+        "TEST_BOOK_KEY",
+        "auto",
+        "skip",
+        "y",
+        sentinel,
+        "",
+    ])
+
+    result = CliRunner().invoke(cli, ["init"], input=user_input, prog_name="book")
+
+    assert result.exit_code == 0, result.output
+    assert sentinel not in result.output
+    assert "TEST_BOOK_KEY" not in manager.environ
+    written = b"".join(
+        path.read_bytes() for path in tmp_files(roots.config, roots.state)
+    )
+    assert sentinel.encode() not in written
+
+
+def tmp_files(*roots: Path) -> list[Path]:
+    return [
+        path
+        for root in roots
+        if root.exists()
+        for path in root.rglob("*")
+        if path.is_file()
+    ]
+
+
+def test_enable_schedule_is_user_owned_and_idempotent(isolated_setup):
+    manager, _ = isolated_setup
+
+    first = manager.execute(
+        requested_agents=(), download_models=False, enable_schedule=True
+    )
+    before = manager.schedule_path.read_bytes()
+    second = manager.execute(
+        requested_agents=(), download_models=False, enable_schedule=True
+    )
+
+    assert first["schedule"]["status"] == "configured"
+    assert second["schedule"]["status"] == "configured"
+    assert manager.schedule_path.read_bytes() == before
+    assert str(manager.schedule_path).startswith(str(manager.home))
+    assert "sudo" not in before.decode("utf-8", errors="ignore")
+    removed = manager.uninstall()
+    assert removed["schedule"]["status"] == "removed"
+    assert not manager.schedule_path.exists()
 
 
 def _invoke_runtime_status(

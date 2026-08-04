@@ -1,0 +1,205 @@
+"""Black-box contracts for the POSIX user-local installer."""
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).parents[1]
+INSTALLER = ROOT / "install.sh"
+
+
+def _executable(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _fake_tools(tmp_path: Path) -> tuple[Path, dict[str, str]]:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    archive = tmp_path / "release.tar.gz"
+    archive.write_bytes(b"verified storybook release")
+    checksum = tmp_path / "release.tar.gz.sha256"
+    checksum.write_text(
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  storybook.tar.gz\n",
+        encoding="ascii",
+    )
+    _executable(
+        tools / "curl",
+        """#!/bin/sh
+set -eu
+[ "${FAKE_DOWNLOAD_FAIL:-0}" = 1 ] && exit 22
+destination=
+url=
+while [ "$#" -gt 0 ]; do
+  case $1 in -o) destination=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac
+done
+case $url in *.sha256) cp "$FAKE_CHECKSUM" "$destination";; *) cp "$FAKE_ARCHIVE" "$destination";; esac
+""",
+    )
+    _executable(
+        tools / "python3",
+        """#!/bin/sh
+set -eu
+if [ "${1:-}" = -c ] && [ "$#" -gt 2 ]; then rm -f "$4"; mv "$3" "$4"; exit 0; fi
+if [ "${1:-}" = -c ]; then echo 3.11; exit 0; fi
+if [ "${1:-}" = -m ] && [ "${2:-}" = venv ] && [ "${3:-}" = --help ]; then
+  [ "${FAKE_VENV_MISSING:-0}" = 1 ] && exit 1
+  exit 0
+fi
+if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
+  target=$3
+  mkdir -p "$target/bin"
+  cat >"$target/bin/pip" <<'PIP'
+#!/bin/sh
+set -eu
+[ "${FAKE_PIP_FAIL:-0}" = 1 ] && exit 42
+bin=$(dirname "$0")
+for name in book storybook; do
+  cat >"$bin/$name" <<ENTRY
+#!/bin/sh
+printf '%s\\n' "${FAKE_INSTALL_TAG:-installed}"
+ENTRY
+  chmod +x "$bin/$name"
+done
+PIP
+  chmod +x "$target/bin/pip"
+  exit 0
+fi
+exit 2
+""",
+    )
+    _executable(
+        tools / "uname",
+        """#!/bin/sh
+case ${1:-} in -s) printf '%s\n' "${FAKE_OS:-Darwin}";; -m) printf '%s\n' "${FAKE_ARCH:-arm64}";; *) exit 2;; esac
+""",
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{tools}:{os.environ['PATH']}",
+        "FAKE_ARCHIVE": str(archive),
+        "FAKE_CHECKSUM": str(checksum),
+        "STORYBOOK_INSTALL_ARCHIVE_URL": "https://mirror.invalid/storybook.tar.gz",
+        "STORYBOOK_INSTALL_CHECKSUM_URL": "https://mirror.invalid/storybook.tar.gz.sha256",
+        "STORYBOOK_INSTALL_PYTHON": "python3",
+        "FAKE_OS": "Darwin",
+        "FAKE_ARCH": "arm64",
+    }
+    return tools, env
+
+
+def _run(prefix: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["sh", str(INSTALLER), "--prefix", str(prefix), "--no-init", *args],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(("system", "architecture"), [("Darwin", "arm64"), ("Linux", "x86_64")])
+def test_dry_run_with_space_in_prefix_performs_zero_writes(
+    tmp_path, system, architecture
+):
+    _, env = _fake_tools(tmp_path)
+    env.update(FAKE_OS=system, FAKE_ARCH=architecture)
+    prefix = tmp_path / "prefix with spaces"
+
+    completed = _run(prefix, env, "--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "no writes performed" in completed.stdout
+    assert not prefix.exists()
+
+
+def test_clean_repeat_and_version_upgrade_atomically_switch_release(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    prefix = tmp_path / "prefix with spaces"
+    env["FAKE_INSTALL_TAG"] = "first"
+
+    first = _run(prefix, env, "--version", "1.2.3")
+
+    assert first.returncode == 0, first.stderr
+    assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "first"
+    assert (prefix / "bin" / "storybook").is_symlink()
+
+    env["FAKE_INSTALL_TAG"] = "second"
+    second = _run(prefix, env, "--version", "1.2.3")
+
+    assert second.returncode == 0, second.stderr
+    assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "first"
+
+    archive = Path(env["FAKE_ARCHIVE"])
+    archive.write_bytes(b"verified storybook release v2")
+    Path(env["FAKE_CHECKSUM"]).write_text(
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  storybook.tar.gz\n",
+        encoding="ascii",
+    )
+    upgraded = _run(prefix, env, "--version", "1.2.4")
+
+    assert upgraded.returncode == 0, upgraded.stderr
+    assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "second"
+
+
+def test_checksum_failure_keeps_previous_release_running(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    prefix = tmp_path / "prefix"
+    env["FAKE_INSTALL_TAG"] = "known-good"
+    assert _run(prefix, env, "--version", "1.2.3").returncode == 0
+    Path(env["FAKE_CHECKSUM"]).write_text("0" * 64 + "  storybook.tar.gz\n")
+    env["FAKE_INSTALL_TAG"] = "bad"
+
+    failed = _run(prefix, env, "--version", "1.2.3")
+
+    assert failed.returncode == 1
+    assert "SB_INSTALL_CHECKSUM_MISMATCH" in failed.stderr
+    assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "known-good"
+
+
+@pytest.mark.parametrize(
+    ("environment", "code"),
+    [
+        ({"STORYBOOK_INSTALL_PYTHON": "missing-python"}, "SB_INSTALL_PYTHON_MISSING"),
+        ({"FAKE_VENV_MISSING": "1"}, "SB_INSTALL_VENV_MISSING"),
+        ({"FAKE_DOWNLOAD_FAIL": "1"}, "SB_INSTALL_DOWNLOAD_FAILED"),
+    ],
+)
+def test_preflight_and_download_failures_have_stable_codes_and_zero_writes(
+    tmp_path, environment, code
+):
+    _, env = _fake_tools(tmp_path)
+    env.update(environment)
+    prefix = tmp_path / "prefix"
+
+    failed = _run(prefix, env)
+
+    assert failed.returncode == 1
+    assert code in failed.stderr
+    assert not prefix.exists()
+
+
+def test_package_install_failure_keeps_previous_release_running(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    prefix = tmp_path / "prefix"
+    env["FAKE_INSTALL_TAG"] = "known-good"
+    assert _run(prefix, env, "--version", "1.2.3").returncode == 0
+    archive = Path(env["FAKE_ARCHIVE"])
+    archive.write_bytes(b"broken next release")
+    Path(env["FAKE_CHECKSUM"]).write_text(
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  storybook.tar.gz\n",
+        encoding="ascii",
+    )
+    env["FAKE_PIP_FAIL"] = "1"
+
+    failed = _run(prefix, env, "--version", "1.2.4")
+
+    assert failed.returncode == 1
+    assert "SB_INSTALL_PACKAGE_FAILED" in failed.stderr
+    assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "known-good"
