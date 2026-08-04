@@ -79,6 +79,69 @@ def test_default_embed_uses_active_serving_model_during_config_switch(monkeypatc
     assert captured["url"] == f"{config.OLLAMA_HOST}/api/embeddings"
 
 
+def test_endpoint_switch_uses_active_credentials_until_atomic_activation(monkeypatch):
+    from storybook import store
+
+    story_id = store.add_story("credential routing", "content", [], basis(0))
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute(
+            """UPDATE embedding_index_state
+               SET active_endpoint = 'https://endpoint-a.example/v1',
+                   active_adapter = 'openai_compatible',
+                   active_api_key_env = 'TOKEN_A'
+               WHERE id = 1"""
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(config, "EMBED_BASE_URL", "https://endpoint-b.example/v1")
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
+    monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "TOKEN_B")
+    monkeypatch.setenv("TOKEN_A", "alpha-token")
+    monkeypatch.setenv("TOKEN_B", "beta-token")
+    requests_seen = []
+
+    class Response(_Response):
+        def json(self):
+            return {"data": [{"embedding": basis(1)}]}
+
+    def fake_post(url, **kwargs):
+        requests_seen.append((url, kwargs.get("headers")))
+        return Response()
+
+    monkeypatch.setattr(embeddings.requests, "post", fake_post)
+
+    assert embeddings.embed("before activation") == basis(1)
+    assert requests_seen[-1] == (
+        "https://endpoint-a.example/v1/embeddings",
+        {"Authorization": "Bearer alpha-token"},
+    )
+
+    result = embeddings.backfill(
+        model=config.EMBED_MODEL,
+        version=config.EMBED_VERSION,
+        batch_size=10,
+    )
+    assert result["activation"]["activated"] == 1
+    assert requests_seen[-1] == (
+        "https://endpoint-b.example/v1/embeddings",
+        {"Authorization": "Bearer beta-token"},
+    )
+    active_state = store.get_embedding_index_state()
+    assert active_state["active_api_key_env"] == "TOKEN_B"
+    assert "alpha-token" not in str(active_state)
+    assert "beta-token" not in str(active_state)
+
+    assert embeddings.embed("after activation") == basis(1)
+    assert requests_seen[-1] == (
+        "https://endpoint-b.example/v1/embeddings",
+        {"Authorization": "Bearer beta-token"},
+    )
+    assert store.get_story(story_id) is not None
+
+
 def test_default_embed_rejects_target_dimension_before_serving_index(monkeypatch):
     """A target API cannot inject its new dimension into the old active index."""
 
@@ -209,6 +272,7 @@ def test_embedding_cache_identity_isolated_by_endpoint_adapter_model_and_version
         "type": "api",
         "base_url": "https://other.example/v1",
         "adapter": "openai_compatible",
+        "credential_env": config.EMBED_API_KEY_ENV,
         "model": "other-model",
         "version": "other-version",
         "dimension": config.EMBED_DIM,

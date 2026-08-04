@@ -73,6 +73,7 @@ def serving_index_compatibility(actual_dimension: int | None) -> dict:
     active_endpoint = state.get("active_endpoint")
     active_adapter = state.get("active_adapter")
     active_dimension = state.get("active_dimension")
+    active_api_key_env = state.get("active_api_key_env")
     if state and active_endpoint != config.EMBED_BASE_URL:
         mismatches.append(
             f"endpoint active={active_endpoint or 'unknown'} target={config.EMBED_BASE_URL}"
@@ -81,6 +82,8 @@ def serving_index_compatibility(actual_dimension: int | None) -> dict:
         mismatches.append(
             f"adapter active={active_adapter or 'unknown'} target={config.EMBED_ADAPTER}"
         )
+    if state and active_api_key_env != config.EMBED_API_KEY_ENV:
+        mismatches.append("credential reference differs from active index")
     if state and active_dimension != serving_dimension:
         mismatches.append(
             f"dimension identity={active_dimension or 'unknown'} active={serving_dimension}"

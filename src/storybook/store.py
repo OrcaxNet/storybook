@@ -257,6 +257,7 @@ CREATE TABLE IF NOT EXISTS story_embedding_backfill (
     embedding_endpoint TEXT,
     embedding_adapter TEXT,
     embedding_dimension INTEGER,
+    embedding_api_key_env TEXT,
     representation TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     embedding BLOB,
@@ -276,12 +277,14 @@ CREATE TABLE IF NOT EXISTS embedding_index_state (
     active_endpoint TEXT,
     active_adapter TEXT,
     active_dimension INTEGER,
+    active_api_key_env TEXT,
     target_model TEXT,
     target_version TEXT,
     target_representation TEXT,
     target_endpoint TEXT,
     target_adapter TEXT,
     target_dimension INTEGER,
+    target_api_key_env TEXT,
     backfill_status TEXT NOT NULL DEFAULT 'idle'
         CHECK(backfill_status IN ('idle', 'running', 'failed', 'ready')),
     updated_at TEXT DEFAULT (datetime('now'))
@@ -386,11 +389,13 @@ def init_db(
         db.execute(
             """INSERT OR IGNORE INTO embedding_index_state (
                    id, active_model, active_version, active_representation,
-                   active_endpoint, active_adapter, active_dimension
-               ) VALUES (1, ?, ?, ?, ?, ?, ?)""",
+                   active_endpoint, active_adapter, active_dimension,
+                   active_api_key_env
+               ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 config.EMBED_MODEL, initial_version, initial_representation,
                 config.EMBED_BASE_URL, config.EMBED_ADAPTER, config.EMBED_DIM,
+                config.EMBED_API_KEY_ENV,
             ),
         )
         db.commit()
@@ -409,9 +414,11 @@ def _ensure_embedding_identity_columns(db: sqlite3.Connection) -> None:
         "active_endpoint": "TEXT",
         "active_adapter": "TEXT",
         "active_dimension": "INTEGER",
+        "active_api_key_env": "TEXT",
         "target_endpoint": "TEXT",
         "target_adapter": "TEXT",
         "target_dimension": "INTEGER",
+        "target_api_key_env": "TEXT",
     }.items():
         if name not in state_columns:
             db.execute(
@@ -425,6 +432,7 @@ def _ensure_embedding_identity_columns(db: sqlite3.Connection) -> None:
         "embedding_endpoint": "TEXT",
         "embedding_adapter": "TEXT",
         "embedding_dimension": "INTEGER",
+        "embedding_api_key_env": "TEXT",
     }.items():
         if name not in backfill_columns:
             db.execute(
@@ -438,16 +446,32 @@ def _ensure_embedding_identity_columns(db: sqlite3.Connection) -> None:
            WHERE id = 1""",
         (serving_dimension,),
     )
-    # Before the unified API feature, every released index was Ollama-backed,
-    # so its adapter is inferable. Its historical endpoint is not: using the
-    # current endpoint here could falsely bless a config switch. Keep it NULL
-    # so diagnostics require one safe backfill generation.
+    # Before the unified API feature every released index was Ollama-backed and
+    # its endpoint was supplied by the same OLLAMA_HOST/default mapping still
+    # used by config. Preserve that zero-touch contract without rewriting any
+    # Story/vector. A custom adapter is never inferred from this legacy shape.
     if config.EMBED_ADAPTER == "ollama":
         db.execute(
             """UPDATE embedding_index_state
-               SET active_adapter = COALESCE(active_adapter, 'ollama')
-               WHERE id = 1"""
+               SET active_endpoint = COALESCE(active_endpoint, ?),
+                   active_adapter = COALESCE(active_adapter, 'ollama'),
+                   active_api_key_env = COALESCE(active_api_key_env, '')
+               WHERE id = 1""",
+            (config.EMBED_BASE_URL,),
         )
+    db.execute(
+        """UPDATE embedding_index_state
+           SET active_api_key_env = ?
+           WHERE id = 1 AND active_api_key_env IS NULL
+             AND active_endpoint = ? AND active_adapter = ?
+             AND active_model = ? AND active_version = ?
+             AND active_dimension = ?""",
+        (
+            config.EMBED_API_KEY_ENV, config.EMBED_BASE_URL,
+            config.EMBED_ADAPTER, config.EMBED_MODEL,
+            config.EMBED_VERSION, config.EMBED_DIM,
+        ),
+    )
 
 
 def _ensure_source_checkpoint_columns(db: sqlite3.Connection) -> None:
@@ -1516,6 +1540,7 @@ def _active_embedding_spec(db: sqlite3.Connection) -> dict:
         "active_endpoint": config.EMBED_BASE_URL,
         "active_adapter": config.EMBED_ADAPTER,
         "active_dimension": config.EMBED_DIM,
+        "active_api_key_env": config.EMBED_API_KEY_ENV,
     }
 
 
@@ -1530,7 +1555,8 @@ def begin_embedding_backfill(
     try:
         existing = db.execute(
             """SELECT DISTINCT embedding_model, representation,
-                       embedding_endpoint, embedding_adapter, embedding_dimension
+                       embedding_endpoint, embedding_adapter, embedding_dimension,
+                       embedding_api_key_env
                FROM story_embedding_backfill
                WHERE embedding_version = ?""",
             (version,),
@@ -1541,6 +1567,7 @@ def begin_embedding_backfill(
             or row["embedding_endpoint"] != config.EMBED_BASE_URL
             or row["embedding_adapter"] != config.EMBED_ADAPTER
             or row["embedding_dimension"] != config.EMBED_DIM
+            or row["embedding_api_key_env"] != config.EMBED_API_KEY_ENV
             for row in existing
         ):
             # Version is only one component of vector-space identity. A same-
@@ -1555,12 +1582,14 @@ def begin_embedding_backfill(
                SET target_model = ?, target_version = ?,
                    target_representation = ?, target_endpoint = ?,
                    target_adapter = ?, target_dimension = ?,
+                   target_api_key_env = ?,
                    backfill_status = 'running',
                    updated_at = datetime('now')
                WHERE id = 1""",
             (
                 model, version, representation, config.EMBED_BASE_URL,
                 config.EMBED_ADAPTER, config.EMBED_DIM,
+                config.EMBED_API_KEY_ENV,
             ),
         )
         db.commit()
@@ -1594,7 +1623,8 @@ def stories_pending_embedding_backfill(
             shadow = db.execute(
                 """SELECT status, content_hash, embedding_model,
                           embedding_endpoint, embedding_adapter,
-                          embedding_dimension, representation
+                          embedding_dimension, representation,
+                          embedding_api_key_env
                    FROM story_embedding_backfill
                    WHERE story_id = ? AND embedding_version = ?""",
                 (story["id"], version),
@@ -1607,6 +1637,7 @@ def stories_pending_embedding_backfill(
                 and shadow["embedding_endpoint"] == target["target_endpoint"]
                 and shadow["embedding_adapter"] == target["target_adapter"]
                 and shadow["embedding_dimension"] == target["target_dimension"]
+                and shadow["embedding_api_key_env"] == target["target_api_key_env"]
                 and shadow["representation"] == representation
             ):
                 continue
@@ -1642,13 +1673,15 @@ def stage_embedding_backfill(
             """INSERT INTO story_embedding_backfill (
                    story_id, embedding_model, embedding_version,
                    embedding_endpoint, embedding_adapter, embedding_dimension,
+                   embedding_api_key_env,
                    representation, content_hash, embedding, status, error
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(story_id, embedding_version) DO UPDATE SET
                    embedding_model = excluded.embedding_model,
                    embedding_endpoint = excluded.embedding_endpoint,
                    embedding_adapter = excluded.embedding_adapter,
                    embedding_dimension = excluded.embedding_dimension,
+                   embedding_api_key_env = excluded.embedding_api_key_env,
                    representation = excluded.representation,
                    content_hash = excluded.content_hash,
                    embedding = excluded.embedding,
@@ -1659,6 +1692,7 @@ def stage_embedding_backfill(
             (
                 story_id, model, version, config.EMBED_BASE_URL,
                 config.EMBED_ADAPTER, config.EMBED_DIM,
+                config.EMBED_API_KEY_ENV,
                 representation, content_hash,
                 blob, status, (error or "")[:500] or None,
             ),
@@ -1694,7 +1728,8 @@ def embedding_backfill_progress(version: str, representation: str) -> dict:
             shadow = db.execute(
                 """SELECT status, content_hash, embedding_model,
                           embedding_endpoint, embedding_adapter,
-                          embedding_dimension, representation
+                          embedding_dimension, representation,
+                          embedding_api_key_env
                    FROM story_embedding_backfill
                    WHERE story_id = ? AND embedding_version = ?""",
                 (story["id"], version),
@@ -1706,6 +1741,7 @@ def embedding_backfill_progress(version: str, representation: str) -> dict:
                 and shadow["embedding_endpoint"] == target["target_endpoint"]
                 and shadow["embedding_adapter"] == target["target_adapter"]
                 and shadow["embedding_dimension"] == target["target_dimension"]
+                and shadow["embedding_api_key_env"] == target["target_api_key_env"]
                 and shadow["representation"] == representation
             ):
                 ready += 1
@@ -1764,7 +1800,8 @@ def activate_embedding_backfill(
             shadow = db.execute(
                 """SELECT embedding, content_hash, embedding_model, representation,
                           embedding_endpoint, embedding_adapter,
-                          embedding_dimension, status
+                          embedding_dimension, status,
+                          embedding_api_key_env
                    FROM story_embedding_backfill
                    WHERE story_id = ? AND embedding_version = ?""",
                 (story["id"], version),
@@ -1777,6 +1814,7 @@ def activate_embedding_backfill(
                 or shadow["embedding_endpoint"] != target["target_endpoint"]
                 or shadow["embedding_adapter"] != target["target_adapter"]
                 or shadow["embedding_dimension"] != target["target_dimension"]
+                or shadow["embedding_api_key_env"] != target["target_api_key_env"]
             ):
                 raise ValueError(
                     f"embedding backfill changed before activation: story {story['id']}"
@@ -1843,14 +1881,17 @@ def activate_embedding_backfill(
                SET active_model = ?, active_version = ?,
                    active_representation = ?, active_endpoint = ?,
                    active_adapter = ?, active_dimension = ?,
+                   active_api_key_env = ?,
                    target_model = NULL, target_version = NULL,
                    target_representation = NULL, target_endpoint = NULL,
                    target_adapter = NULL, target_dimension = NULL,
+                   target_api_key_env = NULL,
                    backfill_status = 'idle', updated_at = datetime('now')
                WHERE id = 1""",
             (
                 model, version, representation, target["target_endpoint"],
                 target["target_adapter"], target_dimension,
+                target["target_api_key_env"],
             ),
         )
         _bump_index_version(db)

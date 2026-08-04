@@ -436,6 +436,71 @@ def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch
     ] == ["create", "update"]
 
 
+def test_legacy_ollama_index_identity_migrates_without_vector_rewrite(monkeypatch):
+    story_id = store.add_story("legacy identity", "content", [], basis(0))
+    story_before = store.get_story(story_id)
+    vector_before = vector_in_index(story_id)
+    active = store.get_embedding_index_state()
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute("DROP TABLE embedding_index_state")
+        db.execute(
+            """CREATE TABLE embedding_index_state (
+                   id INTEGER PRIMARY KEY CHECK(id = 1),
+                   active_model TEXT NOT NULL,
+                   active_version TEXT NOT NULL,
+                   active_representation TEXT NOT NULL,
+                   target_model TEXT,
+                   target_version TEXT,
+                   target_representation TEXT,
+                   backfill_status TEXT NOT NULL DEFAULT 'idle',
+                   updated_at TEXT DEFAULT (datetime('now'))
+               )"""
+        )
+        db.execute(
+            """INSERT INTO embedding_index_state (
+                   id, active_model, active_version, active_representation,
+                   backfill_status
+               ) VALUES (1, ?, ?, ?, 'idle')""",
+            (
+                active["active_model"], active["active_version"],
+                active["active_representation"],
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    store.init_db()
+
+    migrated = store.get_embedding_index_state()
+    assert migrated["active_endpoint"] == config.EMBED_BASE_URL
+    assert migrated["active_adapter"] == "ollama"
+    assert migrated["active_api_key_env"] == ""
+    assert store.get_story(story_id) == story_before
+    assert vector_in_index(story_id) == vector_before
+
+    requested = {}
+
+    def fake_post(url, **kwargs):
+        requested.update({"url": url, **kwargs})
+
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"embedding": basis(0)}
+
+        return Response()
+
+    monkeypatch.setattr(embeddings.requests, "post", fake_post)
+    assert embeddings.embed("legacy recall") == basis(0)
+    assert requested["url"] == f"{config.EMBED_BASE_URL}/api/embeddings"
+
+
 def test_backfill_atomically_switches_serving_vector_dimension(monkeypatch):
     story_id = store.add_story("old", "old content", ["old"], basis(0))
     assert store.serving_embedding_dimension() == config.EMBED_DIM

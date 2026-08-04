@@ -32,6 +32,7 @@ def api_identity(
     *,
     base_url: str | None = None,
     adapter: str | None = None,
+    api_key_env: str | None = None,
 ) -> dict[str, object]:
     """返回会影响向量结果的非敏感身份，用于缓存隔离。"""
 
@@ -39,6 +40,9 @@ def api_identity(
         "type": config.EMBED_TYPE,
         "base_url": base_url or config.EMBED_BASE_URL,
         "adapter": adapter or config.EMBED_ADAPTER,
+        "credential_env": (
+            config.EMBED_API_KEY_ENV if api_key_env is None else api_key_env
+        ),
         "model": model or config.EMBED_MODEL,
         "version": version or config.EMBED_VERSION,
         "dimension": dimension or config.EMBED_DIM,
@@ -158,6 +162,7 @@ def embed(
     expected_dimension = config.EMBED_DIM
     request_base_url = config.EMBED_BASE_URL
     request_adapter = config.EMBED_ADAPTER
+    request_api_key_env = config.EMBED_API_KEY_ENV
     if serving_request:
         try:
             from . import store
@@ -171,7 +176,11 @@ def embed(
             )
             request_base_url = state.get("active_endpoint")
             request_adapter = state.get("active_adapter")
-            if not request_base_url or not request_adapter:
+            request_api_key_env = state.get("active_api_key_env")
+            if (
+                not request_base_url or not request_adapter
+                or request_api_key_env is None
+            ):
                 raise EmbeddingAPIError(
                     "active_index_identity_unknown",
                     "active embedding index endpoint identity is unknown; backfill required",
@@ -183,11 +192,13 @@ def embed(
             model = config.EMBED_MODEL
             request_base_url = config.EMBED_BASE_URL
             request_adapter = config.EMBED_ADAPTER
+            request_api_key_env = config.EMBED_API_KEY_ENV
     cache_version = cache_version or config.EMBED_VERSION
     cache_payload = {
         **api_identity(
             model, cache_version, expected_dimension,
             base_url=request_base_url, adapter=request_adapter,
+            api_key_env=request_api_key_env,
         ),
         "text": text,
     }
@@ -205,6 +216,7 @@ def embed(
             keep_alive=keep_alive if request_adapter == "ollama" else None,
             base_url=request_base_url,
             adapter=request_adapter,
+            api_key_env=request_api_key_env,
         )
         if not vec or len(vec) != expected_dimension:
             logger.warning(

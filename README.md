@@ -142,7 +142,7 @@ storybook uninstall --yes --purge-data --confirm-purge  # 非交互双重显式�
 
 `--embedding-preset ollama` 自动填入本地地址、推荐模型、1024 维和 Ollama adapter。`custom` 需显式提供 base URL、model 和 dimension；只持久符合 `[A-Za-z_][A-Za-z0-9_]*` 的凭据环境变量名，疑似明文凭据会在任何写入前被拒绝。选择会保存在用户级 setup state，之后的 CLI/MCP 进程自动复用，而显式环境变量仍优先。非 loopback endpoint 始终显示“文本将离开本机”警告。
 
-Serving index 的身份包含 endpoint、adapter、model、version 和 dimension。修改任一项会进入 `serving_index_mismatch`；默认查询继续使用旧 index 对应的 API，直到 `embedding-backfill` 完成 shadow generation 并原子切换，避免将不同向量空间混入同一索引。
+Serving index 的身份包含 endpoint、adapter、model、version、dimension 和非敏感的 credential-env 引用。修改任一项会进入 `serving_index_mismatch`；默认查询继续使用旧 index 对应的 API 与凭据引用，直到 `embedding-backfill` 完成 shadow generation 并原子切换，避免将不同向量空间混入同一索引。旧版 schema 只支持 Ollama，因此升级时会按既有 `OLLAMA_HOST`/默认地址映射 active identity，不改写 Story 或向量索引；custom API identity 不会被猜测。
 
 ## 👤 用户级 Profile 与共享存储
 
