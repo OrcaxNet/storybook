@@ -230,7 +230,9 @@ if [ ! -f "$TARGET/.storybook-ready" ]; then
     "$PYTHON" -m venv "$TARGET" || fail SB_INSTALL_VENV_FAILED "could not create the isolated environment"
     [ -x "$TARGET/bin/pip" ] || fail SB_INSTALL_PIP_MISSING "venv did not provide pip; repair the Python installation"
     "$TARGET/bin/pip" install --disable-pip-version-check "$ARCHIVE" >/dev/null || fail SB_INSTALL_PACKAGE_FAILED "package installation failed; the previous installation is unchanged"
-    [ -x "$TARGET/bin/book" ] && [ -x "$TARGET/bin/storybook" ] || fail SB_INSTALL_ENTRYPOINT_MISSING "installed package did not provide book and storybook"
+    if [ ! -x "$TARGET/bin/book" ] || [ ! -x "$TARGET/bin/storybook" ]; then
+        fail SB_INSTALL_ENTRYPOINT_MISSING "installed package did not provide book and storybook"
+    fi
     if ! "$TARGET/bin/book" --help >/dev/null 2>&1 || ! "$TARGET/bin/storybook" --help >/dev/null 2>&1; then
         fail SB_INSTALL_ENTRYPOINT_BROKEN "installed entrypoints failed before activation; the previous installation is unchanged"
     fi

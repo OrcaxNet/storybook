@@ -32,7 +32,9 @@ TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/storybook-release.XXXXXX") || \
 
 "$PYTHON" -m build --sdist --outdir "$TEMP_DIR/dist" "$ROOT"
 set -- "$TEMP_DIR"/dist/storybook-*.tar.gz
-[ "$#" -eq 1 ] && [ -f "$1" ] || fail "expected exactly one Storybook source archive"
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+    fail "expected exactly one Storybook source archive"
+fi
 cp "$1" "$TEMP_DIR/storybook.tar.gz"
 
 "$PYTHON" - "$TEMP_DIR/storybook.tar.gz" "$TEMP_DIR/storybook.tar.gz.sha256" <<'PY'
