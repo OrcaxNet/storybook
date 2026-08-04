@@ -267,7 +267,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 ## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
 
 PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段。`storybook eval` 建立可重复的检索质量基线，
-作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染用户 Profile 数据库。
+作为调参与算法改进的度量依据。评测需要已配置的 embedding API 可用，并在隔离临时库中运行，不污染用户 Profile 数据库。仓库现有固定评测证据使用本地 Ollama `qwen3-embedding:0.6b`；不同 endpoint、adapter、模型、维度或版本的指标不可直接等同。
 
 ```bash
 storybook eval all                              # 跑全部六轮评测（默认）
@@ -524,7 +524,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`）, `graph_enabled?` | 返回直接/图扩散命中；图命中含 `seed_story_id/graph_path/score_components`，顶层 `truncated` 表示图预算安全截断 |
-| `get_story` | `story_id`（必填） | 查看完整 `detail/sources/revisions` 与兼容 `title/content/version`，剥离 1024 维 embedding |
+| `get_story` | `story_id`（必填） | 查看完整 `detail/sources/revisions` 与兼容 `title/content/version`，不返回原始 embedding 向量 |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
 | `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / embedding API 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
 
