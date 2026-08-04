@@ -405,15 +405,25 @@ def _ensure_source_checkpoint_columns(db: sqlite3.Connection) -> None:
 
 
 def _ensure_story_vectors(db: sqlite3.Connection) -> None:
-    """Publish valid legacy BLOBs into vec0 without inventing embeddings."""
+    """Keep vec0 aligned with active BLOBs without reviving archived Stories."""
 
     indexed = {
         int(row[0]) for row in db.execute("SELECT story_id FROM story_vectors")
     }
+    active_rows = db.execute(
+        """SELECT id, embedding FROM stories
+           WHERE embedding IS NOT NULL AND deleted_at IS NULL
+             AND archived_at IS NULL AND embedding_status != 'archived'
+           ORDER BY id"""
+    ).fetchall()
+    active_ids = {int(row["id"]) for row in active_rows}
+    changed = 0
+    for story_id in indexed - active_ids:
+        changed += max(0, db.execute(
+            "DELETE FROM story_vectors WHERE story_id = ?", (story_id,)
+        ).rowcount)
     expected_bytes = config.EMBED_DIM * np.dtype(np.float32).itemsize
-    for row in db.execute(
-        "SELECT id, embedding FROM stories WHERE embedding IS NOT NULL ORDER BY id"
-    ):
+    for row in active_rows:
         if row["id"] in indexed:
             continue
         blob = bytes(row["embedding"])
@@ -427,6 +437,9 @@ def _ensure_story_vectors(db: sqlite3.Connection) -> None:
             "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",
             (row["id"], blob),
         )
+        changed += 1
+    if changed:
+        _bump_index_version(db)
 
 
 def _ensure_fts_index(db: sqlite3.Connection) -> None:
@@ -1302,8 +1315,8 @@ def story_vectors_table_exists() -> bool:
 def vector_consistency() -> dict:
     """检查 stories.embedding 与 story_vectors 的双写一致性。
 
-    embedding 双写约束：stories.embedding（BLOB）与 story_vectors（vec0 行）
-    必须同有同无。返回::
+    embedding 双写约束只适用于 active Story；归档行可保留 BLOB 作为本地
+    审计证据，但不得存在于 serving index。返回::
 
         {
           "blob_count": int,     # stories.embedding 非空行数
@@ -1315,18 +1328,24 @@ def vector_consistency() -> dict:
     db = get_db()
     try:
         blob_count = db.execute(
-            "SELECT COUNT(*) FROM stories WHERE embedding IS NOT NULL"
+            """SELECT COUNT(*) FROM stories
+               WHERE embedding IS NOT NULL AND deleted_at IS NULL
+                 AND archived_at IS NULL AND embedding_status != 'archived'"""
         ).fetchone()[0]
         vec_count = db.execute("SELECT COUNT(*) FROM story_vectors").fetchone()[0]
         missing_vec = [r[0] for r in db.execute(
             """SELECT s.id FROM stories s
                WHERE s.embedding IS NOT NULL
+                 AND s.deleted_at IS NULL AND s.archived_at IS NULL
+                 AND s.embedding_status != 'archived'
                  AND s.id NOT IN (SELECT story_id FROM story_vectors)"""
         ).fetchall()]
         orphan_vec = [r[0] for r in db.execute(
             """SELECT v.story_id FROM story_vectors v
                LEFT JOIN stories s ON s.id = v.story_id
-               WHERE s.id IS NULL OR s.embedding IS NULL"""
+               WHERE s.id IS NULL OR s.embedding IS NULL
+                  OR s.deleted_at IS NOT NULL OR s.archived_at IS NOT NULL
+                  OR s.embedding_status = 'archived'"""
         ).fetchall()]
         return {
             "blob_count": blob_count,
@@ -1466,6 +1485,7 @@ def stories_pending_embedding_backfill(
         rows = db.execute(
             """SELECT s.* FROM stories s
                WHERE s.embedding_status != 'archived' AND s.deleted_at IS NULL
+                 AND s.archived_at IS NULL
                ORDER BY s.id"""
         ).fetchall()
         pending = []
@@ -1548,6 +1568,7 @@ def embedding_backfill_progress(version: str, representation: str) -> dict:
         stories = db.execute(
             """SELECT * FROM stories
                WHERE embedding_status != 'archived' AND deleted_at IS NULL
+                 AND archived_at IS NULL
                ORDER BY id"""
         ).fetchall()
         ready = failed = 0
@@ -1598,6 +1619,7 @@ def activate_embedding_backfill(
         stories = db.execute(
             """SELECT * FROM stories
                WHERE embedding_status != 'archived' AND deleted_at IS NULL
+                 AND archived_at IS NULL
                ORDER BY id"""
         ).fetchall()
         rows = []
@@ -2443,7 +2465,8 @@ def get_story_rerank_texts(story_ids: list[int]) -> dict[int, str]:
     try:
         rows = db.execute(
             f"""SELECT id, content FROM stories
-                 WHERE id IN ({placeholders}) AND deleted_at IS NULL""",
+                 WHERE id IN ({placeholders}) AND deleted_at IS NULL
+                   AND archived_at IS NULL""",
             unique_ids,
         ).fetchall()
         return {
@@ -3113,6 +3136,7 @@ def get_related_stories_batch(
                    WHERE (e.source_id = ? OR e.target_id = ?)
                      AND e.deleted_at IS NULL
                      AND s.deleted_at IS NULL
+                     AND s.archived_at IS NULL
                      AND s.embedding_status != 'archived'
                    ORDER BY e.weight DESC, e.id""",
                 (story_id, story_id, story_id, story_id),
@@ -3194,6 +3218,7 @@ def get_graph_neighbors_batch(
                     WHERE (e.source_id = ? OR e.target_id = ?)
                       AND e.deleted_at IS NULL
                       AND s.deleted_at IS NULL
+                      AND s.archived_at IS NULL
                       AND s.embedding_status != 'archived'""",
                 (
                     story_id, story_id, *allowed,
@@ -3221,6 +3246,7 @@ def get_graph_neighbors_batch(
                    WHERE (e.source_id = ? OR e.target_id = ?)
                      AND e.deleted_at IS NULL
                      AND s.deleted_at IS NULL
+                     AND s.archived_at IS NULL
                      AND s.embedding_status != 'archived'
                      AND {direction_clause}
                      AND {type_clause}
@@ -3291,6 +3317,8 @@ def get_superseded_story_ids(story_ids: list[int]) -> set[int]:
                  JOIN stories replacement ON replacement.id = e.source_id
                  WHERE e.edge_type = 'supersedes' AND e.deleted_at IS NULL
                    AND e.target_id IN ({placeholders})
+                   AND replacement.deleted_at IS NULL
+                   AND replacement.archived_at IS NULL
                    AND replacement.embedding_status != 'archived'""",
             unique_ids,
         ).fetchall()
@@ -3381,6 +3409,7 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
                FROM story_vectors v
                JOIN stories s ON s.id = v.story_id
                WHERE v.embedding MATCH ? AND k = ? AND s.deleted_at IS NULL
+                 AND s.archived_at IS NULL AND s.embedding_status != 'archived'
                ORDER BY v.distance""",
             (emb_blob, top_k)
         ).fetchall()

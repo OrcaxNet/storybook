@@ -6,7 +6,10 @@ import time
 import subprocess
 from datetime import UTC, datetime, timedelta
 
+from click.testing import CliRunner
+
 from storybook import config, context, embeddings, llm, processor, search, store
+from storybook.cli import cli
 
 from ._helpers import basis, with_cos
 
@@ -79,6 +82,92 @@ def test_decay_archives_low_value_and_protects_frequent_story():
     assert store.get_story(low, include_deleted=True)["embedding_status"] == "archived"
     assert store.get_story(high)["access_count"] == 32
     assert [item["story_id"] for item in store.search_by_vector(basis(0), top_k=5)] == [high]
+
+
+def test_archived_story_stays_out_of_every_serving_path_after_reinit(
+    fake_embedder
+):
+    archived = store.add_story(
+        "needle archived", "low value memory", ["needle"], basis(0)
+    )
+    active = store.add_story(
+        "active", "current project memory", ["active"], basis(1)
+    )
+    store.add_or_update_edge(active, archived, 0.1, "semantic")
+    old = datetime(2025, 1, 1, tzinfo=UTC).isoformat()
+    db = store.get_db()
+    try:
+        db.execute(
+            """UPDATE stories
+               SET access_count = 0, access_score = 0, updated_at = ?
+               WHERE id = ?""",
+            (old, archived),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    result = store.archive_low_value_stories(
+        min_age_days=30,
+        max_edge_weight=0.25,
+        now=datetime(2026, 8, 4, tzinfo=UTC),
+        dry_run=False,
+    )
+    assert result["archived"] == 1
+    assert store.get_story(archived, include_deleted=True)["embedding"]
+
+    # Every CLI process calls init_db.  The retained audit BLOB must not be
+    # interpreted as an active vector or repaired back into the serving index.
+    store.init_db()
+    db = store.get_db()
+    try:
+        archived_blob = db.execute(
+            "SELECT embedding FROM stories WHERE id = ?", (archived,)
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",
+            (archived, archived_blob),
+        )
+        db.commit()
+    finally:
+        db.close()
+    store.init_db()
+    assert store.repair_vector_consistency() == {
+        "rebuilt": 0, "cleared": 0, "failed": [],
+    }
+    consistency = store.vector_consistency()
+    assert consistency["missing_vec"] == []
+    assert consistency["orphan_vec"] == []
+
+    assert archived not in {
+        item["story_id"] for item in store.search_by_vector(basis(0), top_k=5)
+    }
+    assert archived not in {
+        item["story_id"]
+        for item in store.search_by_vector_numpy(basis(0), top_k=5)
+    }
+    assert store.search_by_lexical("needle", top_k=5) == []
+    assert store.get_story(archived) is None
+    assert archived not in {item["id"] for item in store.get_all_stories()}
+    assert archived not in {
+        item["id"] for item in store.get_related_stories(active, limit=5)
+    }
+
+    fake_embedder.register("active", basis(1))
+    recall = search.search("active", top_k=5, graph_enabled=True)
+    assert archived not in {item["story_id"] for item in recall["top_matches"]}
+    runner = CliRunner()
+    listed = runner.invoke(cli, ["list"])
+    shown = runner.invoke(cli, ["show", str(archived)])
+    assert listed.exit_code == 0
+    assert "needle archived" not in listed.output
+    assert shown.exit_code == 0
+    assert "不存在" in shown.output
+    db = store.get_db(load_vector_extension=False)
+    try:
+        assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        db.close()
 
 
 def test_project_scope_removes_more_relevant_cross_project_noise(fake_embedder):
