@@ -159,12 +159,29 @@ def serving_index_matches_config(state: dict) -> bool:
     keep using this active route until shadow activation.
     """
 
+    identity = serving_route_identity(state)
     return bool(
         state.get("active_model")
-        and (state.get("active_endpoint") or state.get("active_base_url"))
-        and (state.get("active_adapter") or state.get("active_provider"))
+        and identity["base_url"]
+        and identity["adapter"]
+        and identity["credential_known"]
         and state.get("active_dimension")
     )
+
+
+def serving_route_identity(state: dict) -> dict[str, object]:
+    """Resolve old provider aliases and new serving fields identically."""
+
+    provider = state.get("active_provider")
+    adapter = state.get("active_adapter")
+    if not adapter and provider in {"ollama", "api"}:
+        adapter = "ollama" if provider == "ollama" else "openai_compatible"
+    return {
+        "base_url": state.get("active_endpoint") or state.get("active_base_url"),
+        "adapter": adapter,
+        "api_key_env": state.get("active_api_key_env"),
+        "credential_known": state.get("active_api_key_env") is not None,
+    }
 
 
 def embed(
@@ -202,12 +219,13 @@ def embed(
             cache_version = (
                 cache_version or state.get("active_version") or config.EMBED_VERSION
             )
-            request_base_url = state.get("active_endpoint")
-            request_adapter = state.get("active_adapter")
-            request_api_key_env = state.get("active_api_key_env")
+            identity = serving_route_identity(state)
+            request_base_url = identity["base_url"]
+            request_adapter = identity["adapter"]
+            request_api_key_env = identity["api_key_env"]
             if (
                 not request_base_url or not request_adapter
-                or request_api_key_env is None
+                or not identity["credential_known"]
             ):
                 raise EmbeddingAPIError(
                     "active_index_identity_unknown",

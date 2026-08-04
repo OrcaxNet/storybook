@@ -8,6 +8,7 @@ from collections import OrderedDict
 from typing import Generic, TypeVar
 
 from . import config
+from . import embeddings
 
 T = TypeVar("T")
 
@@ -66,24 +67,16 @@ def index_identity(
     """绝对路径仅作为进程内隔离 key，不进入响应或诊断日志。"""
 
     spec = embedding_spec or {}
+    route = embeddings.serving_route_identity(spec)
     return (
         str(config.DB_PATH.resolve()),
         int(index_version),
         config.EMBED_TYPE,
+        str(route["base_url"] or "<unknown>").rstrip("/"),
+        str(route["adapter"] or "<unknown>"),
         str(
-            spec.get("active_endpoint")
-            or spec.get("active_base_url")
-            or config.EMBED_BASE_URL
-        ).rstrip("/"),
-        str(
-            spec.get("active_adapter")
-            or spec.get("active_provider")
-            or config.EMBED_ADAPTER
-        ),
-        str(
-            config.EMBED_API_KEY_ENV
-            if spec.get("active_api_key_env") is None
-            else spec["active_api_key_env"]
+            route["api_key_env"]
+            if route["credential_known"] else "<unknown>"
         ),
         str(spec.get("active_model") or config.EMBED_MODEL),
         str(spec.get("active_version") or config.EMBED_VERSION),

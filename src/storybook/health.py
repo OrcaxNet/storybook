@@ -70,10 +70,13 @@ def serving_index_compatibility(actual_dimension: int | None) -> dict:
     mismatches: list[str] = []
     active_model = state.get("active_model")
     active_version = state.get("active_version")
-    active_endpoint = state.get("active_endpoint")
-    active_adapter = state.get("active_adapter")
+    identity = embeddings.serving_route_identity(state)
+    active_endpoint = identity["base_url"]
+    active_adapter = identity["adapter"]
     active_dimension = state.get("active_dimension")
-    active_api_key_env = state.get("active_api_key_env")
+    active_api_key_env = identity["api_key_env"]
+    if state and not identity["credential_known"]:
+        mismatches.append("credential reference for active index is unknown")
     if state and active_endpoint != config.EMBED_BASE_URL:
         mismatches.append(
             f"endpoint active={active_endpoint or 'unknown'} target={config.EMBED_BASE_URL}"

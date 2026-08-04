@@ -474,38 +474,80 @@ def _ensure_embedding_identity_columns(db: sqlite3.Connection) -> None:
            WHERE id = 1""",
         (serving_dimension,),
     )
-    # Before the unified API feature every released index was Ollama-backed and
-    # its endpoint was supplied by the same OLLAMA_HOST/default mapping still
-    # used by config. Preserve that zero-touch contract without rewriting any
-    # Story/vector. A custom adapter is never inferred from this legacy shape.
-    if config.EMBED_ADAPTER == "ollama":
-        db.execute(
-            """UPDATE embedding_index_state
-               SET active_endpoint = COALESCE(active_endpoint, ?),
-                   active_adapter = COALESCE(active_adapter, 'ollama'),
-                   active_api_key_env = COALESCE(active_api_key_env, '')
-               WHERE id = 1""",
-            (config.EMBED_BASE_URL,),
-        )
+    row = db.execute(
+        "SELECT * FROM embedding_index_state WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return
+    state = dict(row)
+
+    # FLO-179 already persisted these aliases. They are authoritative active
+    # route evidence and can be mapped without consulting today's target config.
+    alias_provider = state.get("active_provider")
+    alias_base_url = state.get("active_base_url")
+    endpoint = state.get("active_endpoint")
+    adapter = state.get("active_adapter")
+    if not endpoint and alias_base_url:
+        endpoint = str(alias_base_url).rstrip("/")
+    if not adapter and alias_provider in {"ollama", "api"}:
+        adapter = "ollama" if alias_provider == "ollama" else "openai_compatible"
+
+    # Schemas older than FLO-179 have no route aliases. Every such released
+    # index was Ollama-backed, so the legacy OLLAMA_HOST mapping remains safe.
+    if not endpoint and not alias_provider and not alias_base_url:
+        if config.EMBED_ADAPTER == "ollama":
+            endpoint = config.EMBED_BASE_URL
+            adapter = "ollama"
+
     db.execute(
         """UPDATE embedding_index_state
-           SET active_api_key_env = ?
-           WHERE id = 1 AND active_api_key_env IS NULL
-             AND active_endpoint = ? AND active_adapter = ?
-             AND active_model = ? AND active_version = ?
-             AND active_dimension = ?""",
-        (
-            config.EMBED_API_KEY_ENV, config.EMBED_BASE_URL,
-            config.EMBED_ADAPTER, config.EMBED_MODEL,
-            config.EMBED_VERSION, config.EMBED_DIM,
-        ),
+           SET active_endpoint = COALESCE(active_endpoint, ?),
+               active_adapter = COALESCE(active_adapter, ?)
+           WHERE id = 1""",
+        (endpoint, adapter),
     )
+    state = dict(db.execute(
+        "SELECT * FROM embedding_index_state WHERE id = 1"
+    ).fetchone())
+
+    # An Ollama route never needs a credential. For custom APIs, recover only
+    # the non-secret env-name from a configuration that proves every known
+    # vector-space identity field is unchanged. A drifted target must not be
+    # promoted into the immutable active identity.
+    credential_env = state.get("active_api_key_env")
+    if credential_env is None and state.get("active_adapter") == "ollama":
+        credential_env = ""
+    elif credential_env is None:
+        unchanged_custom_identity = (
+            str(state.get("active_endpoint") or "").rstrip("/")
+            == config.EMBED_BASE_URL.rstrip("/")
+            and state.get("active_adapter") == config.EMBED_ADAPTER
+            and state.get("active_model") == config.EMBED_MODEL
+            and state.get("active_version") == config.EMBED_VERSION
+            and state.get("active_representation") == config.EMBED_REPRESENTATION
+            and state.get("active_dimension") == config.EMBED_DIM
+        )
+        if unchanged_custom_identity:
+            credential_env = config.EMBED_API_KEY_ENV
+    if credential_env is not None:
+        db.execute(
+            """UPDATE embedding_index_state
+               SET active_api_key_env = COALESCE(active_api_key_env, ?)
+               WHERE id = 1""",
+            (credential_env,),
+        )
+
+    # Keep the FLO-179 aliases synchronized from proven active fields only.
+    # Never fill an unknown active route from the current target configuration.
+    active_provider = state.get("active_provider")
+    if not active_provider and adapter:
+        active_provider = "ollama" if adapter == "ollama" else "api"
     db.execute(
         """UPDATE embedding_index_state
            SET active_provider = COALESCE(active_provider, ?),
-               active_base_url = COALESCE(active_base_url, active_endpoint, ?)
+               active_base_url = COALESCE(active_base_url, active_endpoint)
            WHERE id = 1""",
-        (config.EMBED_PROVIDER, config.EMBED_BASE_URL),
+        (active_provider,),
     )
 
 
