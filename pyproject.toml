@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 # 测试套件依赖：pytest + 覆盖率。`uv pip install -e ".[test]"` 安装。
 test = [
+    "build>=1.2",
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]

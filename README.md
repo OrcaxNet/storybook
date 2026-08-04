@@ -150,6 +150,11 @@ sh install.sh --prefix "$HOME/tools/storybook" --no-init
 sh install.sh --dry-run                       # 严格零写入
 ```
 
+维护者发布版本时推送 `v*` tag；release workflow 会先运行完整测试，再执行
+`scripts/build_release_assets.sh` 构建并验证固定文件名的 `storybook.tar.gz` 与
+`storybook.tar.gz.sha256`，随后发布到 GitHub Release。也可在本地安装 `build` 后执行
+`./scripts/build_release_assets.sh ./release-assets` 复现同一发布门禁。
+
 卸载程序文件时，删除安装 prefix 下的 `bin/book`、`bin/storybook` 和
 `lib/storybook` 即可。用户 Profile/记忆位于平台数据目录，不随程序升级或上述删除而
 清除；如确实要删除数据，使用 `book uninstall --purge-data` 的显式双重确认流程。

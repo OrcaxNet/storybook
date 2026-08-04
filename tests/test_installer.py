@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import http.server
 import os
 import pty
 import select
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -50,6 +52,9 @@ case $url in *.sha256) cp "$FAKE_CHECKSUM" "$destination";; *) cp "$FAKE_ARCHIVE
         tools / "python3",
         """#!/bin/sh
 set -eu
+if [ "${1:-}" = - ]; then
+  case ${2:-} in https://mirror.invalid/*) exit 0;; *) exit 1;; esac
+fi
 if [ "${1:-}" = -c ] && [ "$#" -gt 2 ]; then rm -f "$4"; mv "$3" "$4"; exit 0; fi
 if [ "${1:-}" = -c ]; then echo 3.11; exit 0; fi
 if [ "${1:-}" = -m ] && [ "${2:-}" = venv ] && [ "${3:-}" = --help ]; then
@@ -162,6 +167,45 @@ def _use_real_python_wheel(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
     return wheel, env, checksum
 
 
+@pytest.fixture(scope="session")
+def official_release_assets(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    output = tmp_path_factory.mktemp("official-release")
+    env = {**os.environ, "PYTHON": sys.executable}
+    completed = subprocess.run(
+        [ROOT / "scripts" / "build_release_assets.sh", output],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert (output / "storybook.tar.gz").is_file()
+    assert (output / "storybook.tar.gz.sha256").is_file()
+    return output
+
+
+@pytest.fixture
+def official_release_url(official_release_assets: Path):
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+    handler = lambda *args, **kwargs: QuietHandler(  # noqa: E731
+        *args, directory=str(official_release_assets), **kwargs
+    )
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
 @pytest.mark.parametrize(("system", "architecture"), [("Darwin", "arm64"), ("Linux", "x86_64")])
 def test_dry_run_with_space_in_prefix_performs_zero_writes(
     tmp_path, system, architecture
@@ -175,6 +219,92 @@ def test_dry_run_with_space_in_prefix_performs_zero_writes(
     assert completed.returncode == 0, completed.stderr
     assert "no writes performed" in completed.stdout
     assert not prefix.exists()
+
+
+@pytest.mark.parametrize(
+    "unsafe_url",
+    [
+        "https://SECRET-SENTINEL@example.invalid/storybook.tar.gz",
+        "https://user:SECRET-SENTINEL@example.invalid/storybook.tar.gz",
+        "https://SECRET-SENTINEL%40name@example.invalid/storybook.tar.gz",
+        "https://example.invalid/storybook.tar.gz?token=SECRET-SENTINEL",
+        "https://example.invalid/storybook.tar.gz#SECRET-SENTINEL",
+    ],
+)
+def test_unsafe_download_url_is_rejected_without_echoing_secrets(
+    tmp_path, unsafe_url
+):
+    _, env = _fake_tools(tmp_path)
+    env.update(
+        STORYBOOK_INSTALL_ARCHIVE_URL=unsafe_url,
+        STORYBOOK_INSTALL_PYTHON=sys.executable,
+    )
+    prefix = tmp_path / "must-not-exist"
+
+    completed = _run(prefix, env, "--dry-run")
+
+    assert completed.returncode == 1
+    assert "SB_INSTALL_URL_UNSAFE" in completed.stderr
+    assert "SECRET-SENTINEL" not in completed.stdout
+    assert "SECRET-SENTINEL" not in completed.stderr
+    assert not prefix.exists()
+
+
+def test_safe_https_download_url_passes_dry_run(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    env["STORYBOOK_INSTALL_PYTHON"] = sys.executable
+
+    completed = _run(tmp_path / "prefix", env, "--dry-run")
+
+    assert completed.returncode == 0, completed.stderr
+    assert "https://mirror.invalid/storybook.tar.gz" in completed.stdout
+
+
+def test_generated_official_asset_installs_with_real_downloader_and_rolls_back(
+    tmp_path, official_release_assets, official_release_url
+):
+    prefix = tmp_path / "official prefix"
+    archive_url = f"{official_release_url}/storybook.tar.gz"
+    checksum_url = f"{archive_url}.sha256"
+    env = {
+        **os.environ,
+        "STORYBOOK_INSTALL_ARCHIVE_URL": archive_url,
+        "STORYBOOK_INSTALL_CHECKSUM_URL": checksum_url,
+        "STORYBOOK_INSTALL_PYTHON": sys.executable,
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    }
+
+    installed = _run(prefix, env, "--version", "0.1.0")
+    assert installed.returncode == 0, installed.stderr
+    for entrypoint in ("book", "storybook"):
+        checked = subprocess.run(
+            [prefix / "bin" / entrypoint, "--help"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert checked.returncode == 0, checked.stderr
+
+    repeated = _run(prefix, env, "--version", "0.1.0")
+    assert repeated.returncode == 0, repeated.stderr
+    upgraded = _run(prefix, env, "--version", "0.1.1")
+    assert upgraded.returncode == 0, upgraded.stderr
+    active_before = (prefix / "lib" / "storybook" / "current").resolve()
+
+    checksum = official_release_assets / "storybook.tar.gz.sha256"
+    original_checksum = checksum.read_text(encoding="ascii")
+    checksum.write_text("0" * 64 + "  storybook.tar.gz\n", encoding="ascii")
+    try:
+        failed = _run(prefix, env, "--version", "0.1.2")
+    finally:
+        checksum.write_text(original_checksum, encoding="ascii")
+
+    assert failed.returncode == 1
+    assert "SB_INSTALL_CHECKSUM_MISMATCH" in failed.stderr
+    assert (prefix / "lib" / "storybook" / "current").resolve() == active_before
+    assert subprocess.run(
+        [prefix / "bin" / "book", "--help"], check=False
+    ).returncode == 0
 
 
 def test_clean_repeat_and_version_upgrade_atomically_switch_release(tmp_path):

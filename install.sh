@@ -103,14 +103,43 @@ if [ "$VERSION" = latest ]; then
     ARCHIVE_URL=${STORYBOOK_INSTALL_ARCHIVE_URL:-$REPOSITORY/releases/latest/download/storybook.tar.gz}
     CHECKSUM_URL=${STORYBOOK_INSTALL_CHECKSUM_URL:-$REPOSITORY/releases/latest/download/storybook.tar.gz.sha256}
 else
-    ARCHIVE_URL=${STORYBOOK_INSTALL_ARCHIVE_URL:-$REPOSITORY/releases/download/v$VERSION/storybook-$VERSION.tar.gz}
+    ARCHIVE_URL=${STORYBOOK_INSTALL_ARCHIVE_URL:-$REPOSITORY/releases/download/v$VERSION/storybook.tar.gz}
     CHECKSUM_URL=${STORYBOOK_INSTALL_CHECKSUM_URL:-$ARCHIVE_URL.sha256}
 fi
-case $ARCHIVE_URL:$CHECKSUM_URL in
-    *://*:*@*|*\?*|*\#*)
-        fail SB_INSTALL_URL_UNSAFE "download URLs must not contain credentials, query, or fragment"
-        ;;
-esac
+
+validate_download_url() {
+    "$PYTHON" - "$1" >/dev/null 2>&1 <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+try:
+    raw = sys.argv[1]
+    parsed = urlsplit(raw)
+    host = (parsed.hostname or "").lower()
+    safe_scheme = parsed.scheme == "https"
+    safe_loopback = parsed.scheme == "http" and host in {"127.0.0.1", "localhost"}
+    if (
+        not raw
+        or any(ord(character) < 33 or ord(character) == 127 for character in raw)
+        or not parsed.netloc
+        or not host
+        or not (safe_scheme or safe_loopback)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError
+    parsed.port
+except (ValueError, UnicodeError):
+    raise SystemExit(1)
+PY
+}
+
+validate_download_url "$ARCHIVE_URL" || \
+    fail SB_INSTALL_URL_UNSAFE "download URLs must use HTTPS without credentials, query, or fragment"
+validate_download_url "$CHECKSUM_URL" || \
+    fail SB_INSTALL_URL_UNSAFE "download URLs must use HTTPS without credentials, query, or fragment"
 
 INSTALL_ROOT=$PREFIX/lib/storybook
 BIN_DIR=$PREFIX/bin
@@ -131,8 +160,20 @@ fi
 download() {
     source_url=$1
     destination=$2
+    case $source_url in
+        http://127.0.0.1/*|http://127.0.0.1:*|http://localhost/*|http://localhost:*)
+            allowed_protocols='=http,https'
+            loopback_http=1
+            ;;
+        *)
+            allowed_protocols='=https'
+            loopback_http=0
+            ;;
+    esac
     if [ "$DOWNLOADER" = curl ]; then
-        curl -fsSL --proto '=https' --tlsv1.2 "$source_url" -o "$destination"
+        curl -fsSL --proto "$allowed_protocols" --tlsv1.2 "$source_url" -o "$destination"
+    elif [ "$loopback_http" -eq 1 ]; then
+        wget -q -O "$destination" "$source_url"
     else
         wget -q --https-only -O "$destination" "$source_url"
     fi
