@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 from itertools import combinations
 from pathlib import Path
@@ -96,6 +96,10 @@ CREATE TABLE IF NOT EXISTS stories (
     applicability_json TEXT NOT NULL DEFAULT '{}',
     environment_summary_json TEXT NOT NULL DEFAULT '[]',
     access_count INTEGER DEFAULT 0,
+    access_score REAL DEFAULT 0.0,
+    last_accessed_at TEXT,
+    access_decay_at TEXT,
+    archived_at TEXT,
     version INTEGER DEFAULT 1,
     deleted_at TEXT,
     tombstone_event_id TEXT,
@@ -343,6 +347,10 @@ def init_db(
         _ensure_memory_graph_schema(db)
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
+        _ensure_governance_columns(db)
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stories_active ON stories(archived_at, deleted_at)"
+        )
         _ensure_memory_event_backfill(db)
         _ensure_fts_index(db)
         # 创建 sqlite-vec 虚拟表
@@ -397,15 +405,25 @@ def _ensure_source_checkpoint_columns(db: sqlite3.Connection) -> None:
 
 
 def _ensure_story_vectors(db: sqlite3.Connection) -> None:
-    """Publish valid legacy BLOBs into vec0 without inventing embeddings."""
+    """Keep vec0 aligned with active BLOBs without reviving archived Stories."""
 
     indexed = {
         int(row[0]) for row in db.execute("SELECT story_id FROM story_vectors")
     }
+    active_rows = db.execute(
+        """SELECT id, embedding FROM stories
+           WHERE embedding IS NOT NULL AND deleted_at IS NULL
+             AND archived_at IS NULL AND embedding_status != 'archived'
+           ORDER BY id"""
+    ).fetchall()
+    active_ids = {int(row["id"]) for row in active_rows}
+    changed = 0
+    for story_id in indexed - active_ids:
+        changed += max(0, db.execute(
+            "DELETE FROM story_vectors WHERE story_id = ?", (story_id,)
+        ).rowcount)
     expected_bytes = config.EMBED_DIM * np.dtype(np.float32).itemsize
-    for row in db.execute(
-        "SELECT id, embedding FROM stories WHERE embedding IS NOT NULL ORDER BY id"
-    ):
+    for row in active_rows:
         if row["id"] in indexed:
             continue
         blob = bytes(row["embedding"])
@@ -419,6 +437,9 @@ def _ensure_story_vectors(db: sqlite3.Connection) -> None:
             "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",
             (row["id"], blob),
         )
+        changed += 1
+    if changed:
+        _bump_index_version(db)
 
 
 def _ensure_fts_index(db: sqlite3.Connection) -> None:
@@ -822,6 +843,25 @@ def _json_load(value, fallback):
         return json.loads(value) if value not in (None, "") else fallback
     except (json.JSONDecodeError, TypeError):
         return fallback
+
+
+def _ensure_governance_columns(db: sqlite3.Connection) -> None:
+    additions = {
+        "access_score": "REAL",
+        "last_accessed_at": "TEXT",
+        "access_decay_at": "TEXT",
+        "archived_at": "TEXT",
+    }
+    columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(stories)").fetchall()
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            db.execute(f"ALTER TABLE stories ADD COLUMN {name} {declaration}")
+    db.execute(
+        """UPDATE stories SET access_score = CAST(access_count AS REAL)
+           WHERE access_score IS NULL"""
+    )
 
 
 def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
@@ -1275,8 +1315,8 @@ def story_vectors_table_exists() -> bool:
 def vector_consistency() -> dict:
     """检查 stories.embedding 与 story_vectors 的双写一致性。
 
-    embedding 双写约束：stories.embedding（BLOB）与 story_vectors（vec0 行）
-    必须同有同无。返回::
+    embedding 双写约束只适用于 active Story；归档行可保留 BLOB 作为本地
+    审计证据，但不得存在于 serving index。返回::
 
         {
           "blob_count": int,     # stories.embedding 非空行数
@@ -1288,18 +1328,24 @@ def vector_consistency() -> dict:
     db = get_db()
     try:
         blob_count = db.execute(
-            "SELECT COUNT(*) FROM stories WHERE embedding IS NOT NULL"
+            """SELECT COUNT(*) FROM stories
+               WHERE embedding IS NOT NULL AND deleted_at IS NULL
+                 AND archived_at IS NULL AND embedding_status != 'archived'"""
         ).fetchone()[0]
         vec_count = db.execute("SELECT COUNT(*) FROM story_vectors").fetchone()[0]
         missing_vec = [r[0] for r in db.execute(
             """SELECT s.id FROM stories s
                WHERE s.embedding IS NOT NULL
+                 AND s.deleted_at IS NULL AND s.archived_at IS NULL
+                 AND s.embedding_status != 'archived'
                  AND s.id NOT IN (SELECT story_id FROM story_vectors)"""
         ).fetchall()]
         orphan_vec = [r[0] for r in db.execute(
             """SELECT v.story_id FROM story_vectors v
                LEFT JOIN stories s ON s.id = v.story_id
-               WHERE s.id IS NULL OR s.embedding IS NULL"""
+               WHERE s.id IS NULL OR s.embedding IS NULL
+                  OR s.deleted_at IS NOT NULL OR s.archived_at IS NOT NULL
+                  OR s.embedding_status = 'archived'"""
         ).fetchall()]
         return {
             "blob_count": blob_count,
@@ -1439,6 +1485,7 @@ def stories_pending_embedding_backfill(
         rows = db.execute(
             """SELECT s.* FROM stories s
                WHERE s.embedding_status != 'archived' AND s.deleted_at IS NULL
+                 AND s.archived_at IS NULL
                ORDER BY s.id"""
         ).fetchall()
         pending = []
@@ -1521,6 +1568,7 @@ def embedding_backfill_progress(version: str, representation: str) -> dict:
         stories = db.execute(
             """SELECT * FROM stories
                WHERE embedding_status != 'archived' AND deleted_at IS NULL
+                 AND archived_at IS NULL
                ORDER BY id"""
         ).fetchall()
         ready = failed = 0
@@ -1571,6 +1619,7 @@ def activate_embedding_backfill(
         stories = db.execute(
             """SELECT * FROM stories
                WHERE embedding_status != 'archived' AND deleted_at IS NULL
+                 AND archived_at IS NULL
                ORDER BY id"""
         ).fetchall()
         rows = []
@@ -2328,7 +2377,7 @@ def delete_story(story_id: int) -> str | None:
                SET embedding = NULL, embedding_status = 'archived',
                    version = version + 1, deleted_at = ?,
                    tombstone_event_id = ?, updated_at = ?
-               WHERE id = ? AND deleted_at IS NULL""",
+               WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
             (deleted_at, event_id, deleted_at, story_id),
         )
         _record_revision(db, story_id, "delete")
@@ -2371,7 +2420,8 @@ def get_story(story_id: int, *, include_deleted: bool = False) -> Optional[dict]
     db = get_db()
     try:
         row = db.execute(
-            "SELECT * FROM stories WHERE id = ? AND (? OR deleted_at IS NULL)",
+            """SELECT * FROM stories WHERE id = ?
+               AND (? OR (deleted_at IS NULL AND archived_at IS NULL))""",
             (story_id, include_deleted),
         ).fetchone()
         if row:
@@ -2415,7 +2465,8 @@ def get_story_rerank_texts(story_ids: list[int]) -> dict[int, str]:
     try:
         rows = db.execute(
             f"""SELECT id, content FROM stories
-                 WHERE id IN ({placeholders}) AND deleted_at IS NULL""",
+                 WHERE id IN ({placeholders}) AND deleted_at IS NULL
+                   AND archived_at IS NULL""",
             unique_ids,
         ).fetchall()
         return {
@@ -2430,7 +2481,8 @@ def get_all_stories(*, include_deleted: bool = False) -> list[dict]:
     db = get_db()
     try:
         rows = db.execute(
-            "SELECT * FROM stories WHERE (? OR deleted_at IS NULL) ORDER BY id",
+            """SELECT * FROM stories
+               WHERE (? OR (deleted_at IS NULL AND archived_at IS NULL)) ORDER BY id""",
             (include_deleted,),
         ).fetchall()
         return [_row_to_story(r) for r in rows]
@@ -2582,8 +2634,11 @@ def increment_access_count(story_id: int):
     db = get_db()
     try:
         db.execute(
-            """UPDATE stories SET access_count = access_count + 1
-               WHERE id = ? AND deleted_at IS NULL""",
+            """UPDATE stories SET access_count = access_count + 1,
+                                  access_score = COALESCE(access_score, access_count, 0) + 1,
+                                  last_accessed_at = datetime('now'),
+                                  access_decay_at = datetime('now')
+               WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
             (story_id,),
         )
         db.commit()
@@ -2604,14 +2659,28 @@ def apply_recall_feedback(
     变成查询失败。
     """
 
-    unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
-    if not unique_ids:
+    requested_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
+    if not requested_ids:
         return
     db = get_db(db_path, load_vector_extension=False)
     try:
+        placeholders = ",".join("?" for _ in requested_ids)
+        unique_ids = [
+            int(row["id"])
+            for row in db.execute(
+                f"""SELECT id FROM stories WHERE id IN ({placeholders})
+                    AND deleted_at IS NULL AND archived_at IS NULL""",
+                requested_ids,
+            ).fetchall()
+        ]
+        if not unique_ids:
+            return
         db.executemany(
-            """UPDATE stories SET access_count = access_count + 1
-               WHERE id = ? AND deleted_at IS NULL""",
+            """UPDATE stories SET access_count = access_count + 1,
+                                  access_score = COALESCE(access_score, access_count, 0) + 1,
+                                  last_accessed_at = datetime('now'),
+                                  access_decay_at = datetime('now')
+               WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
             [(story_id,) for story_id in unique_ids],
         )
         for source_id, target_id in combinations(sorted(unique_ids), 2):
@@ -2663,11 +2732,129 @@ def apply_recall_feedback(
         db.close()
 
 
+def decay_story_access_counts(
+    *, half_life_days: float = 30.0, now: datetime | None = None
+) -> dict:
+    """Exponentially decay access counters using the last decay checkpoint."""
+
+    if half_life_days <= 0:
+        raise ValueError("half_life_days must be positive")
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    db = get_db(load_vector_extension=False)
+    try:
+        rows = db.execute(
+            """SELECT id, access_count, access_score, access_decay_at, updated_at
+               FROM stories
+               WHERE deleted_at IS NULL AND archived_at IS NULL
+                 AND COALESCE(NULLIF(access_score, 0), access_count, 0) > 0"""
+        ).fetchall()
+        decayed = 0
+        for row in rows:
+            checkpoint_text = row["access_decay_at"] or row["updated_at"]
+            checkpoint = datetime.fromisoformat(
+                checkpoint_text.replace("Z", "+00:00")
+            )
+            if checkpoint.tzinfo is None:
+                checkpoint = checkpoint.replace(tzinfo=UTC)
+            elapsed_days = max(0.0, (now - checkpoint.astimezone(UTC)).total_seconds() / 86400)
+            old_count = int(row["access_count"] or 0)
+            stored_score = float(row["access_score"] or 0.0)
+            old_score = old_count if stored_score <= 0.0 < old_count else stored_score
+            new_score = old_score * (0.5 ** (elapsed_days / half_life_days))
+            new_count = max(0, round(new_score))
+            if new_count != old_count:
+                decayed += 1
+            db.execute(
+                """UPDATE stories
+                   SET access_count = ?, access_score = ?, access_decay_at = ?
+                   WHERE id = ?""",
+                (new_count, new_score, now.isoformat(), row["id"]),
+            )
+        db.commit()
+        return {"examined": len(rows), "decayed": decayed}
+    finally:
+        db.close()
+
+
+def archive_low_value_stories(
+    *,
+    max_access_count: int = 0,
+    max_edge_weight: float = 0.25,
+    min_age_days: int = 90,
+    now: datetime | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """Archive old, low-access Stories without destroying provenance."""
+
+    if max_access_count < 0 or min_age_days < 0 or max_edge_weight < 0:
+        raise ValueError("forget thresholds must be non-negative")
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    cutoff = (now - timedelta(days=min_age_days)).isoformat()
+    db = get_db()
+    try:
+        rows = db.execute(
+            """SELECT s.id, s.title, s.access_count,
+                      COALESCE(MAX(CASE WHEN e.deleted_at IS NULL THEN e.weight END), 0) AS max_edge_weight
+               FROM stories s
+               LEFT JOIN edges e ON e.source_id = s.id OR e.target_id = s.id
+               WHERE s.deleted_at IS NULL AND s.archived_at IS NULL
+                 AND s.access_count <= ?
+                 AND COALESCE(s.last_accessed_at, s.updated_at, s.created_at) <= ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM stories child
+                     WHERE child.parent_id = s.id AND child.deleted_at IS NULL
+                       AND child.archived_at IS NULL
+                 )
+               GROUP BY s.id
+               HAVING max_edge_weight <= ?
+               ORDER BY s.id""",
+            (max_access_count, cutoff, max_edge_weight),
+        ).fetchall()
+        candidates = [
+            {
+                "story_id": int(row["id"]),
+                "title": row["title"],
+                "access_count": int(row["access_count"] or 0),
+                "max_edge_weight": float(row["max_edge_weight"] or 0.0),
+            }
+            for row in rows
+        ]
+        if not dry_run and candidates:
+            ids = [item["story_id"] for item in candidates]
+            placeholders = ",".join("?" for _ in ids)
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                f"""UPDATE stories SET archived_at = ?, embedding_status = 'archived'
+                    WHERE id IN ({placeholders})""",
+                (now.isoformat(), *ids),
+            )
+            db.execute(
+                f"DELETE FROM story_vectors WHERE story_id IN ({placeholders})", ids
+            )
+            db.execute(
+                f"""UPDATE edges SET deleted_at = ?, updated_at = ?
+                    WHERE deleted_at IS NULL
+                      AND (source_id IN ({placeholders}) OR target_id IN ({placeholders}))""",
+                (now.isoformat(), now.isoformat(), *ids, *ids),
+            )
+            _bump_index_version(db)
+            db.commit()
+        return {
+            "dry_run": bool(dry_run),
+            "archived": 0 if dry_run else len(candidates),
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+        }
+    finally:
+        db.close()
+
+
 def count_stories() -> int:
     db = get_db()
     try:
         return db.execute(
-            "SELECT COUNT(*) FROM stories WHERE deleted_at IS NULL"
+            """SELECT COUNT(*) FROM stories
+               WHERE deleted_at IS NULL AND archived_at IS NULL"""
         ).fetchone()[0]
     finally:
         db.close()
@@ -2949,6 +3136,7 @@ def get_related_stories_batch(
                    WHERE (e.source_id = ? OR e.target_id = ?)
                      AND e.deleted_at IS NULL
                      AND s.deleted_at IS NULL
+                     AND s.archived_at IS NULL
                      AND s.embedding_status != 'archived'
                    ORDER BY e.weight DESC, e.id""",
                 (story_id, story_id, story_id, story_id),
@@ -3030,6 +3218,7 @@ def get_graph_neighbors_batch(
                     WHERE (e.source_id = ? OR e.target_id = ?)
                       AND e.deleted_at IS NULL
                       AND s.deleted_at IS NULL
+                      AND s.archived_at IS NULL
                       AND s.embedding_status != 'archived'""",
                 (
                     story_id, story_id, *allowed,
@@ -3057,6 +3246,7 @@ def get_graph_neighbors_batch(
                    WHERE (e.source_id = ? OR e.target_id = ?)
                      AND e.deleted_at IS NULL
                      AND s.deleted_at IS NULL
+                     AND s.archived_at IS NULL
                      AND s.embedding_status != 'archived'
                      AND {direction_clause}
                      AND {type_clause}
@@ -3127,6 +3317,8 @@ def get_superseded_story_ids(story_ids: list[int]) -> set[int]:
                  JOIN stories replacement ON replacement.id = e.source_id
                  WHERE e.edge_type = 'supersedes' AND e.deleted_at IS NULL
                    AND e.target_id IN ({placeholders})
+                   AND replacement.deleted_at IS NULL
+                   AND replacement.archived_at IS NULL
                    AND replacement.embedding_status != 'archived'""",
             unique_ids,
         ).fetchall()
@@ -3217,6 +3409,7 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
                FROM story_vectors v
                JOIN stories s ON s.id = v.story_id
                WHERE v.embedding MATCH ? AND k = ? AND s.deleted_at IS NULL
+                 AND s.archived_at IS NULL AND s.embedding_status != 'archived'
                ORDER BY v.distance""",
             (emb_blob, top_k)
         ).fetchall()
@@ -3248,15 +3441,74 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
         db.close()
 
 
-def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list[dict]:
-    """numpy 暴力余弦相似度搜索（fallback）"""
+def _project_filter_sql(
+    story_alias: str,
+    selector: tuple[str | None, frozenset[str]],
+) -> tuple[str, list[object]]:
+    """Build the project predicate with Story-level strong-remote precedence."""
+
+    strong_remote, identity_values = selector
+    values = tuple(sorted(identity_values))
+    placeholders = ", ".join("?" for _ in values)
+    clause = """AND (
+        (
+            ? IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) strong_env
+                WHERE json_extract(strong_env.value, '$.workspace.repo_fingerprint') LIKE 'sha256:%'
+            )
+            AND EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) matching_env
+                WHERE json_extract(matching_env.value, '$.workspace.repo_fingerprint') = ?
+            )
+        ) OR (
+            (? IS NULL OR NOT EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) strong_env
+                WHERE json_extract(strong_env.value, '$.workspace.repo_fingerprint') LIKE 'sha256:%'
+            ))
+            AND EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) env
+                WHERE json_extract(env.value, '$.workspace.repo_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.path_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.id') IN ({values})
+            )
+        )
+    )""".format(story_alias=story_alias, values=placeholders)
+    return clause, [
+        strong_remote, strong_remote, strong_remote,
+        *values, *values, *values,
+    ]
+
+
+def search_by_vector_numpy(
+    query_embedding: list[float],
+    top_k: int = 5,
+    *,
+    project_identities: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+    project_identity: tuple[str, str] | None = None,
+    project_selector: tuple[str | None, frozenset[str]] | None = None,
+) -> list[dict]:
+    """Exact numpy search, optionally constrained before ranking to one project."""
+    if project_identities is None and project_identity is not None:
+        project_identities = frozenset((project_identity[1],))
+    if project_selector is None and project_identities is not None:
+        project_selector = None, frozenset(project_identities)
     db = get_db()
     try:
+        project_clause = ""
+        project_params: list[object] = []
+        if project_selector and project_selector[1]:
+            project_clause, project_params = _project_filter_sql(
+                "stories", project_selector
+            )
         rows = db.execute(
-            """SELECT id, title, abstract, content, keywords, embedding,
+            f"""SELECT id, title, abstract, content, keywords, embedding,
                       applicability_json, environment_summary_json
                FROM stories
-               WHERE embedding IS NOT NULL AND deleted_at IS NULL"""
+               WHERE embedding IS NOT NULL AND deleted_at IS NULL
+                 AND archived_at IS NULL
+                 {project_clause}""",
+            project_params,
         ).fetchall()
         if not rows:
             return []
@@ -3268,6 +3520,13 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
 
         results = []
         for r in rows:
+            environments = context_module.merge_environments(
+                r["environment_summary_json"], []
+            )
+            if project_selector and not context_module.environment_matches_project_selector(
+                project_selector, environments
+            ):
+                continue
             vec = np.frombuffer(r["embedding"], dtype=np.float32)
             vec_norm = np.linalg.norm(vec)
             if vec_norm == 0:
@@ -3284,9 +3543,7 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
                 "applicability": context_module.normalize_applicability(
                     r["applicability_json"]
                 ),
-                "environments": context_module.merge_environments(
-                    r["environment_summary_json"], []
-                ),
+                "environments": environments,
                 "similarity": round(sim, 4),
             })
         results.sort(key=lambda x: x["similarity"], reverse=True)
@@ -3296,7 +3553,13 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
 
 
 def search_by_lexical(
-    query: str, top_k: int = 5, *, timeout_seconds: float = 0.5
+    query: str,
+    top_k: int = 5,
+    *,
+    timeout_seconds: float = 0.5,
+    project_identities: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+    project_identity: tuple[str, str] | None = None,
+    project_selector: tuple[str | None, frozenset[str]] | None = None,
 ) -> list[dict]:
     """FTS5 + 参数化关键词子串的低时延降级检索。
 
@@ -3305,6 +3568,10 @@ def search_by_lexical(
     保证调用方给定的 deadline。
     """
 
+    if project_identities is None and project_identity is not None:
+        project_identities = frozenset((project_identity[1],))
+    if project_selector is None and project_identities is not None:
+        project_selector = None, frozenset(project_identities)
     terms = _lexical_terms(query)
     if not terms or top_k <= 0:
         return []
@@ -3318,18 +3585,25 @@ def search_by_lexical(
     )
     try:
         candidates: dict[int, sqlite3.Row] = {}
+        project_clause = ""
+        project_params: list[object] = []
+        if project_selector and project_selector[1]:
+            project_clause, project_params = _project_filter_sql(
+                "s", project_selector
+            )
         fts_query = " OR ".join(f'"{term}"' for term in terms)
         try:
             rows = db.execute(
-                """SELECT s.id, s.title, s.abstract, s.content, s.keywords,
+                f"""SELECT s.id, s.title, s.abstract, s.content, s.keywords,
                           s.applicability_json, s.environment_summary_json
                    FROM story_fts
                    JOIN stories s ON s.id = story_fts.rowid
                    WHERE story_fts MATCH ? AND s.embedding IS NOT NULL
-                     AND s.deleted_at IS NULL
+                     AND s.deleted_at IS NULL AND s.archived_at IS NULL
+                     {project_clause}
                    ORDER BY bm25(story_fts, 8.0, 5.0, 2.0, 5.0)
                    LIMIT ?""",
-                (fts_query, max(top_k * 8, 16)),
+                (fts_query, *project_params, max(top_k * 8, 16)),
             ).fetchall()
             candidates.update({int(row["id"]): row for row in rows})
         except sqlite3.OperationalError as exc:
@@ -3352,9 +3626,11 @@ def search_by_lexical(
                        s.applicability_json, s.environment_summary_json
                 FROM stories s
                 WHERE s.embedding IS NOT NULL AND s.deleted_at IS NULL
+                  AND s.archived_at IS NULL
+                  {project_clause}
                   AND ({' OR '.join(clauses)})
                 LIMIT ?""",
-            (*params, max(top_k * 32, 256)),
+            (*project_params, *params, max(top_k * 32, 256)),
         ).fetchall()
         candidates.update({int(row["id"]): row for row in rows})
 
@@ -3475,7 +3751,11 @@ def get_stats() -> dict:
             "pending": db.execute("SELECT COUNT(*) FROM sessions WHERE status='pending'").fetchone()[0],
             "processed": db.execute("SELECT COUNT(*) FROM sessions WHERE status='processed'").fetchone()[0],
             "stories": db.execute(
-                "SELECT COUNT(*) FROM stories WHERE deleted_at IS NULL"
+                """SELECT COUNT(*) FROM stories
+                   WHERE deleted_at IS NULL AND archived_at IS NULL"""
+            ).fetchone()[0],
+            "archived_stories": db.execute(
+                "SELECT COUNT(*) FROM stories WHERE archived_at IS NOT NULL"
             ).fetchone()[0],
             "tombstones": db.execute(
                 "SELECT COUNT(*) FROM memory_tombstones"
@@ -3485,11 +3765,13 @@ def get_stats() -> dict:
             ).fetchone()[0],
             "root_stories": db.execute(
                 """SELECT COUNT(*) FROM stories
-                   WHERE parent_id IS NULL AND deleted_at IS NULL"""
+                   WHERE parent_id IS NULL AND deleted_at IS NULL
+                     AND archived_at IS NULL"""
             ).fetchone()[0],
             "child_stories": db.execute(
                 """SELECT COUNT(*) FROM stories
-                   WHERE parent_id IS NOT NULL AND deleted_at IS NULL"""
+                   WHERE parent_id IS NOT NULL AND deleted_at IS NULL
+                     AND archived_at IS NULL"""
             ).fetchone()[0],
             "profile": {
                 "id": config.PROFILE_ID,

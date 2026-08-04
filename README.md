@@ -47,7 +47,7 @@ collector → store → processor (用 llm + embeddings) → search
 
 ### 检索（`search.search`）
 
-Fast：query normalization → vector + FTS/关键词 → 加权 RRF → 环境软加权 → 有界 Graph RAG → 本地 top-N rerank。Fast 不调用生成式 LLM；`graph_enabled=false` 可关闭图扩散。
+Fast：query normalization → vector + FTS/关键词 → 加权 RRF → 环境软加权 → 有界 Graph RAG → 本地 top-N rerank。Fast 不调用生成式 LLM；`graph_enabled=false` 可关闭图扩散。`--scope project` 使用 ContextEnvelope 中隐私安全的 repo/workspace 身份做硬过滤，只返回当前项目来源记忆；`profile` 保持用户级全库召回。
 
 Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambiguous_ranking`、`long_compound_query`、`cross_language`、`environment_ambiguity` 等稳定原因决定是否调用一次 DeepSeek LLM，生成 rewrite、multi-query 或 HyDE 辅助表示。第二阶段有独立 deadline，超时后原 Fast 结果立即作为 fallback 返回。Deep 显式启用三种 transformation、更高 Graph 预算及 5s 总预算。
 
@@ -62,6 +62,8 @@ Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambig
 ### 存储层（`store.py`）
 
 每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。新 Profile、Session、Story、edge 使用可按时间排序的 UUIDv7 全局 ID。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录无损本地快照，`memory_events` 以 `event_id/entity_id/base_version/version/device_id/operation/created_at` 记录 create/update/merge/split/delete 的可移植审计链。事件明文 payload 只含固定元数据、关系 UUID 与修订 SHA-256，不复制正文、原始外部 session ID、路径或证据文本，并预留加密 payload 字段。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
+
+`storybook forget` 用持久化浮点热度按半衰期衰减，再将频率无关的整数投影写入 `access_count`，并以最近访问/更新时间、访问计数和最大关联边权共同筛选低价值 Story；归档默认仅预览，`--apply` 后只归档并移出向量/词法/图检索，重复初始化或索引修复也不会重新发布归档向量；高频或强关联记忆受保护，原 Story、embedding 审计数据与 provenance 仍保留。生成式 LLM 与 embedding 的成功结果按 provider/model/schema/输入哈希持久缓存于 Profile 私有 cache；批处理并行执行无数据库写入的 LLM/embedding 准备阶段，再顺序执行 SQLite 合并与写入。
 
 删除 Story 时不物理删行：同一事务清除 serving 向量、追加 delete event 并写入不可变 `memory_tombstones`。查询默认排除 tombstone；本地事件重放采用 delete-wins，即使旧 create/update 事件晚到也不会复活对象。v0.2 的 `storybook sync status` 是纯本地状态查询，不登录、不联网，也没有上传/下载入口。
 
@@ -328,7 +330,8 @@ storybook process [--session ID]     # 做梦周期：处理所有 pending 会�
 storybook process --watch [--source codex] [--interval N]  # 监听全部启用来源或指定单源
 storybook dream --once [--source codex] # 单次多来源采集+加工；launchd/cron 入口
 storybook dream [--interval N]        # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
-storybook search "<query>" [--top 3] [--mode fast|auto|deep] [--no-transform] [--no-rerank] [--json]
+storybook search "<query>" [--top 3] [--scope profile|project|strict] [--mode fast|auto|deep] [--json]
+storybook forget [--half-life-days 30] [--min-age-days 90] [--apply]  # 默认仅预览
                                     # 默认 fast；auto 门控增强；deep 显式高预算
 storybook status --performance       # 最近 100 次查询 p50/p95、cache/fallback 比例
 storybook benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质量基准
@@ -366,7 +369,7 @@ storybook import-data --source codex
 
 每条新 Session 都保存 `tool/device/session/workspace/runtime/captured_at/provenance`；每个未知叶子字段使用 `null`（`runtime.kind` 使用枚举 `unknown`）并标记 `provenance=unknown`。Claude/Cursor adapter 采集 `detected/reported/inferred/user_confirmed` 来源，原始外部 session ID 使用 Profile 本地 HMAC，绝对路径、hostname、remote host 与 repo URL 只保留哈希或短别名。
 
-Story 合并多个 Session 时会保留全部来源环境，不由最后一次会话覆盖。搜索的语义相似度始终是主信号：默认 `scope=profile` 仅以 workspace/tool/runtime/OS 等环境信号做有界软加权，冲突结果仍可召回并带 `warnings`；只有调用方显式指定 `scope=strict` 才过滤环境冲突。`storybook show` 展示来源环境以及 `applies_when` / `excludes_when`。
+Story 合并多个 Session 时会保留全部来源环境，不由最后一次会话覆盖。历史导入和实时采集都会从 cwd 解析 Git 根目录与 origin：远端仓库哈希作为主身份，同时保留根目录的 Profile 本地 HMAC 作为兼容身份，因此旧版仅含路径指纹的 Story 仍可在 `scope=project` 下召回，且绝对路径不会落库。双方都有远端主身份时以远端为准，不允许相同本地路径覆盖 remote 冲突；仅有一侧缺少远端证据时才使用路径兼容身份。搜索的语义相似度始终是主信号：默认 `scope=profile` 仅以 workspace/tool/runtime/OS 等环境信号做有界软加权，冲突结果仍可召回并带 `warnings`；只有调用方显式指定 `scope=strict` 才过滤环境冲突。`storybook show` 展示来源环境以及 `applies_when` / `excludes_when`。
 
 ### 快速体验（无真实会话）
 
@@ -583,6 +586,8 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
 | `STORYBOOK_EMBED_VERSION` | `story-v2-default-v1` | 活跃表示的不可变版本标识 |
 | `STORYBOOK_EMBED_REPRESENTATION` | `default` | 默认 `title + abstract + applicability` |
+| `STORYBOOK_INFERENCE_CACHE_ENABLED` | `1` | Profile 私有 LLM/embedding 输入哈希缓存；`0` 禁用 |
+| `STORYBOOK_PROCESS_WORKERS` | `4` | 批量加工并行推理准备线程数；SQLite 持久化仍顺序执行 |
 | `STORYBOOK_ABSTRACT_MAX_CHARS` | `600` | abstract 预算；不影响 detail/source 持久化 |
 | `STORYBOOK_EMBED_KEEP_ALIVE` | `10m` | 每次 embedding 请求续期的 Ollama 模型驻留时间 |
 | `STORYBOOK_QUERY_WARM_TIMEOUT_SECONDS` | `2` | warm embedding 硬超时，超时即降级 |

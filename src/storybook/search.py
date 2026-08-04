@@ -44,11 +44,17 @@ def search(
         config.GRAPH_DEFAULT_ENABLED if graph_enabled is None
         else bool(graph_enabled)
     )
-    if scope not in ("profile", "strict"):
-        raise ValueError("scope 必须是 profile 或 strict")
+    if scope not in ("profile", "project", "strict"):
+        raise ValueError("scope 必须是 profile、project 或 strict")
     current_context = (
         context_module.normalize_envelope(context, profile_id=config.PROFILE_ID)
         if context is not None else None
+    )
+    if scope == "project" and context_module.project_identity(current_context) is None:
+        raise ValueError("project scope 需要可识别的当前项目 context")
+    project_scope_selector = (
+        context_module.project_selector(current_context)
+        if scope == "project" else None
     )
     normalized_query = adaptive.normalize_query(query)
     if not normalized_query:
@@ -186,9 +192,16 @@ def search(
     # ── Step 2: 向量检索 ──
     vector_started = performance.now()
     try:
-        matches = store.search_by_vector(
-            query_vec, top_k=max(top_k * 4, top_k)
-        )
+        if project_scope_selector is not None:
+            matches = store.search_by_vector_numpy(
+                query_vec,
+                top_k=max(top_k * 4, top_k),
+                project_selector=project_scope_selector,
+            )
+        else:
+            matches = store.search_by_vector(
+                query_vec, top_k=max(top_k * 4, top_k)
+            )
     except Exception:  # noqa: BLE001 -- vec0 损坏/缺失时必须快速降级
         latency["vector"] = performance.elapsed_ms(vector_started)
         return _lexical_fallback(
@@ -220,6 +233,7 @@ def search(
             normalized_query,
             top_k=candidate_limit,
             timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
+            project_selector=project_scope_selector,
         ),
         config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
@@ -289,6 +303,7 @@ def search(
                 retrieval_mode=retrieval_mode,
                 identity=identity,
                 candidate_limit=candidate_limit,
+                project_selector=project_scope_selector,
             ),
             second_stage_timeout,
         )
@@ -447,6 +462,7 @@ def _run_second_stage(
     retrieval_mode: str,
     identity: str,
     candidate_limit: int,
+    project_selector: tuple[str | None, frozenset[str]] | None,
 ) -> dict:
     """Generate and retrieve transformed queries inside the caller deadline."""
 
@@ -521,10 +537,17 @@ def _run_second_stage(
         vector_matches = []
         if vector:
             try:
-                vector_matches = [
-                    item for item in store.search_by_vector(
-                        vector, top_k=candidate_limit
+                vector_results = (
+                    store.search_by_vector_numpy(
+                        vector,
+                        top_k=candidate_limit,
+                        project_selector=project_selector,
                     )
+                    if project_selector is not None
+                    else store.search_by_vector(vector, top_k=candidate_limit)
+                )
+                vector_matches = [
+                    item for item in vector_results
                     if item["similarity"] >= config.SIM_THRESHOLD_SEARCH
                 ]
             except Exception:  # noqa: BLE001
@@ -535,6 +558,7 @@ def _run_second_stage(
                 value,
                 top_k=candidate_limit,
                 timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
+                project_selector=project_selector,
             ),
             config.QUERY_FALLBACK_TIMEOUT_SECONDS,
         )
@@ -697,6 +721,10 @@ def _run_lexical_fallback(
         normalized_query,
         top_k=max(top_k * 4, top_k, min(64, config.RERANK_TOP_N)),
         timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
+        project_selector=(
+            context_module.project_selector(current_context)
+            if scope == "project" else None
+        ),
     )
     fallback_ms = round((time.perf_counter() - fallback_started) * 1000, 3)
     candidate_limit = max(top_k * 4, top_k, min(64, config.RERANK_TOP_N))
@@ -847,6 +875,11 @@ def _environment_rerank(
     reranked = []
     strict_filtered = 0
     for match in matches:
+        if scope == "project" and not context_module.story_matches_project(
+            current_context, match.get("environments")
+        ):
+            strict_filtered += 1
+            continue
         fit = context_module.evaluate_story_context(
             current_context,
             match.get("environments"),
@@ -960,6 +993,11 @@ def _graph_rerank(
     strict_filtered = 0
     graph_matches = []
     for candidate in expansion["matches"]:
+        if scope == "project" and not context_module.story_matches_project(
+            current_context, candidate.get("environments")
+        ):
+            strict_filtered += 1
+            continue
         fit = context_module.evaluate_story_context(
             current_context,
             candidate.get("environments"),

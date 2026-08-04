@@ -261,6 +261,12 @@ EMBED_REPRESENTATION = os.getenv(
 )
 LLM_THINK = bool(_LLM_CONFIG["think"])
 
+# ── 加工缓存与并行 ──
+INFERENCE_CACHE_ENABLED = os.getenv(
+    "STORYBOOK_INFERENCE_CACHE_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+PROCESS_WORKERS = max(1, int(os.getenv("STORYBOOK_PROCESS_WORKERS", "4")))
+
 # ── 查询快路径 ──
 # Ollama 的 keep_alive 由每次 embedding 请求续期；进程内 warm window 用于选择
 # 2s/5s 硬超时预算，不作为跨进程主键或持久状态。

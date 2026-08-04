@@ -10,6 +10,7 @@ import numpy as np
 import requests
 
 from . import config
+from . import inference_cache
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ def embed(
     *,
     timeout_seconds: float | None = None,
     keep_alive: str | None = None,
+    cache_version: str | None = None,
 ) -> Optional[list[float]]:
     """调用 Ollama 生成语义向量，返回 L2 归一化后的向量。
 
@@ -34,8 +36,22 @@ def embed(
             from . import store
             state = store.get_embedding_index_state()
             model = state.get("active_model") or config.EMBED_MODEL
+            cache_version = (
+                cache_version or state.get("active_version") or config.EMBED_VERSION
+            )
         except Exception:  # schema may not exist during setup health probes
             model = config.EMBED_MODEL
+    cache_version = cache_version or config.EMBED_VERSION
+    cache_payload = {
+        "model": model,
+        "version": cache_version,
+        "dimension": config.EMBED_DIM,
+        "text": text,
+    }
+    cached = inference_cache.get("embedding-v1", cache_payload)
+    if isinstance(cached, list) and len(cached) == config.EMBED_DIM:
+        mark_model_used()
+        return [float(value) for value in cached]
     timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
     keep_alive = config.EMBED_KEEP_ALIVE if keep_alive is None else keep_alive
     try:
@@ -56,6 +72,7 @@ def embed(
             logger.warning("零向量，跳过")
             return None
         result = (arr / norm).tolist()
+        inference_cache.set("embedding-v1", cache_payload, result)
         mark_model_used()
         return result
     except Exception as e:
@@ -129,6 +146,7 @@ def backfill(
         vector = embed(
             story_v2.embedding_input(story, representation),
             model=model,
+            cache_version=version,
         )
         if vector:
             succeeded += 1

@@ -323,6 +323,7 @@ class TestContextEnvelopePersistence:
         assert workspace == {
             "id": None,
             "repo_fingerprint": None,
+            "path_fingerprint": None,
             "project_label": None,
             "cwd_alias": None,
             "branch": None,

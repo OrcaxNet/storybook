@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import re
+import subprocess
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -45,7 +46,8 @@ _LEAF_FIELDS = (
     "device.id", "device.os_family", "device.os_version", "device.arch",
     "device.display_name", "session.id", "session.external_session_hash",
     "session.started_at", "session.locale", "workspace.id",
-    "workspace.repo_fingerprint", "workspace.project_label",
+    "workspace.repo_fingerprint", "workspace.path_fingerprint",
+    "workspace.project_label",
     "workspace.cwd_alias", "workspace.branch", "runtime.kind",
     "runtime.remote_host_hash", "runtime.container_id_hash", "runtime.shell",
     "runtime.versions", "captured_at",
@@ -64,6 +66,7 @@ _FIELD_ALIASES = {
     "external_session_hash": "session.external_session_hash",
     "workspace_id": "workspace.id",
     "repo_fingerprint": "workspace.repo_fingerprint",
+    "path_fingerprint": "workspace.path_fingerprint",
     "runtime_kind": "runtime.kind",
 }
 _SAFE_ALIAS_RE = re.compile(r"[^\w .@+-]+", re.UNICODE)
@@ -297,6 +300,36 @@ def workspace_path_hash(path: Any) -> str | None:
     return local_hash(normalised, "workspace-path")
 
 
+def _git_workspace(path: Any) -> tuple[str | None, str | None]:
+    """Resolve a cwd to its repository root and optional remote without leaking it."""
+
+    if path in (None, ""):
+        return None, None
+    try:
+        candidate = Path(str(path)).expanduser().resolve(strict=False)
+        root_result = subprocess.run(
+            ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        if root_result.returncode != 0 or not root_result.stdout.strip():
+            return None, None
+        root = root_result.stdout.strip()
+        remote_result = subprocess.run(
+            ["git", "-C", root, "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        remote = remote_result.stdout.strip() if remote_result.returncode == 0 else None
+        return root, remote or None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, None
+
+
 def _runtime_kind() -> str:
     if any(os.environ.get(k) for k in ("CI", "GITHUB_ACTIONS", "BUILDKITE", "GITLAB_CI")):
         return "ci"
@@ -339,8 +372,8 @@ def _empty_envelope(profile_id: str, captured_at: str) -> dict:
             "locale": None,
         },
         "workspace": {
-            "id": None, "repo_fingerprint": None, "project_label": None,
-            "cwd_alias": None, "branch": None,
+            "id": None, "repo_fingerprint": None, "path_fingerprint": None,
+            "project_label": None, "cwd_alias": None, "branch": None,
         },
         "runtime": {
             "kind": None, "remote_host_hash": None, "container_id_hash": None,
@@ -428,15 +461,17 @@ def capture_context(
     arch = platform.machine().lower() or None
     display_name = " ".join(v for v in (os_family, arch) if v) or None
 
-    repo_hash = repository_fingerprint(repo_url)
-    path_hash = workspace_path_hash(workspace_path)
+    git_root, detected_remote = _git_workspace(workspace_path)
+    canonical_workspace_path = git_root or workspace_path
+    repo_hash = repository_fingerprint(repo_url or detected_remote)
+    path_hash = workspace_path_hash(canonical_workspace_path)
     workspace_fingerprint = repo_hash or path_hash
     workspace_id = None
     if workspace_fingerprint:
         workspace_id = str(uuid.uuid5(
             uuid.UUID(config.PROFILE_ID), workspace_fingerprint,
         ))
-    alias = _safe_alias(project_label) or _safe_alias(workspace_path)
+    alias = _safe_alias(project_label) or _safe_alias(canonical_workspace_path)
 
     detected_runtime = runtime_kind is None
     kind = runtime_kind or _runtime_kind()
@@ -477,6 +512,7 @@ def capture_context(
         "workspace": {
             "id": workspace_id,
             "repo_fingerprint": workspace_fingerprint,
+            "path_fingerprint": path_hash,
             "project_label": alias,
             "cwd_alias": alias,
             "branch": _safe_alias(branch),
@@ -518,6 +554,8 @@ def capture_context(
     if workspace_fingerprint:
         envelope["provenance"]["workspace.repo_fingerprint"] = prov
         envelope["provenance"]["workspace.id"] = "inferred"
+    if path_hash:
+        envelope["provenance"]["workspace.path_fingerprint"] = "detected"
     if envelope["runtime"]["remote_host_hash"]:
         envelope["provenance"]["runtime.remote_host_hash"] = (
             prov if remote_host_supplied else "detected"
@@ -598,6 +636,8 @@ def normalize_envelope(
                 cleaned = _canonical_local_hash(raw, "external-session")
             elif field == "workspace.repo_fingerprint":
                 cleaned = _canonical_workspace_fingerprint(raw)
+            elif field == "workspace.path_fingerprint":
+                cleaned = _canonical_local_hash(raw, "workspace-path")
             elif field == "runtime.remote_host_hash":
                 cleaned = _canonical_local_hash(raw, "remote-host")
             elif field == "runtime.container_id_hash":
@@ -630,6 +670,7 @@ def normalize_envelope(
         "session_id": ("session", "id"),
         "external_session_hash": ("session", "external_session_hash"),
         "repo_fingerprint": ("workspace", "repo_fingerprint"),
+        "path_fingerprint": ("workspace", "path_fingerprint"),
         "remote_host_hash": ("runtime", "remote_host_hash"),
         "container_id_hash": ("runtime", "container_id_hash"),
     }
@@ -642,6 +683,8 @@ def normalize_envelope(
             cleaned = _canonical_local_hash(value[key], "external-session")
         elif key == "repo_fingerprint":
             cleaned = _canonical_workspace_fingerprint(value[key])
+        elif key == "path_fingerprint":
+            cleaned = _canonical_local_hash(value[key], "workspace-path")
         elif key == "remote_host_hash":
             cleaned = _canonical_local_hash(value[key], "remote-host")
         else:
@@ -678,10 +721,23 @@ def normalize_envelope(
         )
     if workspace_in.get("path") or workspace_in.get("cwd"):
         raw_path = workspace_in.get("path") or workspace_in.get("cwd")
-        if not base["workspace"]["repo_fingerprint"]:
-            base["workspace"]["repo_fingerprint"] = workspace_path_hash(raw_path)
-            raw_path_field = (
-                "workspace.path" if workspace_in.get("path") else "workspace.cwd"
+        raw_path_field = (
+            "workspace.path" if workspace_in.get("path") else "workspace.cwd"
+        )
+        git_root, detected_remote = _git_workspace(raw_path)
+        canonical_workspace_path = git_root or raw_path
+        path_fingerprint = workspace_path_hash(canonical_workspace_path)
+        if path_fingerprint:
+            base["workspace"]["path_fingerprint"] = path_fingerprint
+            base["provenance"]["workspace.path_fingerprint"] = _provenance_for(
+                supplied_provenance,
+                raw_path_field,
+                path_fingerprint,
+                default="reported",
+            )
+        if detected_remote and not workspace_in.get("repo_url"):
+            base["workspace"]["repo_fingerprint"] = repository_fingerprint(
+                detected_remote
             )
             base["provenance"]["workspace.repo_fingerprint"] = _provenance_for(
                 supplied_provenance,
@@ -689,7 +745,15 @@ def normalize_envelope(
                 base["workspace"]["repo_fingerprint"],
                 default="reported",
             )
-        alias = _safe_alias(raw_path)
+        elif not base["workspace"]["repo_fingerprint"]:
+            base["workspace"]["repo_fingerprint"] = path_fingerprint
+            base["provenance"]["workspace.repo_fingerprint"] = _provenance_for(
+                supplied_provenance,
+                raw_path_field,
+                base["workspace"]["repo_fingerprint"],
+                default="reported",
+            )
+        alias = _safe_alias(canonical_workspace_path)
         if not base["workspace"]["project_label"] and alias:
             base["workspace"]["project_label"] = alias
             base["provenance"]["workspace.project_label"] = "inferred"
@@ -799,6 +863,126 @@ def merge_environments(existing: list | str | None, additions: list[dict]) -> li
         merged.append(canonical)
     merged.sort(key=lambda item: item.get("captured_at") or "")
     return merged
+
+
+def project_identity(envelope: dict | None) -> tuple[str, str] | None:
+    """Return a privacy-safe project identity, preferring repository evidence."""
+
+    if not isinstance(envelope, dict):
+        return None
+    workspace = envelope.get("workspace")
+    if not isinstance(workspace, dict):
+        return None
+    fingerprint = workspace.get("repo_fingerprint")
+    if fingerprint:
+        return "repo", str(fingerprint)
+    workspace_id = workspace.get("id")
+    if workspace_id:
+        return "workspace", str(workspace_id)
+    return None
+
+
+def project_identity_values(envelope: dict | None) -> frozenset[str]:
+    """Return primary and compatibility-safe project identifiers.
+
+    New contexts prefer a remote-derived repository fingerprint but retain the
+    HMAC of the canonical local Git root.  The latter lets them match Stories
+    created before remote detection was introduced without persisting a path.
+    """
+
+    if not isinstance(envelope, dict):
+        return frozenset()
+    workspace = envelope.get("workspace")
+    if not isinstance(workspace, dict):
+        return frozenset()
+    return frozenset(
+        str(value)
+        for value in (
+            workspace.get("repo_fingerprint"),
+            workspace.get("path_fingerprint"),
+            workspace.get("id"),
+        )
+        if value
+    )
+
+
+def project_selector(
+    envelope: dict | None,
+) -> tuple[str | None, frozenset[str]]:
+    """Return strong remote identity plus all privacy-safe compatibility IDs."""
+
+    identity = project_identity(envelope)
+    strong_remote = (
+        identity[1]
+        if identity and identity[0] == "repo" and identity[1].startswith("sha256:")
+        else None
+    )
+    return strong_remote, project_identity_values(envelope)
+
+
+def project_selectors_match(
+    current: tuple[str | None, frozenset[str]],
+    candidate: tuple[str | None, frozenset[str]],
+) -> bool:
+    """Match projects while making explicit remote conflicts authoritative."""
+
+    current_remote, current_values = current
+    candidate_remote, candidate_values = candidate
+    if current_remote and candidate_remote:
+        return current_remote == candidate_remote
+    return bool(current_values.intersection(candidate_values))
+
+
+def story_matches_project(
+    current_context: dict | None, environments: list[dict] | None
+) -> bool:
+    """Require at least one Story environment to match the current project."""
+
+    current = project_selector(current_context)
+    if not current[1]:
+        return False
+    return environment_matches_project_selector(current, environments)
+
+
+def environment_matches_project_selector(
+    selector: tuple[str | None, frozenset[str]] | None,
+    environments: list[dict] | None,
+) -> bool:
+    if selector is None or not selector[1]:
+        return False
+    candidates = [project_selector(item) for item in (environments or [])]
+    current_remote = selector[0]
+    candidate_remotes = {
+        remote for remote, _values in candidates if remote is not None
+    }
+    if current_remote and candidate_remotes:
+        return current_remote in candidate_remotes
+    return any(project_selectors_match(selector, item) for item in candidates)
+
+
+def environment_matches_project_identities(
+    identities: frozenset[str] | set[str] | tuple[str, ...] | None,
+    environments: list[dict] | None,
+) -> bool:
+    """Match any primary or compatibility identity in a Story environment."""
+
+    expected = frozenset(identities or ())
+    if not expected:
+        return False
+    return any(
+        bool(expected.intersection(project_identity_values(item)))
+        for item in (environments or [])
+    )
+
+
+def environment_matches_project_identity(
+    identity: tuple[str, str] | None, environments: list[dict] | None
+) -> bool:
+    if identity is None:
+        return False
+    return environment_matches_project_identities(
+        frozenset((identity[1],)), environments
+    )
 
 
 def evaluate_story_context(
