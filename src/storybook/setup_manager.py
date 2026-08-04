@@ -48,7 +48,10 @@ def default_launcher() -> Launcher:
 
     executable = shutil.which("book") or shutil.which("storybook")
     if executable:
-        return Launcher(str(Path(executable).resolve()))
+        # Persist the stable user-facing shim (for example ~/.local/bin/book),
+        # not the content-addressed venv target behind its ``current`` symlink.
+        # Upgrades atomically retarget that shim without requiring setup again.
+        return Launcher(os.path.abspath(executable))
     return Launcher(sys.executable, ("-m", "storybook.cli"))
 
 
@@ -917,7 +920,7 @@ class SetupManager:
             }
             phase = "state"
             self._write_state(state)
-        except Exception as exc:
+        except BaseException as exc:
             rollback_errors = self._rollback_transaction(snapshots, backup_dir)
             if rollback_errors:
                 raise SetupError(
@@ -925,6 +928,10 @@ class SetupManager:
                     f"setup 失败且无法完整回滚: {'; '.join(rollback_errors)}",
                     hint="从 setup-backups 恢复配置并检查磁盘空间或目录权限",
                 ) from exc
+            if not isinstance(exc, Exception):
+                # KeyboardInterrupt/SystemExit must retain their native CLI
+                # semantics, but only after all managed writes are restored.
+                raise
             if phase == "state":
                 raise SetupError(
                     "SB_SETUP_STATE_WRITE_FAILED",

@@ -80,17 +80,24 @@ def cli(verbose):
 
 
 def _emit_setup_error(exc: SetupError, *, as_json: bool) -> None:
+    hint = exc.hint
+    if exc.code.startswith("SB_MODEL_") and "book doctor" not in (hint or ""):
+        hint = "; ".join(
+            item for item in (hint, "运行 `book doctor` 诊断 provider 后重试") if item
+        )
     if as_json:
+        error = exc.as_dict()
+        error["hint"] = hint
         click.echo(
             json.dumps(
-                {"status": "failed", "error": exc.as_dict()},
+                {"status": "failed", "error": error},
                 ensure_ascii=False,
                 indent=2,
             )
         )
         raise click.exceptions.Exit(1)
-    hint = f"\n修复建议: {exc.hint}" if exc.hint else ""
-    raise click.ClickException(f"[{exc.code}] {exc}{hint}") from exc
+    rendered_hint = f"\n修复建议: {hint}" if hint else ""
+    raise click.ClickException(f"[{exc.code}] {exc}{rendered_hint}") from exc
 
 
 def _print_setup_plan(plan: dict) -> None:
@@ -349,7 +356,14 @@ def _run_onboarding(
             else:
                 manager.environ[api_key_env] = previous_secret
 
-    result["next_command"] = 'book search "what should I remember?"'
+    recall = next(
+        (item for item in result["smoke_tests"] if item["name"] == "recall"), None
+    )
+    if recall and recall["ok"]:
+        result["next_command"] = 'book search "what should I remember?"'
+    else:
+        result["next_command"] = "book doctor"
+        result["repair_command"] = "book doctor"
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -367,9 +381,6 @@ def _run_onboarding(
         )
     for reason in result["degraded_reasons"]:
         click.echo(f"  DEGRADED  {reason}")
-    recall = next(
-        (item for item in result["smoke_tests"] if item["name"] == "recall"), None
-    )
     if recall and recall["ok"]:
         click.echo('\nNext: book search "what should I remember?"')
     else:

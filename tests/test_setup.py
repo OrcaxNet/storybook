@@ -16,7 +16,7 @@ from storybook import config
 from storybook.cli import cli
 from storybook.profiles import PlatformRoots, ProfileRegistry
 from storybook.setup_adapters import Launcher
-from storybook.setup_manager import SetupError, SetupManager
+from storybook.setup_manager import SetupError, SetupManager, default_launcher
 
 
 def _roots(tmp_path: Path) -> PlatformRoots:
@@ -443,6 +443,76 @@ def test_state_write_failure_rolls_back_first_install_and_returns_json_error(
     assert "storybook" not in json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
     assert not manager.state_path.exists()
     assert not (roots.state / "setup-backups").exists()
+
+
+def test_keyboard_interrupt_after_adapter_write_restores_snapshot(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    path = manager.home / ".cursor" / "mcp.json"
+    _write_json(path, {"mcpServers": {"existing": {"command": "keep"}}})
+    before = path.read_bytes()
+    adapter = next(item for item in manager.adapters if item.name == "cursor")
+    original_apply = adapter.apply
+
+    def interrupt_after_write(context, backup_dir):
+        original_apply(context, backup_dir)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(adapter, "apply", interrupt_after_write)
+
+    with pytest.raises(KeyboardInterrupt):
+        manager.execute(requested_agents=("cursor",), download_models=False)
+
+    assert path.read_bytes() == before
+    assert not manager.state_path.exists()
+
+
+def test_keyboard_interrupt_after_schedule_write_removes_partial_config(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    original_write = manager._write_schedule
+
+    def interrupt_after_write():
+        original_write()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "_write_schedule", interrupt_after_write)
+
+    with pytest.raises(KeyboardInterrupt):
+        manager.execute(
+            requested_agents=(), download_models=False, enable_schedule=True
+        )
+
+    assert not manager.schedule_path.exists()
+    assert not manager.state_path.exists()
+
+
+def test_default_launcher_keeps_stable_shim_across_release_switch(tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    releases = prefix / "lib" / "storybook" / "releases"
+    for version in ("v1", "v2"):
+        executable = releases / version / "bin" / "book"
+        executable.parent.mkdir(parents=True)
+        executable.write_text(f"#!/bin/sh\necho {version}\n", encoding="utf-8")
+        executable.chmod(0o755)
+    current = prefix / "lib" / "storybook" / "current"
+    current.symlink_to("releases/v1", target_is_directory=True)
+    shim = prefix / "bin" / "book"
+    shim.parent.mkdir(parents=True)
+    shim.symlink_to(current / "bin" / "book")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+
+    launcher = default_launcher()
+    assert launcher.command == str(shim)
+    assert Path(launcher.command).resolve() == releases / "v1" / "bin" / "book"
+
+    current.unlink()
+    current.symlink_to("releases/v2", target_is_directory=True)
+
+    assert launcher.command == str(shim)
+    assert Path(launcher.command).resolve() == releases / "v2" / "bin" / "book"
 
 
 def test_state_write_failure_rolls_back_launcher_upgrade_and_preserves_old_state(
@@ -935,6 +1005,42 @@ def test_book_init_interactive_api_secret_is_ephemeral_and_hidden(
         path.read_bytes() for path in tmp_files(roots.config, roots.state)
     )
     assert sentinel.encode() not in written
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_book_init_provider_failure_returns_doctor_repair_path(
+    isolated_setup, monkeypatch, as_json
+):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    monkeypatch.setattr(
+        manager,
+        "_probe_provider",
+        lambda value: (_ for _ in ()).throw(
+            SetupError("SB_MODEL_NETWORK_FAILED", "generation provider unavailable")
+        ),
+    )
+    args = [
+        "init", "--yes", "--provider", "ollama",
+        "--base-url", "http://127.0.0.1:11434",
+        "--llm-model", "generation-v1",
+        "--embedding-model", "embedding-v1",
+    ]
+    if as_json:
+        args.append("--json")
+
+    result = CliRunner().invoke(cli, args, prog_name="book")
+
+    assert result.exit_code == 1
+    assert config.MODEL_CONFIG_PATH.is_file()
+    if as_json:
+        payload = json.loads(result.output)
+        assert payload["status"] == "failed"
+        assert payload["error"]["code"] == "SB_MODEL_NETWORK_FAILED"
+        assert "book doctor" in payload["error"]["hint"]
+    else:
+        assert "SB_MODEL_NETWORK_FAILED" in result.output
+        assert "book doctor" in result.output
 
 
 def tmp_files(*roots: Path) -> list[Path]:
