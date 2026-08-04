@@ -44,12 +44,14 @@ def search(
         config.GRAPH_DEFAULT_ENABLED if graph_enabled is None
         else bool(graph_enabled)
     )
-    if scope not in ("profile", "strict"):
-        raise ValueError("scope 必须是 profile 或 strict")
+    if scope not in ("profile", "project", "strict"):
+        raise ValueError("scope 必须是 profile、project 或 strict")
     current_context = (
         context_module.normalize_envelope(context, profile_id=config.PROFILE_ID)
         if context is not None else None
     )
+    if scope == "project" and context_module.project_identity(current_context) is None:
+        raise ValueError("project scope 需要可识别的当前项目 context")
     normalized_query = adaptive.normalize_query(query)
     if not normalized_query:
         raise ValueError("query 不能为空")
@@ -847,6 +849,11 @@ def _environment_rerank(
     reranked = []
     strict_filtered = 0
     for match in matches:
+        if scope == "project" and not context_module.story_matches_project(
+            current_context, match.get("environments")
+        ):
+            strict_filtered += 1
+            continue
         fit = context_module.evaluate_story_context(
             current_context,
             match.get("environments"),
@@ -960,6 +967,11 @@ def _graph_rerank(
     strict_filtered = 0
     graph_matches = []
     for candidate in expansion["matches"]:
+        if scope == "project" and not context_module.story_matches_project(
+            current_context, candidate.get("environments")
+        ):
+            strict_filtered += 1
+            continue
         fit = context_module.evaluate_story_context(
             current_context,
             candidate.get("environments"),

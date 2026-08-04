@@ -801,6 +801,34 @@ def merge_environments(existing: list | str | None, additions: list[dict]) -> li
     return merged
 
 
+def project_identity(envelope: dict | None) -> tuple[str, str] | None:
+    """Return a privacy-safe project identity, preferring repository evidence."""
+
+    if not isinstance(envelope, dict):
+        return None
+    workspace = envelope.get("workspace")
+    if not isinstance(workspace, dict):
+        return None
+    fingerprint = workspace.get("repo_fingerprint")
+    if fingerprint:
+        return "repo", str(fingerprint)
+    workspace_id = workspace.get("id")
+    if workspace_id:
+        return "workspace", str(workspace_id)
+    return None
+
+
+def story_matches_project(
+    current_context: dict | None, environments: list[dict] | None
+) -> bool:
+    """Require at least one Story environment to match the current project."""
+
+    current = project_identity(current_context)
+    if current is None:
+        return False
+    return any(project_identity(item) == current for item in (environments or []))
+
+
 def evaluate_story_context(
     current: dict | None,
     environments: list[dict] | None,

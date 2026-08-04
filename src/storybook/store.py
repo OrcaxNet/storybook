@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 from itertools import combinations
 from pathlib import Path
@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS stories (
     applicability_json TEXT NOT NULL DEFAULT '{}',
     environment_summary_json TEXT NOT NULL DEFAULT '[]',
     access_count INTEGER DEFAULT 0,
+    last_accessed_at TEXT,
+    access_decay_at TEXT,
+    archived_at TEXT,
     version INTEGER DEFAULT 1,
     deleted_at TEXT,
     tombstone_event_id TEXT,
@@ -343,6 +346,9 @@ def init_db(
         _ensure_memory_graph_schema(db)
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stories_active ON stories(archived_at, deleted_at)"
+        )
         _ensure_memory_event_backfill(db)
         _ensure_fts_index(db)
         # 创建 sqlite-vec 虚拟表
@@ -727,6 +733,9 @@ def _ensure_context_columns(db: sqlite3.Connection) -> None:
         "stories": {
             "applicability_json": "TEXT NOT NULL DEFAULT '{}'",
             "environment_summary_json": "TEXT NOT NULL DEFAULT '[]'",
+            "last_accessed_at": "TEXT",
+            "access_decay_at": "TEXT",
+            "archived_at": "TEXT",
         },
     }
     for table, columns_to_add in additions.items():
@@ -2328,7 +2337,7 @@ def delete_story(story_id: int) -> str | None:
                SET embedding = NULL, embedding_status = 'archived',
                    version = version + 1, deleted_at = ?,
                    tombstone_event_id = ?, updated_at = ?
-               WHERE id = ? AND deleted_at IS NULL""",
+               WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
             (deleted_at, event_id, deleted_at, story_id),
         )
         _record_revision(db, story_id, "delete")
@@ -2371,7 +2380,8 @@ def get_story(story_id: int, *, include_deleted: bool = False) -> Optional[dict]
     db = get_db()
     try:
         row = db.execute(
-            "SELECT * FROM stories WHERE id = ? AND (? OR deleted_at IS NULL)",
+            """SELECT * FROM stories WHERE id = ?
+               AND (? OR (deleted_at IS NULL AND archived_at IS NULL))""",
             (story_id, include_deleted),
         ).fetchone()
         if row:
@@ -2430,7 +2440,8 @@ def get_all_stories(*, include_deleted: bool = False) -> list[dict]:
     db = get_db()
     try:
         rows = db.execute(
-            "SELECT * FROM stories WHERE (? OR deleted_at IS NULL) ORDER BY id",
+            """SELECT * FROM stories
+               WHERE (? OR (deleted_at IS NULL AND archived_at IS NULL)) ORDER BY id""",
             (include_deleted,),
         ).fetchall()
         return [_row_to_story(r) for r in rows]
@@ -2582,8 +2593,10 @@ def increment_access_count(story_id: int):
     db = get_db()
     try:
         db.execute(
-            """UPDATE stories SET access_count = access_count + 1
-               WHERE id = ? AND deleted_at IS NULL""",
+            """UPDATE stories SET access_count = access_count + 1,
+                                  last_accessed_at = datetime('now'),
+                                  access_decay_at = datetime('now')
+               WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
             (story_id,),
         )
         db.commit()
@@ -2604,14 +2617,27 @@ def apply_recall_feedback(
     变成查询失败。
     """
 
-    unique_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
-    if not unique_ids:
+    requested_ids = list(dict.fromkeys(int(story_id) for story_id in story_ids))
+    if not requested_ids:
         return
     db = get_db(db_path, load_vector_extension=False)
     try:
+        placeholders = ",".join("?" for _ in requested_ids)
+        unique_ids = [
+            int(row["id"])
+            for row in db.execute(
+                f"""SELECT id FROM stories WHERE id IN ({placeholders})
+                    AND deleted_at IS NULL AND archived_at IS NULL""",
+                requested_ids,
+            ).fetchall()
+        ]
+        if not unique_ids:
+            return
         db.executemany(
-            """UPDATE stories SET access_count = access_count + 1
-               WHERE id = ? AND deleted_at IS NULL""",
+            """UPDATE stories SET access_count = access_count + 1,
+                                  last_accessed_at = datetime('now'),
+                                  access_decay_at = datetime('now')
+               WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
             [(story_id,) for story_id in unique_ids],
         )
         for source_id, target_id in combinations(sorted(unique_ids), 2):
@@ -2663,11 +2689,124 @@ def apply_recall_feedback(
         db.close()
 
 
+def decay_story_access_counts(
+    *, half_life_days: float = 30.0, now: datetime | None = None
+) -> dict:
+    """Exponentially decay access counters using the last decay checkpoint."""
+
+    if half_life_days <= 0:
+        raise ValueError("half_life_days must be positive")
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    db = get_db(load_vector_extension=False)
+    try:
+        rows = db.execute(
+            """SELECT id, access_count, access_decay_at, updated_at
+               FROM stories
+               WHERE deleted_at IS NULL AND archived_at IS NULL
+                 AND access_count > 0"""
+        ).fetchall()
+        decayed = 0
+        for row in rows:
+            checkpoint_text = row["access_decay_at"] or row["updated_at"]
+            checkpoint = datetime.fromisoformat(
+                checkpoint_text.replace("Z", "+00:00")
+            )
+            if checkpoint.tzinfo is None:
+                checkpoint = checkpoint.replace(tzinfo=UTC)
+            elapsed_days = max(0.0, (now - checkpoint.astimezone(UTC)).total_seconds() / 86400)
+            old_count = int(row["access_count"] or 0)
+            new_count = int(old_count * (0.5 ** (elapsed_days / half_life_days)))
+            if new_count != old_count:
+                decayed += 1
+            db.execute(
+                "UPDATE stories SET access_count = ?, access_decay_at = ? WHERE id = ?",
+                (new_count, now.isoformat(), row["id"]),
+            )
+        db.commit()
+        return {"examined": len(rows), "decayed": decayed}
+    finally:
+        db.close()
+
+
+def archive_low_value_stories(
+    *,
+    max_access_count: int = 0,
+    max_edge_weight: float = 0.25,
+    min_age_days: int = 90,
+    now: datetime | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """Archive old, low-access Stories without destroying provenance."""
+
+    if max_access_count < 0 or min_age_days < 0 or max_edge_weight < 0:
+        raise ValueError("forget thresholds must be non-negative")
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    cutoff = (now - timedelta(days=min_age_days)).isoformat()
+    db = get_db()
+    try:
+        rows = db.execute(
+            """SELECT s.id, s.title, s.access_count,
+                      COALESCE(MAX(CASE WHEN e.deleted_at IS NULL THEN e.weight END), 0) AS max_edge_weight
+               FROM stories s
+               LEFT JOIN edges e ON e.source_id = s.id OR e.target_id = s.id
+               WHERE s.deleted_at IS NULL AND s.archived_at IS NULL
+                 AND s.access_count <= ?
+                 AND COALESCE(s.last_accessed_at, s.updated_at, s.created_at) <= ?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM stories child
+                     WHERE child.parent_id = s.id AND child.deleted_at IS NULL
+                       AND child.archived_at IS NULL
+                 )
+               GROUP BY s.id
+               HAVING max_edge_weight <= ?
+               ORDER BY s.id""",
+            (max_access_count, cutoff, max_edge_weight),
+        ).fetchall()
+        candidates = [
+            {
+                "story_id": int(row["id"]),
+                "title": row["title"],
+                "access_count": int(row["access_count"] or 0),
+                "max_edge_weight": float(row["max_edge_weight"] or 0.0),
+            }
+            for row in rows
+        ]
+        if not dry_run and candidates:
+            ids = [item["story_id"] for item in candidates]
+            placeholders = ",".join("?" for _ in ids)
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                f"""UPDATE stories SET archived_at = ?, embedding_status = 'archived'
+                    WHERE id IN ({placeholders})""",
+                (now.isoformat(), *ids),
+            )
+            db.execute(
+                f"DELETE FROM story_vectors WHERE story_id IN ({placeholders})", ids
+            )
+            db.execute(
+                f"""UPDATE edges SET deleted_at = ?, updated_at = ?
+                    WHERE deleted_at IS NULL
+                      AND (source_id IN ({placeholders}) OR target_id IN ({placeholders}))""",
+                (now.isoformat(), now.isoformat(), *ids, *ids),
+            )
+            _bump_index_version(db)
+            db.commit()
+        return {
+            "dry_run": bool(dry_run),
+            "archived": 0 if dry_run else len(candidates),
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+        }
+    finally:
+        db.close()
+
+
 def count_stories() -> int:
     db = get_db()
     try:
         return db.execute(
-            "SELECT COUNT(*) FROM stories WHERE deleted_at IS NULL"
+            """SELECT COUNT(*) FROM stories
+               WHERE deleted_at IS NULL AND archived_at IS NULL"""
         ).fetchone()[0]
     finally:
         db.close()
@@ -3256,7 +3395,8 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
             """SELECT id, title, abstract, content, keywords, embedding,
                       applicability_json, environment_summary_json
                FROM stories
-               WHERE embedding IS NOT NULL AND deleted_at IS NULL"""
+               WHERE embedding IS NOT NULL AND deleted_at IS NULL
+                 AND archived_at IS NULL"""
         ).fetchall()
         if not rows:
             return []
@@ -3326,7 +3466,7 @@ def search_by_lexical(
                    FROM story_fts
                    JOIN stories s ON s.id = story_fts.rowid
                    WHERE story_fts MATCH ? AND s.embedding IS NOT NULL
-                     AND s.deleted_at IS NULL
+                     AND s.deleted_at IS NULL AND s.archived_at IS NULL
                    ORDER BY bm25(story_fts, 8.0, 5.0, 2.0, 5.0)
                    LIMIT ?""",
                 (fts_query, max(top_k * 8, 16)),
@@ -3352,6 +3492,7 @@ def search_by_lexical(
                        s.applicability_json, s.environment_summary_json
                 FROM stories s
                 WHERE s.embedding IS NOT NULL AND s.deleted_at IS NULL
+                  AND s.archived_at IS NULL
                   AND ({' OR '.join(clauses)})
                 LIMIT ?""",
             (*params, max(top_k * 32, 256)),
@@ -3475,7 +3616,11 @@ def get_stats() -> dict:
             "pending": db.execute("SELECT COUNT(*) FROM sessions WHERE status='pending'").fetchone()[0],
             "processed": db.execute("SELECT COUNT(*) FROM sessions WHERE status='processed'").fetchone()[0],
             "stories": db.execute(
-                "SELECT COUNT(*) FROM stories WHERE deleted_at IS NULL"
+                """SELECT COUNT(*) FROM stories
+                   WHERE deleted_at IS NULL AND archived_at IS NULL"""
+            ).fetchone()[0],
+            "archived_stories": db.execute(
+                "SELECT COUNT(*) FROM stories WHERE archived_at IS NOT NULL"
             ).fetchone()[0],
             "tombstones": db.execute(
                 "SELECT COUNT(*) FROM memory_tombstones"
@@ -3485,11 +3630,13 @@ def get_stats() -> dict:
             ).fetchone()[0],
             "root_stories": db.execute(
                 """SELECT COUNT(*) FROM stories
-                   WHERE parent_id IS NULL AND deleted_at IS NULL"""
+                   WHERE parent_id IS NULL AND deleted_at IS NULL
+                     AND archived_at IS NULL"""
             ).fetchone()[0],
             "child_stories": db.execute(
                 """SELECT COUNT(*) FROM stories
-                   WHERE parent_id IS NOT NULL AND deleted_at IS NULL"""
+                   WHERE parent_id IS NOT NULL AND deleted_at IS NULL
+                     AND archived_at IS NULL"""
             ).fetchone()[0],
             "profile": {
                 "id": config.PROFILE_ID,

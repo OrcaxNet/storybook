@@ -286,7 +286,7 @@ def create_server():
             query: 自然语言查询，描述当前任务或问题。
             top_k: 最多返回的匹配记忆数，默认 3。
             context: 可选 ContextEnvelope；缺省时仅按 Profile 语义召回。
-            scope: profile（默认软加权）或 strict（环境冲突硬过滤）。
+            scope: profile（默认软加权）、project（仅当前项目）或 strict（环境冲突硬过滤）。
             graph_enabled: 是否启用受预算图扩散；缺省跟随本地配置，false 回退直接检索。
             retrieval_mode: fast（无生成式 LLM）、auto（按门控进入第二阶段）或 deep（显式深度召回）。
             transform_enabled: 可选总开关；false 时 auto/deep 只返回 fast fallback。

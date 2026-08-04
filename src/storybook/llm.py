@@ -9,6 +9,7 @@ from typing import Any, Optional
 import requests
 
 from . import config
+from . import inference_cache
 from . import story_v2
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,20 @@ def _chat(
     plain text remains accepted only as a compatibility fallback for older
     gateways and deterministic test doubles.
     """
+
+    cache_payload = {
+        "provider": config.LLM_PROVIDER,
+        "base_url": config.LLM_BASE_URL.rstrip("/"),
+        "model": config.LLM_MODEL,
+        "thinking": config.LLM_THINK,
+        "prompt": prompt,
+        "system": system,
+        "num_predict": num_predict,
+        "response_schema": response_schema,
+    }
+    cached = inference_cache.get("llm-v1", cache_payload)
+    if isinstance(cached, (str, dict)):
+        return cached
 
     if not config.LLM_API_KEY:
         logger.error(
@@ -83,6 +98,7 @@ def _chat(
                     and block.get("name") == "submit_structured_output"
                     and _matches_schema(block.get("input"), response_schema)
                 ):
+                    inference_cache.set("llm-v1", cache_payload, block["input"])
                     return block["input"]
         text = "".join(
             block.get("text", "")
@@ -92,6 +108,7 @@ def _chat(
         ).strip()
         if not text:
             raise ValueError("empty content")
+        inference_cache.set("llm-v1", cache_payload, text)
         return text
     except requests.exceptions.Timeout:
         category, status = "timeout", None

@@ -8,6 +8,7 @@
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from . import config
@@ -38,8 +39,20 @@ def process_session(session_id: int) -> Optional[int]:
         logger.info("会话 #%d 已处理过，跳过", session_id)
         return None
 
+    prepared = _prepare_session(session)
+    if prepared is None:
+        store.update_session_status(session_id, "failed")
+        return None
+    return _persist_prepared_session(prepared)
+
+
+def _prepare_session(session) -> dict | None:
+    """Run independent network-bound formation work without writing SQLite."""
+
     raw_content = session["raw_content"]
-    logger.info("🔄 开始处理会话 #%d: %s", session_id, session["problem_desc"][:50])
+    logger.info(
+        "🔄 开始处理会话 #%d: %s", session["id"], session["problem_desc"][:50]
+    )
 
     # ── Step 1: LLM 提取关键词，并按独立结论形成 Story v2 ──
     keywords = llm.extract_keywords(raw_content)
@@ -70,7 +83,6 @@ def process_session(session_id: int) -> Optional[int]:
     lookup_vec = embeddings.embed(embed_text)
     if not lookup_vec:
         logger.error("  向量生成失败，跳过")
-        store.update_session_status(session_id, "failed")
         return None
 
     prepared = []
@@ -85,12 +97,22 @@ def process_session(session_id: int) -> Optional[int]:
             ))
             if not story_vec:
                 logger.error("  Story v2 向量生成失败，跳过整条 Session")
-                store.update_session_status(session_id, "failed")
                 return None
         else:
             # Compatibility for deterministic legacy test/adaptor summaries.
             story_vec = lookup_vec
         prepared.append((candidate, candidate_keywords, story_vec))
+
+    return {"session": session, "lookup_vec": lookup_vec, "stories": prepared}
+
+
+def _persist_prepared_session(preparation: dict) -> Optional[int]:
+    """Serial consolidation/write phase used by single and batch processing."""
+
+    session = preparation["session"]
+    session_id = int(session["id"])
+    lookup_vec = preparation["lookup_vec"]
+    prepared = preparation["stories"]
 
     # ── Step 2: 逐独立 Story 检索并执行 create/merge/update ──
     story_ids = []
@@ -445,7 +467,7 @@ def _split_and_store(old_story: dict, session, merged_text: str,
 
 
 def process_all_pending(verbose: bool = True) -> dict:
-    """处理所有 pending 状态的会话"""
+    """Parallelize inference preparation, then serialize SQLite consolidation."""
     pending = store.get_pending_sessions()
     total = len(pending)
     success = 0
@@ -454,16 +476,25 @@ def process_all_pending(verbose: bool = True) -> dict:
     if verbose:
         print(f"\n🌙 开始「做梦」加工，共 {total} 条待处理会话\n")
 
-    for i, session in enumerate(pending, 1):
+    worker_count = min(config.PROCESS_WORKERS, max(1, total))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(_prepare_session, session) for session in pending]
+
+    for i, (session, future) in enumerate(zip(pending, futures), 1):
         if verbose:
             print(f"  [{i}/{total}] 处理会话 #{session['id']}: {session['problem_desc'][:40]}...")
 
         try:
-            result = process_session(session["id"])
+            preparation = future.result()
+            result = (
+                _persist_prepared_session(preparation)
+                if preparation is not None else None
+            )
             if result:
                 success += 1
             else:
                 failed += 1
+                store.update_session_status(session["id"], "failed")
         except Exception as e:
             logger.error("处理会话 #%d 异常: %s", session["id"], e)
             failed += 1

@@ -940,10 +940,10 @@ def dream(once, interval, source):
 )
 @click.option(
     "--scope",
-    type=click.Choice(["profile", "strict"]),
+    type=click.Choice(["profile", "project", "strict"]),
     default="profile",
     show_default=True,
-    help="profile 默认软加权；strict 对环境冲突硬过滤",
+    help="profile 全 Profile 软加权；project 仅当前项目；strict 过滤环境冲突",
 )
 @click.option(
     "--mode",
@@ -1018,6 +1018,41 @@ def embedding_backfill(model, version, representation, batch_size, no_activate):
         activate=not no_activate,
     )
     click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@cli.command(name="forget")
+@click.option("--half-life-days", type=click.FloatRange(min=0.001), default=30.0,
+              show_default=True, help="访问计数指数衰减半衰期")
+@click.option("--max-access", type=click.IntRange(min=0), default=0,
+              show_default=True, help="衰减后可归档的最大访问计数")
+@click.option("--max-edge-weight", type=click.FloatRange(min=0.0), default=0.25,
+              show_default=True, help="可归档 Story 的最大关联边权")
+@click.option("--min-age-days", type=click.IntRange(min=0), default=90,
+              show_default=True, help="距离最近访问/更新的最短天数")
+@click.option("--apply", is_flag=True, help="执行归档；默认仅预览候选")
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
+def forget(half_life_days, max_access, max_edge_weight, min_age_days, apply, as_json):
+    """衰减访问热度，并预览或归档低价值记忆。"""
+
+    store.init_db()
+    decay = store.decay_story_access_counts(half_life_days=half_life_days)
+    archive = store.archive_low_value_stories(
+        max_access_count=max_access,
+        max_edge_weight=max_edge_weight,
+        min_age_days=min_age_days,
+        dry_run=not apply,
+    )
+    result = {"decay": decay, "archive": archive}
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    action = "已归档" if apply else "预览到"
+    click.echo(
+        f"访问衰减完成：检查 {decay['examined']} 条，变更 {decay['decayed']} 条；"
+        f"{action} {archive['candidate_count']} 条低价值记忆。"
+    )
+    if not apply and archive["candidate_count"]:
+        click.echo("确认后加 --apply 执行；归档保留 Story 与来源证据，但不再参与检索。")
 
 
 @cli.command()
