@@ -9,13 +9,14 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import click
 from click.testing import CliRunner
 
 from storybook import config
 from storybook.cli import cli
 from storybook.profiles import PlatformRoots, ProfileRegistry
 from storybook.setup_adapters import Launcher
-from storybook.setup_manager import SetupError, SetupManager
+from storybook.setup_manager import SetupError, SetupManager, default_launcher
 
 
 def _roots(tmp_path: Path) -> PlatformRoots:
@@ -67,6 +68,7 @@ def isolated_setup(tmp_path, monkeypatch):
     finally:
         config.PROFILE_REGISTRY = old_registry
         config.refresh_profile(create=False)
+        config.refresh_model_config()
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -441,6 +443,87 @@ def test_state_write_failure_rolls_back_first_install_and_returns_json_error(
     assert "storybook" not in json.loads(path.read_text(encoding="utf-8"))["mcpServers"]
     assert not manager.state_path.exists()
     assert not (roots.state / "setup-backups").exists()
+
+
+def test_keyboard_interrupt_after_adapter_write_restores_snapshot(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    path = manager.home / ".cursor" / "mcp.json"
+    _write_json(path, {"mcpServers": {"existing": {"command": "keep"}}})
+    before = path.read_bytes()
+    adapter = next(item for item in manager.adapters if item.name == "cursor")
+    original_apply = adapter.apply
+
+    def interrupt_after_write(context, backup_dir):
+        original_apply(context, backup_dir)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(adapter, "apply", interrupt_after_write)
+
+    with pytest.raises(KeyboardInterrupt):
+        manager.execute(requested_agents=("cursor",), download_models=False)
+
+    assert path.read_bytes() == before
+    assert not manager.state_path.exists()
+
+
+def test_keyboard_interrupt_after_schedule_write_removes_partial_config(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    original_write = manager._write_schedule
+
+    def interrupt_after_write():
+        original_write()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "_write_schedule", interrupt_after_write)
+
+    with pytest.raises(KeyboardInterrupt):
+        manager.execute(
+            requested_agents=(), download_models=False, enable_schedule=True
+        )
+
+    assert not manager.schedule_path.exists()
+    assert not manager.state_path.exists()
+
+
+def test_default_launcher_keeps_stable_shim_across_release_switch(tmp_path, monkeypatch):
+    prefix = tmp_path / "prefix"
+    releases = prefix / "lib" / "storybook" / "releases"
+    for version in ("v1", "v2"):
+        executable = releases / version / "bin" / "book"
+        executable.parent.mkdir(parents=True)
+        executable.write_text(f"#!/bin/sh\necho {version}\n", encoding="utf-8")
+        executable.chmod(0o755)
+    current = prefix / "lib" / "storybook" / "current"
+    current.symlink_to("releases/v1", target_is_directory=True)
+    shim = prefix / "bin" / "book"
+    shim.parent.mkdir(parents=True)
+    shim.symlink_to(current / "bin" / "book")
+    monkeypatch.setenv("PATH", f"{shim.parent}{os.pathsep}{os.environ['PATH']}")
+
+    launcher = default_launcher()
+    assert launcher.command == str(shim)
+    assert Path(launcher.command).resolve() == releases / "v1" / "bin" / "book"
+
+    current.unlink()
+    current.symlink_to("releases/v2", target_is_directory=True)
+
+    assert launcher.command == str(shim)
+    assert Path(launcher.command).resolve() == releases / "v2" / "bin" / "book"
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("STORYBOOK_LAUNCHER", str(shim))
+    without_path = default_launcher()
+    assert without_path.command == str(shim)
+    assert Path(without_path.command).resolve() == releases / "v2" / "bin" / "book"
+
+    monkeypatch.delenv("STORYBOOK_LAUNCHER")
+    monkeypatch.setattr(sys, "argv", [str(shim), "init"])
+    absolute_invocation = default_launcher()
+    assert absolute_invocation.command == str(shim)
 
 
 def test_state_write_failure_rolls_back_launcher_upgrade_and_preserves_old_state(
@@ -1029,6 +1112,206 @@ def test_model_unavailable_returns_degraded_not_failed(isolated_setup, monkeypat
 
     assert result["status"] == "degraded"
     assert result["degraded_reasons"] == ["Ollama unavailable"]
+
+
+def test_legacy_storybook_init_and_admin_init_db_share_low_level_behavior(monkeypatch):
+    calls = []
+    monkeypatch.setattr("storybook.cli.store.init_db", lambda: calls.append("init"))
+
+    legacy = CliRunner().invoke(cli, ["init"], prog_name="storybook")
+    admin = CliRunner().invoke(cli, ["admin", "init-db"], prog_name="book")
+
+    assert legacy.exit_code == 0, legacy.output
+    assert admin.exit_code == 0, admin.output
+    assert calls == ["init", "init"]
+
+
+def test_book_init_json_reuses_setup_contract(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+
+    result = CliRunner().invoke(
+        cli,
+        ["init", "--yes", "--json", "--skip-models", "--agent", "codex"],
+        prog_name="book",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ready"
+    assert payload["next_command"].startswith("book search")
+    assert payload["profile"]["id"]
+    assert payload["model_config"]["embedding"]["provider"] == "ollama"
+
+
+def test_book_help_hides_setup_compatibility_alias():
+    result = CliRunner().invoke(cli, ["--help"], prog_name="book")
+
+    assert result.exit_code == 0, result.output
+    assert "  init " in result.output
+    assert "  setup " not in result.output
+
+
+def test_book_init_combines_release_schedule_and_embedding_preset_options(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    for name in (
+        "EMBED_PRESET", "EMBED_ADAPTER", "EMBED_BASE_URL", "EMBED_MODEL",
+        "EMBED_DIM", "EMBED_VERSION", "EMBED_PROVIDER", "EMBED_API_KEY_ENV",
+        "EMBED_API_KEY", "EMBED_CONFIG_SOURCE", "EMBED_CONFIG_NORMALIZED",
+        "OLLAMA_HOST",
+    ):
+        monkeypatch.setattr(config, name, getattr(config, name))
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "init", "--dry-run", "--json", "--enable-schedule",
+            "--embedding-preset", "custom",
+            "--embedding-base-url", "https://embedding.example/v1",
+            "--embedding-model", "custom-embed",
+            "--embedding-dimension", "2",
+            "--embedding-version", "custom-v1",
+            "--embedding-api-key-env", "CUSTOM_EMBED_TOKEN",
+        ],
+        prog_name="book",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "dry_run"
+    assert payload["plan"]["schedule"] == {"enabled": True, "mode": "watch"}
+    embedding = payload["plan"]["embedding"]
+    assert embedding["preset"] == "custom"
+    assert embedding["adapter"] == "openai_compatible"
+    assert embedding["base_url"] == "https://embedding.example/v1"
+    assert embedding["model"] == "custom-embed"
+    assert embedding["dimension"] == 2
+
+
+def test_book_init_interactive_api_secret_is_ephemeral_and_hidden(
+    isolated_setup, monkeypatch
+):
+    manager, roots = isolated_setup
+    sentinel = "SECRET-SENTINEL-NEVER-PERSIST"
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+
+    def probe(value):
+        assert manager.environ["TEST_BOOK_KEY"] == sentinel
+        return [
+            {"name": "generation", "ok": True, "detail": "ready"},
+            {"name": "embedding-provider", "ok": True, "detail": "ready"},
+        ]
+
+    monkeypatch.setattr(manager, "_probe_provider", probe)
+    original_stream = click.get_text_stream
+
+    class TtyInput:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def isatty(self):
+            return True
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    monkeypatch.setattr(
+        click,
+        "get_text_stream",
+        lambda name: TtyInput(original_stream(name)) if name == "stdin" else original_stream(name),
+    )
+    user_input = "\n".join([
+        "api",
+        "https://models.example.test",
+        "generation-v1",
+        "embedding-v1",
+        "TEST_BOOK_KEY",
+        "auto",
+        "skip",
+        "y",
+        sentinel,
+        "",
+    ])
+
+    result = CliRunner().invoke(cli, ["init"], input=user_input, prog_name="book")
+
+    assert result.exit_code == 0, result.output
+    assert sentinel not in result.output
+    assert "TEST_BOOK_KEY" not in manager.environ
+    written = b"".join(
+        path.read_bytes() for path in tmp_files(roots.config, roots.state)
+    )
+    assert sentinel.encode() not in written
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_book_init_provider_failure_returns_doctor_repair_path(
+    isolated_setup, monkeypatch, as_json
+):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    monkeypatch.setattr(
+        manager,
+        "_probe_provider",
+        lambda value: (_ for _ in ()).throw(
+            SetupError("SB_MODEL_NETWORK_FAILED", "generation provider unavailable")
+        ),
+    )
+    args = [
+        "init", "--yes", "--provider", "ollama",
+        "--base-url", "http://127.0.0.1:11434",
+        "--llm-model", "generation-v1",
+        "--embedding-model", "embedding-v1",
+    ]
+    if as_json:
+        args.append("--json")
+
+    result = CliRunner().invoke(cli, args, prog_name="book")
+
+    assert result.exit_code == 1
+    assert config.MODEL_CONFIG_PATH.is_file()
+    if as_json:
+        payload = json.loads(result.output)
+        assert payload["status"] == "failed"
+        assert payload["error"]["code"] == "SB_MODEL_NETWORK_FAILED"
+        assert "book doctor" in payload["error"]["hint"]
+    else:
+        assert "SB_MODEL_NETWORK_FAILED" in result.output
+        assert "book doctor" in result.output
+
+
+def tmp_files(*roots: Path) -> list[Path]:
+    return [
+        path
+        for root in roots
+        if root.exists()
+        for path in root.rglob("*")
+        if path.is_file()
+    ]
+
+
+def test_enable_schedule_is_user_owned_and_idempotent(isolated_setup):
+    manager, _ = isolated_setup
+
+    first = manager.execute(
+        requested_agents=(), download_models=False, enable_schedule=True
+    )
+    before = manager.schedule_path.read_bytes()
+    second = manager.execute(
+        requested_agents=(), download_models=False, enable_schedule=True
+    )
+
+    assert first["schedule"]["status"] == "configured"
+    assert second["schedule"]["status"] == "configured"
+    assert manager.schedule_path.read_bytes() == before
+    assert str(manager.schedule_path).startswith(str(manager.home))
+    assert "sudo" not in before.decode("utf-8", errors="ignore")
+    removed = manager.uninstall()
+    assert removed["schedule"]["status"] == "removed"
+    assert not manager.schedule_path.exists()
 
 
 def _invoke_runtime_status(

@@ -82,20 +82,20 @@ storybook embedding-backfill --model qwen3-embedding:0.6b \
 - **Ollama（推荐）**：本地 preset 默认为 `http://localhost:11434` + `qwen3-embedding:0.6b` + 1024 维。旧 `OLLAMA_HOST` / `STORYBOOK_EMBED_MODEL` 会自动映射，无需重建现有索引
 - **自定义 API（可选）**：设置 `STORYBOOK_EMBED_ADAPTER=openai_compatible`、base URL、model、dimension；凭据只通过 `STORYBOOK_EMBED_API_KEY_ENV` 引用环境变量
 
-### 模型 Provider setup
+### 模型 Provider onboarding
 
-`book` 与 `storybook` 是等价命令。新安装会在 active Profile 内写入版本化的
+`book` 是 canonical 命令，`storybook` 在兼容期保留旧入口。新安装会在 active Profile 内写入版本化的
 `model-config.json`，generation 与 embedding 可分别诊断；文件只保存 credential
 环境变量名，绝不保存密钥。
 
 ```bash
 # 本地 Ollama：探测服务，按需拉取 generation/embedding 模型
-book setup --provider ollama --llm-model qwen3:8b \
+book init --provider ollama --llm-model qwen3:8b \
   --embedding-model qwen3-embedding:0.6b
 
 # OpenAI-compatible API：明确使用 /v1/chat/completions 与 /v1/embeddings
 export STORYBOOK_API_KEY='...'
-book setup --provider api --base-url https://gateway.example \
+book init --provider api --base-url https://gateway.example/v1-root \
   --llm-model chat-model --embedding-model embedding-model \
   --api-key-env STORYBOOK_API_KEY
 ```
@@ -119,42 +119,72 @@ setup。不同 provider/base URL 即使模型同名，也不会共享 inference/
 ollama pull qwen3-embedding:0.6b
 ```
 
-## 📦 安装
+## 📦 安装：从下载到首次 recall
 
 ```bash
-# 1. 建 venv（uv 创建的 venv 没有 pip）
-uv venv .venv
+# 1. 下载并审阅安装器（macOS/Linux、Python 3.11+，不使用 sudo）
+curl -fsSLO https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh
+less install.sh
+sh install.sh
 
-# 2. 以 editable 方式安装，得到 storybook 命令
-VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .
-# （项目目录移动后 shebang 可能失效，重新跑一次即可）
+# 2. 选择 Profile、Provider/model、Agent adapter 与可选 watch schedule
+book init
 
-# 3. 一键建立 Profile、接入已检测到的 Agent 并运行端到端自检
-storybook setup
+# 3. 查看状态并完成首次有效 recall
+book status
+book search "what should I remember about this task?"
 ```
 
-不想安装也可直接跑模块：
+非交互环境可使用 `book init --provider ... --agent codex --yes --json`；API
+密钥只从 `--api-key-env` 指定的进程环境变量读取，Profile 只保存变量名。
+`book setup` 是一个 minor release 内的隐藏兼容 alias。旧 `storybook init` 继续只做
+数据库初始化，低层 canonical 入口为 `book admin init-db`。
+
+`curl ... | sh` 会把远端当前内容直接交给 shell，无法先审阅，且信任 HTTPS、GitHub
+账号与发布流程；安全要求较高时使用上面的“下载 → 审阅 → 执行”路径。安装器默认写入
+`~/.local`，不会修改 shell rc；PATH 缺失时只打印可复制的修复命令。指定版本升级会下载
+官方 release checksum，先在临时 venv 验证并安装，最后原子切换；失败时旧版本仍可运行：
 
 ```bash
+sh install.sh --version 0.2.0
+sh install.sh --prefix "$HOME/tools/storybook" --no-init
+sh install.sh --dry-run                       # 严格零写入
+```
+
+维护者发布版本时推送 `v*` tag；release workflow 会先运行完整测试，再执行
+`scripts/build_release_assets.sh` 构建并验证固定文件名的 `storybook.tar.gz` 与
+`storybook.tar.gz.sha256`，随后发布到 GitHub Release。也可在本地安装 `build` 后执行
+`./scripts/build_release_assets.sh ./release-assets` 复现同一发布门禁。
+
+卸载程序文件时，删除安装 prefix 下的 `bin/book`、`bin/storybook` 和
+`lib/storybook` 即可。用户 Profile/记忆位于平台数据目录，不随程序升级或上述删除而
+清除；如确实要删除数据，使用 `book uninstall --purge-data` 的显式双重确认流程。
+
+开发者不想安装 release 也可直接跑模块：
+
+```bash
+uv venv .venv
+VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .
 PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 ```
 
 ### 一键 setup 与安全卸载
 
-`storybook setup` 会先展示完整改动计划，再创建用户级 Profile/schema、检测并接入
+`book init` 会先展示完整改动计划，再创建用户级 Profile/schema、检测并接入
 Claude Code、Cursor、Codex。Ollama 推荐 preset 会检查/下载本地 embedding 模型；自定义 API 不会调用 Ollama 的 tags/pull 接口。最后执行 schema、embedding、
 adapter、recall smoke test。三类 Agent 都复用同一个 `storybook mcp` stdio server；Claude
 Code 还会安装幂等的 `SessionStart` recall hook。无需手工编辑 JSON/TOML。
 
 ```bash
-storybook setup                         # 交互确认
-storybook setup --yes                   # 非交互安装
-storybook setup --dry-run               # 严格零写入（不建目录/DB、不下载模型）
-storybook setup --json                  # 结构化结果，便于自动化
-storybook setup --agent codex --yes     # 可重复 --agent，覆盖自动检测
-storybook setup --skip-models --yes     # 离线跳过缺失模型，状态为 degraded
-storybook setup --yes --embedding-preset ollama
-storybook setup --yes --embedding-preset custom \
+book init                               # 交互确认
+book init --yes                         # 非交互安装
+book init --dry-run                     # 严格零写入（不建目录/DB、不下载模型）
+book init --json                        # 结构化结果，便于自动化
+book init --agent codex --yes           # 可重复 --agent，覆盖自动检测
+book init --enable-schedule --yes       # 生成用户级 watch service（无需 sudo）
+book init --skip-models --yes           # 离线跳过缺失模型，状态为 degraded
+book init --yes --embedding-preset ollama
+book init --yes --embedding-preset custom \
   --embedding-base-url https://embedding.example/v1 \
   --embedding-model your-model --embedding-dimension 1024 \
   --embedding-version your-model-v1 \

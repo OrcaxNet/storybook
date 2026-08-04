@@ -1,6 +1,7 @@
 """一键 setup / uninstall 编排。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -45,9 +46,24 @@ class SetupError(RuntimeError):
 def default_launcher() -> Launcher:
     """优先使用安装后的 console script，源码运行时回退到 ``python -m``。"""
 
-    executable = shutil.which("storybook")
+    installer_launcher = os.environ.get("STORYBOOK_LAUNCHER", "").strip()
+    if installer_launcher:
+        candidate = os.path.abspath(os.path.expanduser(installer_launcher))
+        if Path(candidate).name in {"book", "storybook"} and os.access(
+            candidate, os.X_OK
+        ):
+            return Launcher(candidate)
+    invoked_as = os.path.abspath(sys.argv[0])
+    if Path(invoked_as).name in {"book", "storybook"} and os.access(
+        invoked_as, os.X_OK
+    ):
+        return Launcher(invoked_as)
+    executable = shutil.which("book") or shutil.which("storybook")
     if executable:
-        return Launcher(str(Path(executable).resolve()))
+        # Persist the stable user-facing shim (for example ~/.local/bin/book),
+        # not the content-addressed venv target behind its ``current`` symlink.
+        # Upgrades atomically retarget that shim without requiring setup again.
+        return Launcher(os.path.abspath(executable))
     return Launcher(sys.executable, ("-m", "storybook.cli"))
 
 
@@ -211,7 +227,7 @@ class SetupManager:
         return self.roots.state / "setup-state.json"
 
     def _selected_names(self, requested: Iterable[str] | None) -> set[str]:
-        if requested:
+        if requested is not None:
             selected = set(requested)
             known = {adapter.name for adapter in self.adapters}
             unknown = selected - known
@@ -481,6 +497,51 @@ class SetupManager:
             for target in adapter["targets"]
         )
         return tuple(_FileSnapshot.capture(path) for path in sorted(paths, key=str))
+
+    @property
+    def schedule_path(self) -> Path:
+        if sys.platform == "darwin":
+            return self.home / "Library" / "LaunchAgents" / "com.storybook.watch.plist"
+        config_home = Path(
+            self.environ.get("XDG_CONFIG_HOME", str(self.home / ".config"))
+        ).expanduser()
+        return config_home / "systemd" / "user" / "storybook-watch.service"
+
+    def _write_schedule(self) -> dict[str, Any]:
+        """Write a user-owned, login-persistent watch definition without sudo."""
+
+        command = [self.launcher.command, *self.launcher.args, "process", "--watch"]
+        if sys.platform == "darwin":
+            import plistlib
+
+            payload = plistlib.dumps({
+                "Label": "com.storybook.watch",
+                "ProgramArguments": command,
+                "RunAtLoad": True,
+                "KeepAlive": True,
+                "StandardOutPath": str(config.LOG_DIR / "watch.log"),
+                "StandardErrorPath": str(config.LOG_DIR / "watch.log"),
+            })
+            activation = f"launchctl bootstrap gui/$(id -u) {self.schedule_path}"
+        else:
+            import shlex
+
+            exec_start = " ".join(shlex.quote(part) for part in command)
+            payload = (
+                "[Unit]\nDescription=Storybook memory watch\n\n"
+                "[Service]\nType=simple\n"
+                f"ExecStart={exec_start}\nRestart=on-failure\n\n"
+                "[Install]\nWantedBy=default.target\n"
+            ).encode("utf-8")
+            activation = "systemctl --user enable --now storybook-watch.service"
+        atomic_write(self.schedule_path, payload)
+        return {
+            "status": "configured",
+            "mode": "watch",
+            "path": str(self.schedule_path),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "activation_command": activation,
+        }
 
     @staticmethod
     def _rollback_transaction(
@@ -842,6 +903,7 @@ class SetupManager:
         download_models: bool = True,
         progress: Progress | None = None,
         provider_config: model_config.ModelConfig | None = None,
+        enable_schedule: bool = False,
     ) -> dict[str, Any]:
         plan = self.plan(requested_agents, provider_config=provider_config)
         selected = {
@@ -872,7 +934,9 @@ class SetupManager:
         backup_dir = self.roots.state / "setup-backups" / (
             datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
         )
-        snapshots = self._transaction_snapshots(plan)
+        snapshots = self._transaction_snapshots(plan) + (
+            (_FileSnapshot.capture(self.schedule_path),) if enable_schedule else ()
+        )
         adapter_results: list[dict[str, Any]] = []
         planned_changes = {
             item["adapter"]: bool(item["changed"]) for item in plan.adapters
@@ -896,6 +960,11 @@ class SetupManager:
                 )
                 if state.get("changed"):
                     adapter_states[adapter.name] = state
+            schedule = (
+                self._write_schedule()
+                if enable_schedule
+                else existing_state.get("schedule", {"status": "disabled"})
+            )
             state = {
                 "schema_version": STATE_SCHEMA_VERSION,
                 "installed_at": existing_state.get("installed_at", _utc_now()),
@@ -923,10 +992,11 @@ class SetupManager:
                     "api_key_env": config.EMBED_API_KEY_ENV,
                 },
                 "adapters": adapter_states,
+                "schedule": schedule,
             }
             phase = "state"
             self._write_state(state)
-        except Exception as exc:
+        except BaseException as exc:
             rollback_errors = self._rollback_transaction(snapshots, backup_dir)
             if rollback_errors:
                 raise SetupError(
@@ -934,6 +1004,10 @@ class SetupManager:
                     f"setup 失败且无法完整回滚: {'; '.join(rollback_errors)}",
                     hint="从 setup-backups 恢复配置并检查磁盘空间或目录权限",
                 ) from exc
+            if not isinstance(exc, Exception):
+                # KeyboardInterrupt/SystemExit must retain their native CLI
+                # semantics, but only after all managed writes are restored.
+                raise
             if phase == "state":
                 raise SetupError(
                     "SB_SETUP_STATE_WRITE_FAILED",
@@ -969,6 +1043,7 @@ class SetupManager:
             "legacy_databases": list(plan.legacy_databases),
             "degraded_reasons": degraded,
             "state_file": str(self.state_path),
+            "schedule": schedule,
         }
 
     def runtime_status(self) -> dict[str, Any]:
@@ -1183,6 +1258,26 @@ class SetupManager:
             results.append(result)
             drifted = drifted or result.get("status") == "drifted"
 
+        schedule_result = {"status": "not_configured"}
+        schedule_state = state.get("schedule", {})
+        if schedule_state.get("status") == "configured":
+            expected_path = self.schedule_path.resolve(strict=False)
+            saved_path = Path(str(schedule_state.get("path", ""))).resolve(strict=False)
+            if saved_path != expected_path:
+                drifted = True
+                schedule_result = {"status": "drifted"}
+            elif not expected_path.exists():
+                schedule_result = {"status": "missing"}
+            elif (
+                hashlib.sha256(expected_path.read_bytes()).hexdigest()
+                != schedule_state.get("sha256")
+            ):
+                drifted = True
+                schedule_result = {"status": "drifted"}
+            else:
+                expected_path.unlink()
+                schedule_result = {"status": "removed"}
+
         removed: list[str] = []
         if purge_data:
             removed = self._safe_purge(
@@ -1202,6 +1297,7 @@ class SetupManager:
             "status": "degraded" if drifted else "uninstalled",
             "data": "purged" if purge_data else "kept",
             "adapters": results,
+            "schedule": schedule_result,
             "removed": removed,
             "degraded_reasons": (
                 ["adapter config drift detected; setup state retained"] if drifted else []
