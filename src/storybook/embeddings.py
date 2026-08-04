@@ -37,16 +37,19 @@ def embed(
         try:
             from . import store
             state = store.get_embedding_index_state()
-            model = state.get("active_model") or config.EMBED_MODEL
+            active_model = state.get("active_model") or config.EMBED_MODEL
             active_provider = state.get("active_provider") or provider
             active_base_url = (state.get("active_base_url") or base_url).rstrip("/")
-            if active_provider != provider or active_base_url != base_url:
+            if (
+                active_provider != provider
+                or active_base_url != base_url
+                or active_model != config.EMBED_MODEL
+            ):
                 logger.error(
-                    "Embedding index provider mismatch active=%s configured=%s",
-                    active_provider,
-                    provider,
+                    "Embedding index configuration mismatch; refusing default embedding",
                 )
                 return None
+            model = active_model
             cache_version = (
                 cache_version or state.get("active_version") or config.EMBED_VERSION
             )
