@@ -25,6 +25,7 @@ mcp = [
 
 [project.scripts]
 storybook = "storybook.cli:cli"
+book = "storybook.cli:cli"
 
 [build-system]
 requires = ["setuptools>=68"]

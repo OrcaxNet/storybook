@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import requests
 
-from . import config, embeddings, health, search, store
+from . import config, embeddings, health, model_config, search, store
 from .profiles import PlatformRoots, ProfileError
 from .setup_adapters import (
     AdapterContext,
@@ -239,9 +239,16 @@ class SetupManager:
             if path.is_file() and path.resolve(strict=False) != current
         )
 
-    def plan(self, requested_agents: Iterable[str] | None = None) -> SetupPlan:
+    def plan(
+        self,
+        requested_agents: Iterable[str] | None = None,
+        *,
+        provider_config: model_config.ModelConfig | None = None,
+    ) -> SetupPlan:
         """只读生成完整计划；不得创建 Profile、目录或网络请求。"""
 
+        if provider_config is not None:
+            self._validate_embedding_index_compatibility(provider_config)
         selected = self._selected_names(requested_agents)
         adapter_plans: list[dict[str, Any]] = []
         try:
@@ -501,10 +508,20 @@ class SetupManager:
         return errors
 
     def _ensure_models(
-        self, *, download: bool, progress: Progress | None
+        self, *, download: bool, progress: Progress | None,
+        provider_config: model_config.ModelConfig | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        required = (config.EMBED_MODEL,)
-        if config.EMBED_ADAPTER != "ollama":
+        if provider_config is not None and provider_config.embedding.provider == "api":
+            return ([
+                {"name": provider_config.generation.model, "status": "remote"},
+                {"name": provider_config.embedding.model, "status": "remote"},
+            ], [])
+        required = tuple(dict.fromkeys(
+            (provider_config.generation.model, provider_config.embedding.model)
+            if provider_config is not None
+            else (config.EMBED_MODEL,)
+        ))
+        if provider_config is None and config.EMBED_ADAPTER != "ollama":
             # 通用 API 的模型生命周期由服务端管理；setup 不得调用
             # Ollama 的 tags/pull 端点。可用性由后续 embedding smoke 验证。
             return (
@@ -555,6 +572,96 @@ class SetupManager:
                 )
                 degraded.append(f"model download failed ({name}): {exc}")
         return results, degraded
+
+    def _probe_provider(self, value: model_config.ModelConfig) -> list[dict[str, Any]]:
+        """Verify generation and embedding using the declared wire protocol."""
+
+        generation = value.generation
+        embedding = value.embedding
+        generation_secret = self.environ.get(generation.credential_env or "")
+        embedding_secret = self.environ.get(embedding.credential_env or "")
+        if generation.provider == "api" and not generation_secret:
+            raise SetupError(
+                "SB_MODEL_CREDENTIALS_MISSING",
+                f"generation 环境变量 {generation.credential_env} 未设置",
+                hint="设置该环境变量后重试；密钥不会写入配置",
+            )
+        if embedding.provider == "api" and not embedding_secret:
+            raise SetupError(
+                "SB_MODEL_CREDENTIALS_MISSING",
+                f"embedding 环境变量 {embedding.credential_env} 未设置",
+                hint="设置该环境变量后重试；密钥不会写入配置",
+            )
+
+        def request(
+            kind: str, url: str, payload: dict, *, secret: str = ""
+        ) -> dict:
+            headers = {"Authorization": f"Bearer {secret}"} if secret else {}
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=8)
+                response.raise_for_status()
+                body = response.json()
+                if not isinstance(body, dict):
+                    raise ValueError("response must be object")
+                return body
+            except requests.exceptions.Timeout as exc:
+                raise SetupError("SB_MODEL_TIMEOUT", f"{kind} provider 请求超时") from exc
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                code = "SB_MODEL_AUTH_FAILED" if status in {401, 403} else f"SB_MODEL_{kind.upper()}_FAILED"
+                raise SetupError(code, f"{kind} provider 返回 HTTP {status}") from exc
+            except requests.exceptions.RequestException as exc:
+                raise SetupError("SB_MODEL_NETWORK_FAILED", f"{kind} provider 不可达") from exc
+            except (ValueError, TypeError) as exc:
+                raise SetupError(f"SB_MODEL_{kind.upper()}_FAILED", f"{kind} provider 响应无效") from exc
+
+        if generation.provider == "api":
+            gen = request(
+                "generation", f"{generation.base_url}/v1/chat/completions",
+                {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 4},
+                secret=generation_secret,
+            )
+            choices = gen.get("choices")
+            first_choice = choices[0] if isinstance(choices, list) and choices else None
+            message = first_choice.get("message") if isinstance(first_choice, dict) else None
+            if (
+                not isinstance(message, dict)
+                or not isinstance(message.get("content"), str)
+                or not message["content"].strip()
+            ):
+                raise SetupError("SB_MODEL_GENERATION_FAILED", "generation provider 未返回 choices")
+            embedded = request(
+                "embedding", f"{embedding.base_url}/v1/embeddings",
+                {"model": embedding.model, "input": "storybook setup probe"},
+                secret=embedding_secret,
+            )
+            rows = embedded.get("data")
+            first_row = rows[0] if isinstance(rows, list) and rows else None
+            vector = first_row.get("embedding") if isinstance(first_row, dict) else None
+        else:
+            gen = request(
+                "generation", f"{generation.base_url}/api/chat",
+                {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "stream": False},
+            )
+            if not isinstance(gen.get("message"), dict):
+                raise SetupError("SB_MODEL_GENERATION_FAILED", "Ollama generation 响应无效")
+            embedded = request(
+                "embedding", f"{embedding.base_url}/api/embeddings",
+                {"model": embedding.model, "prompt": "storybook setup probe"},
+            )
+            vector = embedded.get("embedding")
+        if not isinstance(vector, list):
+            raise SetupError("SB_MODEL_EMBEDDING_FAILED", "embedding provider 未返回向量")
+        if len(vector) != config.EMBED_DIM:
+            raise SetupError(
+                "SB_MODEL_EMBED_DIM_MISMATCH",
+                f"embedding 维度为 {len(vector)}，索引要求 {config.EMBED_DIM}",
+                hint="选择兼容模型或重建明确维度的索引；禁止静默混用",
+            )
+        return [
+            {"name": "generation", "ok": True, "detail": f"provider={generation.provider}; model={generation.model}"},
+            {"name": "embedding-provider", "ok": True, "detail": f"provider={embedding.provider}; model={embedding.model}; dimension={len(vector)}"},
+        ]
 
     @staticmethod
     def _schema_smoke() -> tuple[bool, str]:
@@ -653,21 +760,106 @@ class SetupManager:
             })
         return result
 
+    def _validate_embedding_index_compatibility(
+        self, value: model_config.ModelConfig
+    ) -> None:
+        """Reject provider drift before setup performs any write.
+
+        The serving vec0 rows are one immutable embedding space.  Changing the
+        Profile endpoint without rebuilding that index would make runtime
+        requests use a provider/model that does not match the stored vectors.
+        """
+
+        profile = config.PROFILE_REGISTRY.peek_active_profile()
+        if profile is None:
+            return
+        database = config.PROFILE_REGISTRY.paths_for(profile).database
+        if not database.is_file():
+            return
+        try:
+            db = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            try:
+                table = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embedding_index_state'"
+                ).fetchone()
+                if table is None:
+                    return
+                row = db.execute(
+                    "SELECT * FROM embedding_index_state WHERE id = 1"
+                ).fetchone()
+            finally:
+                db.close()
+        except sqlite3.Error as exc:
+            raise SetupError(
+                "SB_MODEL_INDEX_STATE_INVALID",
+                "无法只读检查 active embedding index",
+                hint="运行 `storybook doctor` 修复数据库后重试",
+            ) from exc
+        if row is None:
+            return
+
+        fields = set(row.keys())
+        current = config.MODEL_CONFIG.embedding
+        active = {
+            "provider": (
+                row["active_provider"]
+                if "active_provider" in fields and row["active_provider"]
+                else current.provider
+            ),
+            "base_url": (
+                row["active_base_url"]
+                if "active_base_url" in fields and row["active_base_url"]
+                else current.base_url
+            ).rstrip("/"),
+            "model": row["active_model"],
+            "version": row["active_version"],
+        }
+        candidate = value.embedding
+        if (
+            active["provider"] == candidate.provider
+            and active["base_url"] == candidate.base_url.rstrip("/")
+            and active["model"] == candidate.model
+        ):
+            return
+        raise SetupError(
+            "SB_MODEL_INDEX_INCOMPATIBLE",
+            (
+                "目标 embedding provider/model 与 active index 不兼容："
+                f"active={active['provider']}/{active['model']}@{active['version']}，"
+                f"target={candidate.provider}/{candidate.model}"
+            ),
+            hint=(
+                "保持当前配置，或运行 `storybook profile create provider-migration "
+                "--switch` 创建隔离 Profile 并重新执行 setup；禁止在旧索引上静默切换"
+            ),
+        )
+
     def execute(
         self,
         *,
         requested_agents: Iterable[str] | None = None,
         download_models: bool = True,
         progress: Progress | None = None,
+        provider_config: model_config.ModelConfig | None = None,
     ) -> dict[str, Any]:
-        plan = self.plan(requested_agents)
+        plan = self.plan(requested_agents, provider_config=provider_config)
         selected = {
             item["adapter"] for item in plan.adapters if item["selected"]
         }
-        # 受管 state 决定升级与卸载恢复行为，必须在任何 Profile/DB 写入前校验。
+        # Provider/index compatibility and managed state must be validated
+        # before Profile, config, database, or adapter writes.
         existing_state = self._load_state() or {}
+        if provider_config is not None and provider_config.generation.provider == "api":
+            # Validate remote credentials and both capabilities before any write.
+            provider_smoke = self._probe_provider(provider_config)
+        else:
+            provider_smoke = []
         try:
             config.refresh_profile(create=True)
+            if provider_config is not None:
+                model_config.save(config.MODEL_CONFIG_PATH, provider_config)
+                config.refresh_model_config(environ=dict(self.environ))
             store.init_db()
         except Exception as exc:  # noqa: BLE001
             raise SetupError(
@@ -752,9 +944,12 @@ class SetupManager:
             raise SetupError(code, str(exc), hint="配置与旧 setup state 已回滚；修复后重试") from exc
 
         models, degraded = self._ensure_models(
-            download=download_models, progress=progress
+            download=download_models, progress=progress, provider_config=provider_config
         )
+        if provider_config is not None and provider_config.generation.provider == "ollama" and not degraded:
+            provider_smoke = self._probe_provider(provider_config)
         smoke = self._smoke_tests(selected)
+        smoke = provider_smoke + smoke
         failed_smoke = [test["name"] for test in smoke if not test["ok"]]
         degraded.extend(f"smoke failed: {name}" for name in failed_smoke)
         status = "ready" if not degraded else "degraded"
@@ -769,6 +964,7 @@ class SetupManager:
             "adapters": adapter_results,
             "history_ingestion": self._history_ingestion_status(selected),
             "models": models,
+            "model_config": config.MODEL_CONFIG.public_dict(self.environ),
             "smoke_tests": smoke,
             "legacy_databases": list(plan.legacy_databases),
             "degraded_reasons": degraded,
@@ -804,7 +1000,7 @@ class SetupManager:
             }
             sync_state = profile.sync_state
 
-        llm_ready = bool(config.LLM_API_KEY)
+        llm_ready = config.LLM_PROVIDER == "ollama" or bool(config.LLM_API_KEY)
         llm_payload = {
             "provider": config.LLM_PROVIDER,
             "name": config.LLM_MODEL,

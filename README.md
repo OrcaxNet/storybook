@@ -21,7 +21,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
 - 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/lexical/fusion/transform/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 与离线策略消融同时守护质量/时延
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
-- 🏠 **本地优先**：Profile、原始证据、数据库与 embedding 留在本机；云端生成调用可明确门控并快速降级
+- 🏠 **本地优先**：Profile、原始证据与数据库留在本机；embedding 默认走本地 Ollama，选择远程 API 时会明确披露文本离机；云端调用均可快速降级
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
 - 🌅 **晨间简报**：会话启动时基于 cwd / 首条提问**主动召回**相关记忆并注入上下文（`SessionStart` hook 或 `prime_context` MCP 工具），实现"下意识回忆"--更贴近初衷；token 预算内、相关度不足时**静默不注入**
 
@@ -81,6 +81,37 @@ storybook embedding-backfill --model qwen3-embedding:0.6b \
 - **DeepSeek API 凭据**：优先 `ANTHROPIC_AUTH_TOKEN`，兼容 `DEEPSEEK_KEY`；默认读取 `~/.chrc/dpsk.sh`
 - **Ollama（推荐）**：本地 preset 默认为 `http://localhost:11434` + `qwen3-embedding:0.6b` + 1024 维。旧 `OLLAMA_HOST` / `STORYBOOK_EMBED_MODEL` 会自动映射，无需重建现有索引
 - **自定义 API（可选）**：设置 `STORYBOOK_EMBED_ADAPTER=openai_compatible`、base URL、model、dimension；凭据只通过 `STORYBOOK_EMBED_API_KEY_ENV` 引用环境变量
+
+### 模型 Provider setup
+
+`book` 与 `storybook` 是等价命令。新安装会在 active Profile 内写入版本化的
+`model-config.json`，generation 与 embedding 可分别诊断；文件只保存 credential
+环境变量名，绝不保存密钥。
+
+```bash
+# 本地 Ollama：探测服务，按需拉取 generation/embedding 模型
+book setup --provider ollama --llm-model qwen3:8b \
+  --embedding-model qwen3-embedding:0.6b
+
+# OpenAI-compatible API：明确使用 /v1/chat/completions 与 /v1/embeddings
+export STORYBOOK_API_KEY='...'
+book setup --provider api --base-url https://gateway.example \
+  --llm-model chat-model --embedding-model embedding-model \
+  --api-key-env STORYBOOK_API_KEY
+```
+
+外部 embedding 必须返回当前 Profile 配置的 `STORYBOOK_EMBED_DIM` 维度，否则
+setup/doctor 会报告 dimension mismatch。base URL 中的 userinfo、query 和 fragment
+会被拒绝，doctor/status/JSON 输出不会包含 credential 值或 Authorization header。
+未生成 Profile 配置的旧安装继续按“Profile 配置 > 旧环境变量 > 默认值”的优先级
+只读解析 `ANTHROPIC_*`、`DEEPSEEK_KEY`、`OLLAMA_HOST` 与
+`STORYBOOK_EMBED_MODEL`，无需迁移现有数据。
+
+已有 Profile 的 active 向量索引会持久化 provider、base URL、model 与 version
+身份。setup 若检测到目标 embedding space 不兼容，会在任何写入和网络探测前以
+`SB_MODEL_INDEX_INCOMPATIBLE` 失败；可保持原配置，或先运行
+`storybook profile create provider-migration --switch` 创建隔离 Profile 后重新
+setup。不同 provider/base URL 即使模型同名，也不会共享 inference/query cache。
 - 依赖：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
 
 ```bash
@@ -601,7 +632,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic-compatible Base URL |
 | `ANTHROPIC_AUTH_TOKEN` / `DEEPSEEK_KEY` | 无 | API key 与兼容回退变量；不会写入日志/status |
 | `STORYBOOK_LLM_MODEL` | `deepseek-v4-flash` | 生成模型；其次读取 `ANTHROPIC_DEFAULT_HAIKU_MODEL` |
-| `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
+| `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型；输出维度必须与 `STORYBOOK_EMBED_DIM` 一致 |
 | `STORYBOOK_EMBED_DIM` | `1024` | API 响应必须匹配的向量维度 |
 | `STORYBOOK_EMBED_VERSION` | `story-v2-default-v1` | 活跃表示的不可变版本标识 |
 | `STORYBOOK_EMBED_REPRESENTATION` | `default` | 默认 `title + abstract + applicability` |
@@ -658,7 +689,7 @@ storybook/
 │   ├── store.py        # SQLite + sqlite-vec 存储层
 │   ├── processor.py    # 做梦周期（dream cycle）
 │   ├── llm.py          # DeepSeek Anthropic-compatible Messages API
-│   ├── embeddings.py   # Ollama embedding 调用
+│   ├── embeddings.py   # 统一 embedding API 与 Ollama/OpenAI-compatible adapter
 │   ├── search.py       # 版本化缓存 + 向量/词法降级 + 关联激活
 │   ├── query_cache.py  # index_version 隔离的向量/结果 LRU+TTL 缓存
 │   ├── feedback.py     # access_count/边权异步反馈队列
@@ -679,7 +710,7 @@ storybook/
 
 ## 📝 说明
 
-- **隐私边界**：Profile、数据库、原始证据和 embedding 均留在本机；生成式操作会把其 prompt 发送到 DeepSeek，Fast 查询不会。
+- **隐私边界**：Profile、数据库与原始证据留在本机；本地 Ollama preset 不发送文本离机，远程 embedding/generation API 会接收各自请求文本并在 setup/status 中披露；Fast 查询不调用生成式 LLM。
 - **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖真实 provider（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
 - **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「🔌 MCP 接入」）。
 - **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / embedding API 不可用时静默不注入（见上文「🌅 会话启动注入」）。

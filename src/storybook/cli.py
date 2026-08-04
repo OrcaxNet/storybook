@@ -47,6 +47,7 @@ from . import (
     dreamd,
     embeddings,
     health,
+    model_config,
     migration as migration_module,
     perf_benchmark,
     performance,
@@ -146,18 +147,27 @@ def _print_setup_plan(plan: dict) -> None:
     "--embedding-api-key-env",
     help="凭据所在的环境变量名（不接受明文凭据）",
 )
-@click.option("--skip-models", is_flag=True, help="不下载缺失模型并进入 degraded")
+@click.option("--provider", type=click.Choice(["ollama", "api"]), help="模型 provider")
+@click.option("--base-url", help="provider 根 URL（不得包含凭据或 query）")
+@click.option("--llm-model", help="generation 模型名")
+@click.option("--api-key-env", help="API key 所在环境变量名；只保存变量名")
+@click.option("--skip-models", "--skip-download", is_flag=True,
+              help="不下载缺失 Ollama 模型并进入 degraded")
 def setup_command(
-    assume_yes, dry_run, as_json, agents, embedding_preset,
-    embedding_base_url, embedding_model, embedding_dimension, embedding_version,
-    embedding_api_key_env, skip_models,
+    assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
+    embedding_model, api_key_env, embedding_preset, embedding_base_url,
+    embedding_dimension, embedding_version, embedding_api_key_env, skip_models,
 ):
     """一键建立用户级存储、Agent 接入并执行端到端自检。"""
 
     embedding_options = (
-        embedding_base_url, embedding_model, embedding_dimension,
-        embedding_version, embedding_api_key_env,
+        embedding_base_url, embedding_dimension, embedding_version,
+        embedding_api_key_env,
     )
+    if embedding_preset and provider:
+        raise click.UsageError(
+            "--embedding-preset and --provider are alternative setup interfaces"
+        )
     if not embedding_preset and any(value is not None for value in embedding_options):
         raise click.UsageError("embedding 详细选项需与 --embedding-preset 同用")
     if embedding_preset:
@@ -174,12 +184,76 @@ def setup_command(
             raise click.UsageError(str(exc)) from exc
 
     manager = SetupManager()
+    model_options_supplied = not embedding_preset and any(
+        value is not None
+        for value in (provider, base_url, llm_model, embedding_model, api_key_env)
+    )
+    interactive = (
+        not assume_yes
+        and not as_json
+        and click.get_text_stream("stdin").isatty()
+    )
+    if provider is None and interactive:
+        provider = click.prompt(
+            "Model provider", type=click.Choice(["ollama", "api"]), default="ollama"
+        )
+        model_options_supplied = True
+    selected_model_config = None
+    provider = provider or "ollama"
+    if interactive and model_options_supplied:
+        if not base_url:
+            base_url = click.prompt(
+                "API base URL" if provider == "api" else "Ollama base URL",
+                default=(None if provider == "api" else model_config.DEFAULT_OLLAMA_URL),
+            )
+        if not llm_model:
+            llm_model = click.prompt(
+                "Generation model",
+                default=(None if provider == "api" else model_config.DEFAULT_LLM_MODEL),
+            )
+        if not embedding_model:
+            embedding_model = click.prompt(
+                "Embedding model",
+                default=(None if provider == "api" else model_config.DEFAULT_EMBED_MODEL),
+            )
+        if provider == "api" and not api_key_env:
+            api_key_env = click.prompt(
+                "API key environment variable", default="STORYBOOK_API_KEY"
+            )
+    if model_options_supplied and provider == "api" and not base_url:
+        _emit_setup_error(
+            SetupError("SB_MODEL_BASE_URL_REQUIRED", "api provider 需要 --base-url"),
+            as_json=as_json,
+        )
+        return
+    if model_options_supplied:
+        try:
+            selected_model_config = model_config.build(
+                provider=provider,
+                base_url=base_url,
+                llm_model=llm_model,
+                embedding_model=embedding_model,
+                api_key_env=api_key_env or ("STORYBOOK_API_KEY" if provider == "api" else None),
+            )
+        except model_config.ModelConfigError as exc:
+            _emit_setup_error(SetupError("SB_MODEL_CONFIG_INVALID", str(exc)), as_json=as_json)
+            return
     try:
-        plan = manager.plan(agents or None).as_dict()
+        plan = manager.plan(
+            agents or None, provider_config=selected_model_config
+        ).as_dict()
     except SetupError as exc:
         _emit_setup_error(exc, as_json=as_json)
         return
 
+    plan["model_config"] = (
+        selected_model_config or config.MODEL_CONFIG
+    ).public_dict(os.environ)
+    if selected_model_config is not None:
+        plan["models"] = list(dict.fromkeys((
+            selected_model_config.generation.model,
+            selected_model_config.embedding.model,
+        )))
     if dry_run:
         payload = {"status": "dry_run", "plan": plan, "writes_performed": 0}
         if as_json:
@@ -211,6 +285,7 @@ def setup_command(
             requested_agents=agents or None,
             download_models=not skip_models,
             progress=progress,
+            provider_config=selected_model_config,
         )
     except SetupError as exc:
         _emit_setup_error(exc, as_json=as_json)

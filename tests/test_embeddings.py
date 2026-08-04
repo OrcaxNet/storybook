@@ -19,6 +19,8 @@ class _Response:
 
 
 def test_embed_sends_keep_alive_and_bounded_http_timeout(monkeypatch):
+    from storybook import store
+
     captured = {}
 
     def fake_post(url, *, json, timeout):
@@ -31,7 +33,8 @@ def test_embed_sends_keep_alive_and_bounded_http_timeout(monkeypatch):
     )
 
     assert result == basis(0)
-    assert captured["url"] == f"{config.OLLAMA_HOST}/api/embeddings"
+    active_endpoint = store.get_embedding_index_state()["active_endpoint"]
+    assert captured["url"] == f"{active_endpoint}/api/embeddings"
     assert captured["json"] == {
         "model": config.EMBED_MODEL,
         "prompt": "query",
@@ -56,8 +59,8 @@ def test_prewarm_uses_cold_budget_and_configured_keep_alive(monkeypatch):
     assert captured["keep_alive"] == config.EMBED_KEEP_ALIVE
 
 
-def test_default_embed_uses_active_serving_model_during_config_switch(monkeypatch):
-    """Changing target config must not mix query vectors into the old index."""
+def test_default_embed_keeps_active_model_during_configured_model_drift(monkeypatch):
+    """Target model drift must not interrupt the still-active serving index."""
 
     from storybook import store
 
@@ -66,17 +69,40 @@ def test_default_embed_uses_active_serving_model_during_config_switch(monkeypatc
 
     def fake_post(url, *, json, timeout):
         captured.update(json)
-        captured["url"] = url
         return _Response()
 
+    monkeypatch.setattr(embeddings.requests, "post", fake_post)
+    monkeypatch.setattr(config, "EMBED_MODEL", "future-target-model")
+
+    assert embeddings.embed("query") == basis(0)
+    assert captured["model"] == active_model
+
+
+def test_explicit_shadow_model_remains_available_during_config_switch(monkeypatch):
+    """Backfill may explicitly embed with the target model before activation."""
+
+    captured = {}
+
+    class Response(_Response):
+        def json(self):
+            return {"data": [{"embedding": basis(0)}]}
+
+    def fake_post(url, *, json, timeout):
+        captured.update(json)
+        captured["url"] = url
+        return Response()
+
+    monkeypatch.setattr(embeddings.inference_cache, "get", lambda *args: None)
+    monkeypatch.setattr(embeddings.inference_cache, "set", lambda *args: None)
     monkeypatch.setattr(embeddings.requests, "post", fake_post)
     monkeypatch.setattr(config, "EMBED_MODEL", "future-target-model")
     monkeypatch.setattr(config, "EMBED_BASE_URL", "https://endpoint-b.example/v1")
     monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
 
-    assert embeddings.embed("query") == basis(0)
-    assert captured["model"] == active_model
-    assert captured["url"] == f"{config.OLLAMA_HOST}/api/embeddings"
+    assert embeddings.embed(
+        "query", model="future-target-model", cache_version="future-v"
+    ) == basis(0)
+    assert captured["model"] == "future-target-model"
 
 
 def test_endpoint_switch_uses_active_credentials_until_atomic_activation(monkeypatch):

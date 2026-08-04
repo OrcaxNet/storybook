@@ -837,6 +837,51 @@ def test_setup_cli_selects_and_persists_custom_api(tmp_path):
     assert embedding["config_source"] == "setup_selection"
 
 
+def test_single_embedding_env_override_preserves_persisted_custom_fields(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    env = os.environ.copy()
+    env.update({
+        "STORYBOOK_HOME": str(storybook_home),
+        "HOME": str(tmp_path / "home"),
+        "PATH": "",
+        "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+    })
+    for name in tuple(env):
+        if name.startswith("STORYBOOK_EMBED_") or name == "OLLAMA_HOST":
+            env.pop(name)
+
+    selected = subprocess.run(
+        [
+            sys.executable, "-m", "storybook.cli", "setup", "--yes", "--json",
+            "--skip-models", "--embedding-preset", "custom",
+            "--embedding-base-url", "https://embed.example/v1",
+            "--embedding-model", "persisted-model",
+            "--embedding-dimension", "2",
+            "--embedding-version", "persisted-v1",
+            "--embedding-api-key-env", "EMBED_TOKEN",
+        ],
+        cwd=Path(__file__).parents[1], env=env, text=True,
+        capture_output=True, check=False,
+    )
+    assert selected.returncode == 0, selected.stderr
+
+    override_env = {**env, "STORYBOOK_EMBED_MODEL": "override-model"}
+    restored = subprocess.run(
+        [sys.executable, "-m", "storybook.cli", "setup", "--dry-run", "--json"],
+        cwd=Path(__file__).parents[1], env=override_env, text=True,
+        capture_output=True, check=False,
+    )
+
+    assert restored.returncode == 0, restored.stderr
+    embedding = json.loads(restored.stdout)["plan"]["embedding"]
+    assert embedding["preset"] == "custom"
+    assert embedding["adapter"] == "openai_compatible"
+    assert embedding["base_url"] == "https://embed.example/v1"
+    assert embedding["model"] == "override-model"
+    assert embedding["dimension"] == 2
+    assert embedding["version"] == "persisted-v1"
+
+
 def test_setup_rejects_plaintext_credential_before_any_write(tmp_path):
     storybook_home = tmp_path / "storybook-home"
     env = os.environ.copy()

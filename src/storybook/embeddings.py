@@ -58,6 +58,7 @@ def _request_embedding(
     base_url: str | None = None,
     adapter: str | None = None,
     api_key_env: str | None = None,
+    api_key_value: str | None = None,
 ) -> list[float]:
     request_base_url = (base_url or config.EMBED_BASE_URL).rstrip("/")
     request_adapter = adapter or config.EMBED_ADAPTER
@@ -71,6 +72,8 @@ def _request_embedding(
                 f"credential environment variable {credential_env} is missing",
             )
         headers["Authorization"] = f"Bearer {credential}"
+    elif api_key_value:
+        headers["Authorization"] = f"Bearer {api_key_value}"
 
     if request_adapter == "ollama":
         url = f"{request_base_url}/api/embeddings"
@@ -78,7 +81,11 @@ def _request_embedding(
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
     else:
-        url = f"{request_base_url}/embeddings"
+        api_root = (
+            request_base_url if request_base_url.endswith("/v1")
+            else f"{request_base_url}/v1"
+        )
+        url = f"{api_root}/embeddings"
         payload = {"model": model, "input": text}
 
     try:
@@ -145,6 +152,21 @@ def probe() -> dict[str, object]:
     return {"ok": True, "reason": None, "dimension": actual}
 
 
+def serving_index_matches_config(state: dict) -> bool:
+    """Return whether the active serving route is complete and usable.
+
+    Target configuration drift is diagnosed separately; queries intentionally
+    keep using this active route until shadow activation.
+    """
+
+    return bool(
+        state.get("active_model")
+        and (state.get("active_endpoint") or state.get("active_base_url"))
+        and (state.get("active_adapter") or state.get("active_provider"))
+        and state.get("active_dimension")
+    )
+
+
 def embed(
     text: str,
     model: str = None,
@@ -161,8 +183,14 @@ def embed(
     serving_request = model is None
     expected_dimension = config.EMBED_DIM
     request_base_url = config.EMBED_BASE_URL
-    request_adapter = config.EMBED_ADAPTER
+    request_adapter = (
+        "openai_compatible"
+        if config.EMBED_PROVIDER == "api"
+        or config.EMBED_ADAPTER == "openai_compatible"
+        else "ollama"
+    )
     request_api_key_env = config.EMBED_API_KEY_ENV
+    request_api_key_value = config.EMBED_API_KEY if not serving_request else None
     if serving_request:
         try:
             from . import store
@@ -193,6 +221,7 @@ def embed(
             request_base_url = config.EMBED_BASE_URL
             request_adapter = config.EMBED_ADAPTER
             request_api_key_env = config.EMBED_API_KEY_ENV
+            request_api_key_value = config.EMBED_API_KEY
     cache_version = cache_version or config.EMBED_VERSION
     cache_payload = {
         **api_identity(
@@ -217,6 +246,7 @@ def embed(
             base_url=request_base_url,
             adapter=request_adapter,
             api_key_env=request_api_key_env,
+            api_key_value=request_api_key_value,
         )
         if not vec or len(vec) != expected_dimension:
             logger.warning(
@@ -233,8 +263,13 @@ def embed(
         inference_cache.set("embedding-v1", cache_payload, result)
         mark_model_used()
         return result
-    except Exception as e:
-        logger.error("Embedding 失败: %s", e)
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error(
+            "Embedding failed provider=%s category=%s",
+            config.EMBED_PROVIDER,
+            f"http_{status}" if status else type(exc).__name__,
+        )
         return None
 
 
@@ -292,7 +327,11 @@ def backfill(
     from . import store
     from . import story_v2
 
-    store.begin_embedding_backfill(model, version, representation)
+    store.begin_embedding_backfill(
+        model, version, representation,
+        provider=config.EMBED_PROVIDER,
+        base_url=config.EMBED_BASE_URL,
+    )
     pending = store.stories_pending_embedding_backfill(
         version,
         representation,
@@ -315,6 +354,8 @@ def backfill(
                 representation=representation,
                 content_hash=story["target_content_hash"],
                 embedding=vector,
+                provider=config.EMBED_PROVIDER,
+                base_url=config.EMBED_BASE_URL,
             )
         else:
             failed += 1
@@ -326,6 +367,8 @@ def backfill(
                 content_hash=story["target_content_hash"],
                 embedding=None,
                 error="embedding unavailable or dimension mismatch",
+                provider=config.EMBED_PROVIDER,
+                base_url=config.EMBED_BASE_URL,
             )
 
     progress = store.embedding_backfill_progress(version, representation)
@@ -335,6 +378,8 @@ def backfill(
             model=model,
             version=version,
             representation=representation,
+            provider=config.EMBED_PROVIDER,
+            base_url=config.EMBED_BASE_URL,
         )
     elif progress["pending"] == 0:
         store.mark_embedding_backfill_ready()

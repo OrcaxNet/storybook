@@ -60,17 +60,34 @@ _result_cache = _TTLCache[dict](
 )
 
 
-def index_identity(index_version: int) -> tuple:
+def index_identity(
+    index_version: int, *, embedding_spec: dict | None = None
+) -> tuple:
     """绝对路径仅作为进程内隔离 key，不进入响应或诊断日志。"""
 
+    spec = embedding_spec or {}
     return (
         str(config.DB_PATH.resolve()),
         int(index_version),
         config.EMBED_TYPE,
-        config.EMBED_BASE_URL,
-        config.EMBED_ADAPTER,
-        config.EMBED_MODEL,
-        config.EMBED_VERSION,
+        str(
+            spec.get("active_endpoint")
+            or spec.get("active_base_url")
+            or config.EMBED_BASE_URL
+        ).rstrip("/"),
+        str(
+            spec.get("active_adapter")
+            or spec.get("active_provider")
+            or config.EMBED_ADAPTER
+        ),
+        str(
+            config.EMBED_API_KEY_ENV
+            if spec.get("active_api_key_env") is None
+            else spec["active_api_key_env"]
+        ),
+        str(spec.get("active_model") or config.EMBED_MODEL),
+        str(spec.get("active_version") or config.EMBED_VERSION),
+        int(spec.get("active_dimension") or config.EMBED_DIM),
     )
 
 

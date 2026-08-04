@@ -231,6 +231,45 @@ class TestFastPathCache:
         assert result["query_vector_cache_hit"] is True
         assert fake_embedder.calls == ["q"]
 
+    @pytest.mark.parametrize(
+        "config_field", ["EMBED_PROVIDER", "EMBED_BASE_URL", "EMBED_MODEL"]
+    )
+    def test_target_spec_drift_keeps_active_result_and_vector_caches(
+        self, fake_embedder, monkeypatch, config_field
+    ):
+        story_id = store.add_story(
+            "cache drift recovery phrase", "lexical fallback", [], basis(0)
+        )
+        fake_embedder.register("cache drift recovery phrase", basis(0))
+        original_value = getattr(config, config_field)
+        drifted_value = {
+            "EMBED_PROVIDER": "api" if original_value != "api" else "ollama",
+            "EMBED_BASE_URL": f"{original_value.rstrip('/')}/different",
+            "EMBED_MODEL": f"{original_value}-different",
+        }[config_field]
+
+        initial = search_module.search("cache drift recovery phrase", top_k=1)
+        assert initial["mode"] == "vector"
+
+        def unexpected_call(*args, **kwargs):
+            raise AssertionError(
+                "active query vector should remain cached during target drift"
+            )
+
+        monkeypatch.setattr(config, config_field, drifted_value)
+        monkeypatch.setattr(embeddings, "embed", unexpected_call)
+
+        cached = search_module.search("cache drift recovery phrase", top_k=1)
+        assert cached["mode"] == "cache"
+        assert cached["top_matches"][0]["story_id"] == story_id
+
+        active_vector = search_module.search(
+            "cache drift recovery phrase", top_k=2
+        )
+        assert active_vector["mode"] == "vector"
+        assert active_vector["query_vector_cache_hit"] is True
+        assert active_vector["top_matches"][0]["story_id"] == story_id
+
     def test_feedback_writes_do_not_invalidate_retrieval_cache(self, fake_embedder):
         story_id = _seed("A", basis(0))
         fake_embedder.register("q", basis(0))
