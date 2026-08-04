@@ -64,6 +64,10 @@ class TestQueryDiagnostics:
     def test_status_performance_json(self, monkeypatch):
         registry_path = config.PROFILE_REGISTRY.path
         assert not registry_path.exists()
+        # This test exercises diagnostics serialization, not credential
+        # discovery. Pin a ready local generation provider so the expected
+        # degraded reasons are independent of the host environment.
+        monkeypatch.setattr(config, "LLM_PROVIDER", "ollama")
         monkeypatch.setattr(
             "storybook.setup_manager.health._check_ollama_reachable",
             lambda: (
