@@ -80,17 +80,24 @@ def cli(verbose):
 
 
 def _emit_setup_error(exc: SetupError, *, as_json: bool) -> None:
+    hint = exc.hint
+    if exc.code.startswith("SB_MODEL_") and "book doctor" not in (hint or ""):
+        hint = "; ".join(
+            item for item in (hint, "运行 `book doctor` 诊断 provider 后重试") if item
+        )
     if as_json:
+        error = exc.as_dict()
+        error["hint"] = hint
         click.echo(
             json.dumps(
-                {"status": "failed", "error": exc.as_dict()},
+                {"status": "failed", "error": error},
                 ensure_ascii=False,
                 indent=2,
             )
         )
         raise click.exceptions.Exit(1)
-    hint = f"\n修复建议: {exc.hint}" if exc.hint else ""
-    raise click.ClickException(f"[{exc.code}] {exc}{hint}") from exc
+    rendered_hint = f"\n修复建议: {hint}" if hint else ""
+    raise click.ClickException(f"[{exc.code}] {exc}{rendered_hint}") from exc
 
 
 def _print_setup_plan(plan: dict) -> None:
@@ -115,7 +122,7 @@ def _print_setup_plan(plan: dict) -> None:
         click.echo("            run: storybook migration run <path> --dry-run")
 
 
-@cli.command(name="setup")
+@cli.command(name="setup", hidden=True)
 @click.option("--yes", "assume_yes", is_flag=True, help="接受计划并非交互执行")
 @click.option("--dry-run", is_flag=True, help="只输出计划；零文件、数据库和网络写入")
 @click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
@@ -131,15 +138,39 @@ def _print_setup_plan(plan: dict) -> None:
 @click.option("--llm-model", help="generation 模型名")
 @click.option("--embedding-model", help="embedding 模型名（当前索引要求 1024 维）")
 @click.option("--api-key-env", help="API key 所在环境变量名；只保存变量名")
+@click.option("--enable-schedule", is_flag=True, help="配置用户级 watch schedule")
 @click.option("--skip-models", "--skip-download", is_flag=True,
               help="不下载缺失 Ollama 模型并进入 degraded")
 def setup_command(
     assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
-    embedding_model, api_key_env, skip_models,
+    embedding_model, api_key_env, enable_schedule, skip_models,
 ):
-    """一键建立用户级存储、Agent 接入并执行端到端自检。"""
+    """兼容 alias；canonical onboarding 命令为 ``book init``。"""
+
+    return _run_onboarding(
+        assume_yes=assume_yes,
+        dry_run=dry_run,
+        as_json=as_json,
+        agents=agents,
+        provider=provider,
+        base_url=base_url,
+        llm_model=llm_model,
+        embedding_model=embedding_model,
+        api_key_env=api_key_env,
+        enable_schedule=enable_schedule,
+        skip_models=skip_models,
+        full_onboarding=False,
+    )
+
+
+def _run_onboarding(
+    *, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
+    embedding_model, api_key_env, enable_schedule, skip_models, full_onboarding,
+):
+    """Shared, rerunnable implementation for ``book init`` and setup alias."""
 
     manager = SetupManager()
+    agents = tuple(agents) if agents else None
     model_options_supplied = any(
         value is not None
         for value in (provider, base_url, llm_model, embedding_model, api_key_env)
@@ -149,6 +180,14 @@ def setup_command(
         and not as_json
         and click.get_text_stream("stdin").isatty()
     )
+    if interactive and full_onboarding:
+        active_profile = config.PROFILE_REGISTRY.peek_active_profile()
+        if active_profile is None:
+            click.echo("Profile: create default (local-only)")
+        else:
+            click.echo(
+                f"Profile: reuse {active_profile.display_name} ({active_profile.id})"
+            )
     if provider is None and interactive:
         provider = click.prompt(
             "Model provider", type=click.Choice(["ollama", "api"]), default="ollama"
@@ -176,6 +215,49 @@ def setup_command(
             api_key_env = click.prompt(
                 "API key environment variable", default="STORYBOOK_API_KEY"
             )
+    if interactive and full_onboarding and not agents:
+        agent_answer = click.prompt(
+            "Agent adapters (auto, skip, back, or comma-separated names)",
+            default="auto",
+        ).strip()
+        if agent_answer.lower() == "back":
+            return _run_onboarding(
+                assume_yes=False, dry_run=False, as_json=False, agents=None,
+                provider=None, base_url=None, llm_model=None,
+                embedding_model=None, api_key_env=None, enable_schedule=False,
+                skip_models=skip_models, full_onboarding=True,
+            )
+        if agent_answer.lower() == "skip":
+            agents = ()
+        elif agent_answer.lower() != "auto":
+            parsed_agents = tuple(
+                item.strip().lower() for item in agent_answer.split(",") if item.strip()
+            )
+            unknown_agents = set(parsed_agents) - {"claude", "cursor", "codex"}
+            if unknown_agents:
+                _emit_setup_error(
+                    SetupError(
+                        "SB_SETUP_AGENT_UNKNOWN",
+                        f"未知 adapter: {', '.join(sorted(unknown_agents))}",
+                    ),
+                    as_json=as_json,
+                )
+                return
+            agents = parsed_agents
+    if interactive and full_onboarding and not enable_schedule:
+        schedule_answer = click.prompt(
+            "Schedule (skip, enable, back)",
+            type=click.Choice(["skip", "enable", "back"]),
+            default="skip",
+        )
+        if schedule_answer == "back":
+            return _run_onboarding(
+                assume_yes=False, dry_run=False, as_json=False, agents=None,
+                provider=None, base_url=None, llm_model=None,
+                embedding_model=None, api_key_env=None, enable_schedule=False,
+                skip_models=skip_models, full_onboarding=True,
+            )
+        enable_schedule = schedule_answer == "enable"
     if model_options_supplied and provider == "api" and not base_url:
         _emit_setup_error(
             SetupError("SB_MODEL_BASE_URL_REQUIRED", "api provider 需要 --base-url"),
@@ -196,7 +278,7 @@ def setup_command(
             return
     try:
         plan = manager.plan(
-            agents or None, provider_config=selected_model_config
+            agents, provider_config=selected_model_config
         ).as_dict()
     except SetupError as exc:
         _emit_setup_error(exc, as_json=as_json)
@@ -211,6 +293,10 @@ def setup_command(
             selected_model_config.embedding.model,
         )))
     if dry_run:
+        plan["schedule"] = {
+            "enabled": bool(enable_schedule),
+            "mode": "watch" if enable_schedule else "disabled",
+        }
         payload = {"status": "dry_run", "plan": plan, "writes_performed": 0}
         if as_json:
             click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -223,6 +309,21 @@ def setup_command(
         _print_setup_plan(plan)
     if not assume_yes and not as_json:
         click.confirm("Apply this plan?", abort=True)
+
+    temporary_secret = None
+    secret_marker = object()
+    previous_secret = secret_marker
+    if (
+        interactive
+        and provider == "api"
+        and api_key_env
+        and not manager.environ.get(api_key_env)
+    ):
+        temporary_secret = click.prompt(
+            "API key (used for this run only)", hide_input=True
+        )
+        previous_secret = manager.environ.get(api_key_env, secret_marker)
+        manager.environ[api_key_env] = temporary_secret
 
     def progress(event: dict) -> None:
         if as_json:
@@ -237,16 +338,32 @@ def setup_command(
         click.echo(f"  Model     {model}: {status}{suffix}")
 
     try:
-        result = manager.execute(
-            requested_agents=agents or None,
-            download_models=not skip_models,
-            progress=progress,
-            provider_config=selected_model_config,
-        )
-    except SetupError as exc:
-        _emit_setup_error(exc, as_json=as_json)
-        return
+        try:
+            result = manager.execute(
+                requested_agents=agents,
+                download_models=not skip_models,
+                progress=progress,
+                provider_config=selected_model_config,
+                enable_schedule=enable_schedule,
+            )
+        except SetupError as exc:
+            _emit_setup_error(exc, as_json=as_json)
+            return
+    finally:
+        if temporary_secret is not None:
+            if previous_secret is secret_marker:
+                manager.environ.pop(api_key_env, None)
+            else:
+                manager.environ[api_key_env] = previous_secret
 
+    recall = next(
+        (item for item in result["smoke_tests"] if item["name"] == "recall"), None
+    )
+    if recall and recall["ok"]:
+        result["next_command"] = 'book search "what should I remember?"'
+    else:
+        result["next_command"] = "book doctor"
+        result["repair_command"] = "book doctor"
     if as_json:
         click.echo(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -264,6 +381,10 @@ def setup_command(
         )
     for reason in result["degraded_reasons"]:
         click.echo(f"  DEGRADED  {reason}")
+    if recall and recall["ok"]:
+        click.echo('\nNext: book search "what should I remember?"')
+    else:
+        click.echo("\nRecall smoke is degraded. Run: book doctor")
 
 
 @cli.command(name="uninstall")
@@ -623,11 +744,72 @@ def migration_delete_backup(migration_id, assume_yes, as_json):
     click.echo(f"Backup {result['status']}: {migration_id}")
 
 
-@cli.command()
-def init():
-    """初始化数据库"""
+def _legacy_init_db() -> None:
     store.init_db()
     click.echo(f"✅ 数据库已初始化: {config.DB_PATH}")
+
+
+@cli.command(name="init")
+@click.option("--yes", "assume_yes", is_flag=True, help="接受计划并非交互执行")
+@click.option("--dry-run", is_flag=True, help="只输出计划；零写入")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
+@click.option(
+    "--agent", "agents", multiple=True,
+    type=click.Choice(["claude", "cursor", "codex"]),
+    help="只配置指定 Agent；可重复",
+)
+@click.option("--provider", type=click.Choice(["ollama", "api"]), help="模型 provider")
+@click.option("--base-url", help="provider 根 URL")
+@click.option("--llm-model", help="generation 模型名")
+@click.option("--embedding-model", help="embedding 模型名")
+@click.option("--api-key-env", help="API key 环境变量名；只保存变量名")
+@click.option("--enable-schedule", is_flag=True, help="配置用户级 watch schedule")
+@click.option("--skip-models", "--skip-download", is_flag=True, help="跳过模型下载")
+@click.pass_context
+def init_command(
+    ctx, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
+    embedding_model, api_key_env, enable_schedule, skip_models,
+):
+    """Canonical ``book init`` onboarding; legacy ``storybook init`` initializes DB."""
+
+    executable = Path(ctx.find_root().info_name or "").name
+    if executable != "book":
+        supplied = (
+            assume_yes or dry_run or as_json or agents or provider or base_url
+            or llm_model or embedding_model or api_key_env or enable_schedule
+            or skip_models
+        )
+        if supplied:
+            raise click.UsageError(
+                "legacy `storybook init` only initializes the database; use `book init`"
+            )
+        _legacy_init_db()
+        return
+    return _run_onboarding(
+        assume_yes=assume_yes,
+        dry_run=dry_run,
+        as_json=as_json,
+        agents=agents,
+        provider=provider,
+        base_url=base_url,
+        llm_model=llm_model,
+        embedding_model=embedding_model,
+        api_key_env=api_key_env,
+        enable_schedule=enable_schedule,
+        skip_models=skip_models,
+        full_onboarding=True,
+    )
+
+
+@cli.group(name="admin")
+def admin_group():
+    """Low-level maintenance commands."""
+
+
+@admin_group.command(name="init-db")
+def admin_init_db():
+    """Initialize the active Profile database."""
+    _legacy_init_db()
 
 
 @cli.command()
