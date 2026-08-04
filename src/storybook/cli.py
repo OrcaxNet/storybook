@@ -144,13 +144,38 @@ def setup_command(
         value is not None
         for value in (provider, base_url, llm_model, embedding_model, api_key_env)
     )
-    if provider is None and not assume_yes and not as_json and click.get_text_stream("stdin").isatty():
+    interactive = (
+        not assume_yes
+        and not as_json
+        and click.get_text_stream("stdin").isatty()
+    )
+    if provider is None and interactive:
         provider = click.prompt(
             "Model provider", type=click.Choice(["ollama", "api"]), default="ollama"
         )
         model_options_supplied = True
     selected_model_config = None
     provider = provider or "ollama"
+    if interactive and model_options_supplied:
+        if not base_url:
+            base_url = click.prompt(
+                "API base URL" if provider == "api" else "Ollama base URL",
+                default=(None if provider == "api" else model_config.DEFAULT_OLLAMA_URL),
+            )
+        if not llm_model:
+            llm_model = click.prompt(
+                "Generation model",
+                default=(None if provider == "api" else model_config.DEFAULT_LLM_MODEL),
+            )
+        if not embedding_model:
+            embedding_model = click.prompt(
+                "Embedding model",
+                default=(None if provider == "api" else model_config.DEFAULT_EMBED_MODEL),
+            )
+        if provider == "api" and not api_key_env:
+            api_key_env = click.prompt(
+                "API key environment variable", default="STORYBOOK_API_KEY"
+            )
     if model_options_supplied and provider == "api" and not base_url:
         _emit_setup_error(
             SetupError("SB_MODEL_BASE_URL_REQUIRED", "api provider 需要 --base-url"),

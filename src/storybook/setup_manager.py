@@ -517,17 +517,25 @@ class SetupManager:
 
         generation = value.generation
         embedding = value.embedding
-        secret = self.environ.get(generation.credential_env or "")
-        if generation.provider == "api" and not secret:
+        generation_secret = self.environ.get(generation.credential_env or "")
+        embedding_secret = self.environ.get(embedding.credential_env or "")
+        if generation.provider == "api" and not generation_secret:
             raise SetupError(
                 "SB_MODEL_CREDENTIALS_MISSING",
-                f"环境变量 {generation.credential_env} 未设置",
+                f"generation 环境变量 {generation.credential_env} 未设置",
+                hint="设置该环境变量后重试；密钥不会写入配置",
+            )
+        if embedding.provider == "api" and not embedding_secret:
+            raise SetupError(
+                "SB_MODEL_CREDENTIALS_MISSING",
+                f"embedding 环境变量 {embedding.credential_env} 未设置",
                 hint="设置该环境变量后重试；密钥不会写入配置",
             )
 
-        headers = {"Authorization": f"Bearer {secret}"} if secret else {}
-
-        def request(kind: str, url: str, payload: dict) -> dict:
+        def request(
+            kind: str, url: str, payload: dict, *, secret: str = ""
+        ) -> dict:
+            headers = {"Authorization": f"Bearer {secret}"} if secret else {}
             try:
                 response = requests.post(url, headers=headers, json=payload, timeout=8)
                 response.raise_for_status()
@@ -550,9 +558,11 @@ class SetupManager:
             gen = request(
                 "generation", f"{generation.base_url}/v1/chat/completions",
                 {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 4},
+                secret=generation_secret,
             )
             choices = gen.get("choices")
-            message = choices[0].get("message") if isinstance(choices, list) and choices else None
+            first_choice = choices[0] if isinstance(choices, list) and choices else None
+            message = first_choice.get("message") if isinstance(first_choice, dict) else None
             if (
                 not isinstance(message, dict)
                 or not isinstance(message.get("content"), str)
@@ -562,9 +572,11 @@ class SetupManager:
             embedded = request(
                 "embedding", f"{embedding.base_url}/v1/embeddings",
                 {"model": embedding.model, "input": "storybook setup probe"},
+                secret=embedding_secret,
             )
             rows = embedded.get("data")
-            vector = rows[0].get("embedding") if isinstance(rows, list) and rows else None
+            first_row = rows[0] if isinstance(rows, list) and rows else None
+            vector = first_row.get("embedding") if isinstance(first_row, dict) else None
         else:
             gen = request(
                 "generation", f"{generation.base_url}/api/chat",
