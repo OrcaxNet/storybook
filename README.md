@@ -63,7 +63,7 @@ Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambig
 
 每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。新 Profile、Session、Story、edge 使用可按时间排序的 UUIDv7 全局 ID。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录无损本地快照，`memory_events` 以 `event_id/entity_id/base_version/version/device_id/operation/created_at` 记录 create/update/merge/split/delete 的可移植审计链。事件明文 payload 只含固定元数据、关系 UUID 与修订 SHA-256，不复制正文、原始外部 session ID、路径或证据文本，并预留加密 payload 字段。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
 
-`storybook forget` 先持久化按半衰期衰减后的 `access_count`，再以最近访问/更新时间、访问计数和最大关联边权共同筛选低价值 Story；归档默认仅预览，`--apply` 后只归档并移出向量/词法/图检索，高频或强关联记忆受保护，原 Story 与 provenance 仍保留。生成式 LLM 与 embedding 的成功结果按 provider/model/schema/输入哈希持久缓存于 Profile 私有 cache；批处理并行执行无数据库写入的 LLM/embedding 准备阶段，再顺序执行 SQLite 合并与写入。
+`storybook forget` 用持久化浮点热度按半衰期衰减，再将频率无关的整数投影写入 `access_count`，并以最近访问/更新时间、访问计数和最大关联边权共同筛选低价值 Story；归档默认仅预览，`--apply` 后只归档并移出向量/词法/图检索，高频或强关联记忆受保护，原 Story 与 provenance 仍保留。生成式 LLM 与 embedding 的成功结果按 provider/model/schema/输入哈希持久缓存于 Profile 私有 cache；批处理并行执行无数据库写入的 LLM/embedding 准备阶段，再顺序执行 SQLite 合并与写入。
 
 删除 Story 时不物理删行：同一事务清除 serving 向量、追加 delete event 并写入不可变 `memory_tombstones`。查询默认排除 tombstone；本地事件重放采用 delete-wins，即使旧 create/update 事件晚到也不会复活对象。v0.2 的 `storybook sync status` 是纯本地状态查询，不登录、不联网，也没有上传/下载入口。
 

@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS stories (
     applicability_json TEXT NOT NULL DEFAULT '{}',
     environment_summary_json TEXT NOT NULL DEFAULT '[]',
     access_count INTEGER DEFAULT 0,
+    access_score REAL DEFAULT 0.0,
     last_accessed_at TEXT,
     access_decay_at TEXT,
     archived_at TEXT,
@@ -346,6 +347,7 @@ def init_db(
         _ensure_memory_graph_schema(db)
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
+        _ensure_governance_columns(db)
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_stories_active ON stories(archived_at, deleted_at)"
         )
@@ -733,9 +735,6 @@ def _ensure_context_columns(db: sqlite3.Connection) -> None:
         "stories": {
             "applicability_json": "TEXT NOT NULL DEFAULT '{}'",
             "environment_summary_json": "TEXT NOT NULL DEFAULT '[]'",
-            "last_accessed_at": "TEXT",
-            "access_decay_at": "TEXT",
-            "archived_at": "TEXT",
         },
     }
     for table, columns_to_add in additions.items():
@@ -831,6 +830,25 @@ def _json_load(value, fallback):
         return json.loads(value) if value not in (None, "") else fallback
     except (json.JSONDecodeError, TypeError):
         return fallback
+
+
+def _ensure_governance_columns(db: sqlite3.Connection) -> None:
+    additions = {
+        "access_score": "REAL",
+        "last_accessed_at": "TEXT",
+        "access_decay_at": "TEXT",
+        "archived_at": "TEXT",
+    }
+    columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(stories)").fetchall()
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            db.execute(f"ALTER TABLE stories ADD COLUMN {name} {declaration}")
+    db.execute(
+        """UPDATE stories SET access_score = CAST(access_count AS REAL)
+           WHERE access_score IS NULL"""
+    )
 
 
 def _ensure_story_v2_columns(db: sqlite3.Connection) -> None:
@@ -2594,6 +2612,7 @@ def increment_access_count(story_id: int):
     try:
         db.execute(
             """UPDATE stories SET access_count = access_count + 1,
+                                  access_score = COALESCE(access_score, access_count, 0) + 1,
                                   last_accessed_at = datetime('now'),
                                   access_decay_at = datetime('now')
                WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
@@ -2635,6 +2654,7 @@ def apply_recall_feedback(
             return
         db.executemany(
             """UPDATE stories SET access_count = access_count + 1,
+                                  access_score = COALESCE(access_score, access_count, 0) + 1,
                                   last_accessed_at = datetime('now'),
                                   access_decay_at = datetime('now')
                WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
@@ -2700,10 +2720,10 @@ def decay_story_access_counts(
     db = get_db(load_vector_extension=False)
     try:
         rows = db.execute(
-            """SELECT id, access_count, access_decay_at, updated_at
+            """SELECT id, access_count, access_score, access_decay_at, updated_at
                FROM stories
                WHERE deleted_at IS NULL AND archived_at IS NULL
-                 AND access_count > 0"""
+                 AND COALESCE(NULLIF(access_score, 0), access_count, 0) > 0"""
         ).fetchall()
         decayed = 0
         for row in rows:
@@ -2715,12 +2735,17 @@ def decay_story_access_counts(
                 checkpoint = checkpoint.replace(tzinfo=UTC)
             elapsed_days = max(0.0, (now - checkpoint.astimezone(UTC)).total_seconds() / 86400)
             old_count = int(row["access_count"] or 0)
-            new_count = int(old_count * (0.5 ** (elapsed_days / half_life_days)))
+            stored_score = float(row["access_score"] or 0.0)
+            old_score = old_count if stored_score <= 0.0 < old_count else stored_score
+            new_score = old_score * (0.5 ** (elapsed_days / half_life_days))
+            new_count = max(0, round(new_score))
             if new_count != old_count:
                 decayed += 1
             db.execute(
-                "UPDATE stories SET access_count = ?, access_decay_at = ? WHERE id = ?",
-                (new_count, now.isoformat(), row["id"]),
+                """UPDATE stories
+                   SET access_count = ?, access_score = ?, access_decay_at = ?
+                   WHERE id = ?""",
+                (new_count, new_score, now.isoformat(), row["id"]),
             )
         db.commit()
         return {"examined": len(rows), "decayed": decayed}
@@ -3387,16 +3412,36 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
         db.close()
 
 
-def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list[dict]:
-    """numpy 暴力余弦相似度搜索（fallback）"""
+def search_by_vector_numpy(
+    query_embedding: list[float],
+    top_k: int = 5,
+    *,
+    project_identity: tuple[str, str] | None = None,
+) -> list[dict]:
+    """Exact numpy search, optionally constrained before ranking to one project."""
     db = get_db()
     try:
+        project_clause = ""
+        project_params: list[object] = []
+        if project_identity is not None:
+            kind, value = project_identity
+            json_path = (
+                "$.workspace.repo_fingerprint"
+                if kind == "repo" else "$.workspace.id"
+            )
+            project_clause = """AND EXISTS (
+                SELECT 1 FROM json_each(stories.environment_summary_json) env
+                WHERE json_extract(env.value, ?) = ?
+            )"""
+            project_params = [json_path, value]
         rows = db.execute(
-            """SELECT id, title, abstract, content, keywords, embedding,
+            f"""SELECT id, title, abstract, content, keywords, embedding,
                       applicability_json, environment_summary_json
                FROM stories
                WHERE embedding IS NOT NULL AND deleted_at IS NULL
-                 AND archived_at IS NULL"""
+                 AND archived_at IS NULL
+                 {project_clause}""",
+            project_params,
         ).fetchall()
         if not rows:
             return []
@@ -3408,6 +3453,13 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
 
         results = []
         for r in rows:
+            environments = context_module.merge_environments(
+                r["environment_summary_json"], []
+            )
+            if project_identity and not context_module.environment_matches_project_identity(
+                project_identity, environments
+            ):
+                continue
             vec = np.frombuffer(r["embedding"], dtype=np.float32)
             vec_norm = np.linalg.norm(vec)
             if vec_norm == 0:
@@ -3424,9 +3476,7 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
                 "applicability": context_module.normalize_applicability(
                     r["applicability_json"]
                 ),
-                "environments": context_module.merge_environments(
-                    r["environment_summary_json"], []
-                ),
+                "environments": environments,
                 "similarity": round(sim, 4),
             })
         results.sort(key=lambda x: x["similarity"], reverse=True)
@@ -3436,7 +3486,11 @@ def search_by_vector_numpy(query_embedding: list[float], top_k: int = 5) -> list
 
 
 def search_by_lexical(
-    query: str, top_k: int = 5, *, timeout_seconds: float = 0.5
+    query: str,
+    top_k: int = 5,
+    *,
+    timeout_seconds: float = 0.5,
+    project_identity: tuple[str, str] | None = None,
 ) -> list[dict]:
     """FTS5 + 参数化关键词子串的低时延降级检索。
 
@@ -3458,18 +3512,32 @@ def search_by_lexical(
     )
     try:
         candidates: dict[int, sqlite3.Row] = {}
+        project_clause = ""
+        project_params: list[object] = []
+        if project_identity is not None:
+            kind, value = project_identity
+            json_path = (
+                "$.workspace.repo_fingerprint"
+                if kind == "repo" else "$.workspace.id"
+            )
+            project_clause = """AND EXISTS (
+                SELECT 1 FROM json_each(s.environment_summary_json) env
+                WHERE json_extract(env.value, ?) = ?
+            )"""
+            project_params = [json_path, value]
         fts_query = " OR ".join(f'"{term}"' for term in terms)
         try:
             rows = db.execute(
-                """SELECT s.id, s.title, s.abstract, s.content, s.keywords,
+                f"""SELECT s.id, s.title, s.abstract, s.content, s.keywords,
                           s.applicability_json, s.environment_summary_json
                    FROM story_fts
                    JOIN stories s ON s.id = story_fts.rowid
                    WHERE story_fts MATCH ? AND s.embedding IS NOT NULL
                      AND s.deleted_at IS NULL AND s.archived_at IS NULL
+                     {project_clause}
                    ORDER BY bm25(story_fts, 8.0, 5.0, 2.0, 5.0)
                    LIMIT ?""",
-                (fts_query, max(top_k * 8, 16)),
+                (fts_query, *project_params, max(top_k * 8, 16)),
             ).fetchall()
             candidates.update({int(row["id"]): row for row in rows})
         except sqlite3.OperationalError as exc:
@@ -3493,9 +3561,10 @@ def search_by_lexical(
                 FROM stories s
                 WHERE s.embedding IS NOT NULL AND s.deleted_at IS NULL
                   AND s.archived_at IS NULL
+                  {project_clause}
                   AND ({' OR '.join(clauses)})
                 LIMIT ?""",
-            (*params, max(top_k * 32, 256)),
+            (*project_params, *params, max(top_k * 32, 256)),
         ).fetchall()
         candidates.update({int(row["id"]): row for row in rows})
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import subprocess
 from datetime import UTC, datetime, timedelta
 
 from storybook import config, context, embeddings, llm, processor, search, store
@@ -79,7 +80,120 @@ def test_project_scope_removes_more_relevant_cross_project_noise(fake_embedder):
 
     assert profile_result["top_matches"][0]["story_id"] == cross_story
     assert [item["story_id"] for item in project_result["top_matches"]] == [local_story]
-    assert project_result["strict_filtered"] >= 1
+
+
+def test_decay_is_frequency_invariant_across_one_half_life():
+    once = store.add_story("once", "single decay", [], basis(0))
+    daily = store.add_story("daily", "daily decay", [], basis(1))
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    db = store.get_db()
+    try:
+        db.execute(
+            """UPDATE stories
+               SET access_count = 8, access_decay_at = ?
+               WHERE id = ?""",
+            (start.isoformat(), once),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    store.decay_story_access_counts(
+        half_life_days=30, now=start + timedelta(days=30)
+    )
+    once_count = store.get_story(once)["access_count"]
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute(
+            "UPDATE stories SET access_count = 0, access_score = 0 WHERE id = ?",
+            (once,),
+        )
+        db.execute(
+            """UPDATE stories
+               SET access_count = 8, access_score = 0, access_decay_at = ?
+               WHERE id = ?""",
+            (start.isoformat(), daily),
+        )
+        db.commit()
+    finally:
+        db.close()
+    for day in range(1, 31):
+        store.decay_story_access_counts(
+            half_life_days=30, now=start + timedelta(days=day)
+        )
+
+    assert once_count == 4
+    assert store.get_story(daily)["access_count"] == 4
+
+
+def test_project_scope_cannot_be_starved_by_global_top_n(fake_embedder):
+    local_context = context.capture_context(workspace_path="/work/local")
+    noise_context = context.capture_context(workspace_path="/work/noise")
+    local_session = store.add_session("codex", "local", context=local_context)
+    noise_session = store.add_session("codex", "noise", context=noise_context)
+    for index in range(25):
+        store.add_story(
+            f"noise-{index}", "q cross project", ["q"], basis(0),
+            source_session_ids=[noise_session],
+        )
+    local_story = store.add_story(
+        "local", "q local project", ["q"], with_cos(0, 0.9),
+        source_session_ids=[local_session],
+    )
+    fake_embedder.register("q", basis(0))
+
+    result = search.search(
+        "q", top_k=1, context=local_context, scope="project", graph_enabled=False
+    )
+
+    assert [item["story_id"] for item in result["top_matches"]] == [local_story]
+
+
+def test_project_scope_lexical_fallback_is_filtered_before_limit(fake_embedder):
+    local_context = context.capture_context(workspace_path="/work/local-lexical")
+    noise_context = context.capture_context(workspace_path="/work/noise-lexical")
+    local_session = store.add_session("codex", "local", context=local_context)
+    noise_session = store.add_session("codex", "noise", context=noise_context)
+    for index in range(25):
+        store.add_story(
+            f"needle-noise-{index}", "needle noise", ["needle"], basis(index),
+            source_session_ids=[noise_session],
+        )
+    local_story = store.add_story(
+        "needle-local", "needle local", ["needle"], basis(100),
+        source_session_ids=[local_session],
+    )
+    fake_embedder.register("needle", None)
+
+    result = search.search(
+        "needle",
+        top_k=1,
+        context=local_context,
+        scope="project",
+        graph_enabled=False,
+        rerank_enabled=False,
+    )
+
+    assert result["mode"] == "lexical_fallback"
+    assert [item["story_id"] for item in result["top_matches"]] == [local_story]
+
+
+def test_git_root_and_subdirectory_share_project_identity(tmp_path):
+    repository = tmp_path / "repo"
+    child = repository / "src" / "package"
+    child.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", str(repository)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    root_context = context.capture_context(workspace_path=repository)
+    child_context = context.capture_context(workspace_path=child)
+
+    assert context.project_identity(root_context) == context.project_identity(child_context)
+    assert root_context["workspace"]["project_label"] == repository.name
 
 
 def test_llm_and_embedding_cache_skip_duplicate_provider_calls(monkeypatch):

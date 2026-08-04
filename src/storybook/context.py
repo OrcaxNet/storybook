@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import re
+import subprocess
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -297,6 +298,36 @@ def workspace_path_hash(path: Any) -> str | None:
     return local_hash(normalised, "workspace-path")
 
 
+def _git_workspace(path: Any) -> tuple[str | None, str | None]:
+    """Resolve a cwd to its repository root and optional remote without leaking it."""
+
+    if path in (None, ""):
+        return None, None
+    try:
+        candidate = Path(str(path)).expanduser().resolve(strict=False)
+        root_result = subprocess.run(
+            ["git", "-C", str(candidate), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        if root_result.returncode != 0 or not root_result.stdout.strip():
+            return None, None
+        root = root_result.stdout.strip()
+        remote_result = subprocess.run(
+            ["git", "-C", root, "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+            check=False,
+        )
+        remote = remote_result.stdout.strip() if remote_result.returncode == 0 else None
+        return root, remote or None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, None
+
+
 def _runtime_kind() -> str:
     if any(os.environ.get(k) for k in ("CI", "GITHUB_ACTIONS", "BUILDKITE", "GITLAB_CI")):
         return "ci"
@@ -428,15 +459,17 @@ def capture_context(
     arch = platform.machine().lower() or None
     display_name = " ".join(v for v in (os_family, arch) if v) or None
 
-    repo_hash = repository_fingerprint(repo_url)
-    path_hash = workspace_path_hash(workspace_path)
+    git_root, detected_remote = _git_workspace(workspace_path)
+    canonical_workspace_path = git_root or workspace_path
+    repo_hash = repository_fingerprint(repo_url or detected_remote)
+    path_hash = workspace_path_hash(canonical_workspace_path)
     workspace_fingerprint = repo_hash or path_hash
     workspace_id = None
     if workspace_fingerprint:
         workspace_id = str(uuid.uuid5(
             uuid.UUID(config.PROFILE_ID), workspace_fingerprint,
         ))
-    alias = _safe_alias(project_label) or _safe_alias(workspace_path)
+    alias = _safe_alias(project_label) or _safe_alias(canonical_workspace_path)
 
     detected_runtime = runtime_kind is None
     kind = runtime_kind or _runtime_kind()
@@ -826,7 +859,15 @@ def story_matches_project(
     current = project_identity(current_context)
     if current is None:
         return False
-    return any(project_identity(item) == current for item in (environments or []))
+    return environment_matches_project_identity(current, environments)
+
+
+def environment_matches_project_identity(
+    identity: tuple[str, str] | None, environments: list[dict] | None
+) -> bool:
+    if identity is None:
+        return False
+    return any(project_identity(item) == identity for item in (environments or []))
 
 
 def evaluate_story_context(
