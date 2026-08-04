@@ -59,6 +59,37 @@ def _probe_embed_dim() -> tuple[bool, int, str]:
     return bool(result["ok"]), int(result["dimension"]), str(result["reason"] or "")
 
 
+def serving_index_compatibility(actual_dimension: int | None) -> dict:
+    """Compare configured API target with the immutable active index contract."""
+
+    try:
+        state = store.get_embedding_index_state()
+        serving_dimension = store.serving_embedding_dimension()
+    except Exception:  # schema can be absent during first-run diagnostics
+        state, serving_dimension = {}, None
+    mismatches: list[str] = []
+    active_model = state.get("active_model")
+    active_version = state.get("active_version")
+    if serving_dimension and actual_dimension and serving_dimension != actual_dimension:
+        mismatches.append(
+            f"dimension active={serving_dimension} api={actual_dimension}"
+        )
+    if active_model and active_model != config.EMBED_MODEL:
+        mismatches.append(f"model active={active_model} target={config.EMBED_MODEL}")
+    if active_version and active_version != config.EMBED_VERSION:
+        mismatches.append(
+            f"version active={active_version} target={config.EMBED_VERSION}"
+        )
+    return {
+        "ok": not mismatches,
+        "reason": None if not mismatches else "serving_index_mismatch",
+        "serving_dimension": serving_dimension,
+        "active_model": active_model,
+        "active_version": active_version,
+        "detail": "; ".join(mismatches),
+    }
+
+
 # ═══════════════════════════════════════════════
 #  主流程
 # ═══════════════════════════════════════════════
@@ -86,6 +117,9 @@ def run_doctor(fix: bool = False) -> bool:
             if not endpoint_ok else ""))
         model_ready = endpoint_ok and _model_pulled(tags, config.EMBED_MODEL)
         probe_result = None
+        results.append(CheckResult(
+            "Ollama warm/cold", True,
+            detail=f"model_state={embeddings.model_state()}"))
     else:
         probe_result = embeddings.probe()
         endpoint_ok = bool(probe_result["ok"]) or probe_result["reason"] == "dimension_mismatch"
@@ -153,7 +187,22 @@ def run_doctor(fix: bool = False) -> bool:
                 detail=f"探测失败：{dim_err}",
                 suggestion="检查 embedding endpoint、凭据、模型与响应协议"))
 
-    # [5] sqlite-vec 扩展 + story_vectors 虚表
+    # [5] Target config must not masquerade as the active serving index.
+    compatibility = serving_index_compatibility(actual if model_ready else None)
+    if compatibility["ok"]:
+        results.append(CheckResult(
+            "Serving index 兼容性", True,
+            detail=(f"dimension={compatibility['serving_dimension'] or 'uninitialized'}，"
+                    f"model={compatibility['active_model'] or 'uninitialized'}，"
+                    f"version={compatibility['active_version'] or 'uninitialized'}")))
+    else:
+        results.append(CheckResult(
+            "Serving index 兼容性", False,
+            detail=f"reason=serving_index_mismatch：{compatibility['detail']}",
+            suggestion=("保留当前 serving index；使用 `storybook embedding-backfill` "
+                        "完成 shadow 后再原子切换")))
+
+    # [6] sqlite-vec 扩展 + story_vectors 虚表
     ext_ok = store.check_vec_extension()
     db_exists = config.DB_PATH.exists()
     stories_exists = store.stories_table_exists()
@@ -178,7 +227,7 @@ def run_doctor(fix: bool = False) -> bool:
             "sqlite-vec 扩展 + story_vectors 虚表", True,
             detail="扩展加载成功，虚表存在"))
 
-    # [6] 向量双写一致性
+    # [7] 向量双写一致性
     can_check = ext_ok and db_exists and stories_exists and vec_exists
     if not can_check:
         results.append(CheckResult("向量双写一致性", False, skipped=True,

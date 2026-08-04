@@ -762,9 +762,88 @@ def test_setup_plan_exposes_unified_api_and_legacy_ollama_mapping(tmp_path):
         "dimension": 1024,
         "version": "story-v2-default-v1",
         "config_source": "legacy_ollama_env",
-        "remote_text_disclosure": False,
+        "config_normalized": False,
+        "remote_text_disclosure": True,
     }
     assert not storybook_home.exists()
+
+
+def test_setup_normalizes_conflicting_remote_adapter_and_warns(tmp_path):
+    env = os.environ.copy()
+    env.update({
+        "STORYBOOK_HOME": str(tmp_path / "storybook-home"),
+        "STORYBOOK_EMBED_PRESET": "ollama",
+        "STORYBOOK_EMBED_ADAPTER": "openai_compatible",
+        "STORYBOOK_EMBED_BASE_URL": "https://remote.example/v1",
+        "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+    })
+    completed = subprocess.run(
+        [sys.executable, "-m", "storybook.cli", "setup", "--dry-run", "--json"],
+        cwd=Path(__file__).parents[1], env=env, text=True,
+        capture_output=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    embedding = json.loads(completed.stdout)["plan"]["embedding"]
+    assert embedding["preset"] == "custom"
+    assert embedding["adapter"] == "openai_compatible"
+    assert embedding["config_normalized"] is True
+    assert embedding["remote_text_disclosure"] is True
+
+
+def test_setup_cli_selects_and_persists_custom_api(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    env = os.environ.copy()
+    env.update({
+        "STORYBOOK_HOME": str(storybook_home),
+        "HOME": str(user_home),
+        "CODEX_HOME": str(user_home / ".codex"),
+        "PATH": "",
+        "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+    })
+    for name in tuple(env):
+        if name.startswith("STORYBOOK_EMBED_") or name == "OLLAMA_HOST":
+            env.pop(name)
+
+    selected = subprocess.run(
+        [
+            sys.executable, "-m", "storybook.cli", "setup", "--yes", "--json",
+            "--skip-models", "--embedding-preset", "custom",
+            "--embedding-base-url", "http://127.0.0.1:9/v1",
+            "--embedding-model", "test-embed", "--embedding-dimension", "2",
+            "--embedding-version", "test-embed-v1",
+            "--embedding-api-key-env", "TEST_EMBED_TOKEN",
+        ],
+        cwd=Path(__file__).parents[1], env=env, text=True,
+        capture_output=True, check=False,
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert json.loads(selected.stdout)["status"] == "degraded"
+
+    restored = subprocess.run(
+        [sys.executable, "-m", "storybook.cli", "setup", "--dry-run", "--json"],
+        cwd=Path(__file__).parents[1], env=env, text=True,
+        capture_output=True, check=False,
+    )
+    assert restored.returncode == 0, restored.stderr
+    embedding = json.loads(restored.stdout)["plan"]["embedding"]
+    assert embedding["preset"] == "custom"
+    assert embedding["base_url"] == "http://127.0.0.1:9/v1"
+    assert embedding["model"] == "test-embed"
+    assert embedding["dimension"] == 2
+    assert embedding["version"] == "test-embed-v1"
+    assert embedding["config_source"] == "setup_selection"
+
+
+def test_setup_help_exposes_embedding_provider_selection():
+    result = CliRunner().invoke(cli, ["setup", "--help"])
+
+    assert result.exit_code == 0
+    assert "--embedding-preset [ollama|custom]" in result.output
+    assert "--embedding-base-url" in result.output
+    assert "--embedding-api-key-env" in result.output
 
 
 @pytest.mark.parametrize(
@@ -961,6 +1040,27 @@ def test_status_reports_embedding_dimension_mismatch(isolated_setup, monkeypatch
 
     assert payload["model"]["embedding"]["status"] == "dimension_mismatch"
     assert payload["degraded_reasons"] == ["dimension_mismatch:embedding"]
+
+
+def test_status_reports_serving_index_mismatch_and_ollama_model_state(
+    isolated_setup, monkeypatch
+):
+    manager, _ = isolated_setup
+    manager.execute(requested_agents=(), download_models=False)
+    monkeypatch.setattr(config, "EMBED_DIM", 2)
+    monkeypatch.setattr("storybook.setup_manager.embeddings.model_state", lambda: "warm")
+    payload = _invoke_runtime_status(
+        manager,
+        monkeypatch,
+        models=(config.EMBED_MODEL,),
+        embedding_probe={"ok": True, "reason": None, "dimension": 2},
+    )
+
+    embedding = payload["model"]["embedding"]
+    assert embedding["status"] == "serving_index_mismatch"
+    assert embedding["serving_dimension"] != embedding["actual_dimension"]
+    assert embedding["model_state"] == "warm"
+    assert payload["degraded_reasons"] == ["serving_index_mismatch:embedding"]
 
 
 def test_status_reports_managed_adapter_missing(isolated_setup, monkeypatch):

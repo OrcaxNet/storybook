@@ -75,6 +75,27 @@ def test_default_embed_uses_active_serving_model_during_config_switch(monkeypatc
     assert captured["model"] == active_model
 
 
+def test_default_embed_rejects_target_dimension_before_serving_index(monkeypatch):
+    """A target API cannot inject its new dimension into the old active index."""
+
+    class Response(_Response):
+        def json(self):
+            return {"data": [{"embedding": [1.0, 0.0]}]}
+
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
+    monkeypatch.setattr(config, "EMBED_DIM", 2)
+    monkeypatch.setattr(embeddings.requests, "post", lambda *a, **k: Response())
+
+    assert embeddings.embed("query") is None
+
+
+def test_default_embed_keeps_old_serving_dimension_during_target_backfill(monkeypatch):
+    monkeypatch.setattr(config, "EMBED_DIM", 2)
+    monkeypatch.setattr(embeddings.requests, "post", lambda *a, **k: _Response())
+
+    assert embeddings.embed("old serving query") == basis(0)
+
+
 def test_openai_compatible_api_uses_no_ollama_endpoint_or_parameters(monkeypatch):
     captured = {}
 

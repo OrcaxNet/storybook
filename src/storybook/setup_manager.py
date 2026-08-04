@@ -292,7 +292,8 @@ class SetupManager:
                 "dimension": config.EMBED_DIM,
                 "version": config.EMBED_VERSION,
                 "config_source": config.EMBED_CONFIG_SOURCE,
-                "remote_text_disclosure": config.EMBED_PRESET != "ollama",
+                "config_normalized": config.EMBED_CONFIG_NORMALIZED,
+                "remote_text_disclosure": config.embedding_text_leaves_device(),
             },
             adapters=tuple(adapter_plans),
             models=(config.EMBED_MODEL,),
@@ -341,6 +342,28 @@ class SetupManager:
         args = launcher.get("args")
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise self._invalid_state("launcher.args 必须是 string array")
+
+        embedding = state.get("embedding")
+        if embedding is not None:
+            if not isinstance(embedding, dict):
+                raise self._invalid_state("embedding 必须是 object")
+            expected_strings = (
+                "type", "preset", "adapter", "base_url", "model", "version",
+                "api_key_env",
+            )
+            if any(not isinstance(embedding.get(name), str) for name in expected_strings):
+                raise self._invalid_state("embedding 字段类型无效")
+            if embedding["type"] != "api":
+                raise self._invalid_state("embedding.type 必须是 api")
+            if embedding["preset"] not in {"ollama", "custom"}:
+                raise self._invalid_state("embedding.preset 无效")
+            if embedding["adapter"] not in {"ollama", "openai_compatible"}:
+                raise self._invalid_state("embedding.adapter 无效")
+            if type(embedding.get("dimension")) is not int or embedding["dimension"] < 1:
+                raise self._invalid_state("embedding.dimension 必须是正整数")
+            forbidden = {"api_key", "token", "credential", "authorization"}
+            if forbidden.intersection(embedding):
+                raise self._invalid_state("embedding 不得持久化明文凭据")
 
         adapter_states = state.get("adapters")
         if not isinstance(adapter_states, dict):
@@ -691,6 +714,16 @@ class SetupManager:
                     "command": self.launcher.command,
                     "args": list(self.launcher.args),
                 },
+                "embedding": {
+                    "type": config.EMBED_TYPE,
+                    "preset": config.EMBED_PRESET,
+                    "adapter": config.EMBED_ADAPTER,
+                    "base_url": config.EMBED_BASE_URL,
+                    "model": config.EMBED_MODEL,
+                    "dimension": config.EMBED_DIM,
+                    "version": config.EMBED_VERSION,
+                    "api_key_env": config.EMBED_API_KEY_ENV,
+                },
                 "adapters": adapter_states,
             }
             phase = "state"
@@ -803,6 +836,12 @@ class SetupManager:
             if not embedding_ready:
                 degraded_reasons.append(f"{reason}:embedding")
 
+        compatibility = health.serving_index_compatibility(actual_dimension)
+        if embedding_ready and not compatibility["ok"]:
+            embedding_ready = False
+            embedding_status = "serving_index_mismatch"
+            degraded_reasons.append("serving_index_mismatch:embedding")
+
         model_payload = {
             "provider": "hybrid",
             "status": "ready" if llm_ready and embedding_ready else "degraded",
@@ -816,8 +855,18 @@ class SetupManager:
                 "name": config.EMBED_MODEL,
                 "dimension": config.EMBED_DIM,
                 "actual_dimension": actual_dimension,
+                "serving_dimension": compatibility["serving_dimension"],
+                "active_model": compatibility["active_model"],
+                "active_version": compatibility["active_version"],
                 "version": config.EMBED_VERSION,
                 "config_source": config.EMBED_CONFIG_SOURCE,
+                "config_normalized": config.EMBED_CONFIG_NORMALIZED,
+                "remote_text_disclosure": config.embedding_text_leaves_device(),
+                "model_state": (
+                    embeddings.model_state()
+                    if config.EMBED_ADAPTER == "ollama"
+                    else None
+                ),
                 "status": embedding_status,
             },
         }

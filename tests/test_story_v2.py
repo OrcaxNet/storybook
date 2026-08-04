@@ -400,3 +400,29 @@ def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch
     assert [
         event["operation"] for event in store.get_memory_events(1)
     ] == ["create", "update"]
+
+
+def test_backfill_atomically_switches_serving_vector_dimension(monkeypatch):
+    story_id = store.add_story("old", "old content", ["old"], basis(0))
+    assert store.serving_embedding_dimension() == config.EMBED_DIM
+    assert vector_in_index(story_id) == basis(0)
+
+    monkeypatch.setattr(config, "EMBED_DIM", 2)
+    monkeypatch.setattr(config, "EMBED_MODEL", "two-dimensional-model")
+    monkeypatch.setattr(config, "EMBED_VERSION", "two-dimensional-v1")
+    assert store.serving_embedding_dimension() != config.EMBED_DIM
+    assert vector_in_index(story_id) == basis(0)
+    monkeypatch.setattr(
+        embeddings, "embed", lambda *args, **kwargs: [1.0, 0.0]
+    )
+
+    result = embeddings.backfill(
+        model=config.EMBED_MODEL,
+        version=config.EMBED_VERSION,
+        representation="default",
+    )
+
+    assert result["activation"]["activated"] == 1
+    assert store.serving_embedding_dimension() == 2
+    assert vector_in_index(story_id) == [1.0, 0.0]
+    assert store.get_embedding_index_state()["active_version"] == config.EMBED_VERSION

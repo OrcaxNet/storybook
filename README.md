@@ -122,6 +122,12 @@ storybook setup --dry-run               # 严格零写入（不建目录/DB、�
 storybook setup --json                  # 结构化结果，便于自动化
 storybook setup --agent codex --yes     # 可重复 --agent，覆盖自动检测
 storybook setup --skip-models --yes     # 离线跳过缺失模型，状态为 degraded
+storybook setup --yes --embedding-preset ollama
+storybook setup --yes --embedding-preset custom \
+  --embedding-base-url https://embedding.example/v1 \
+  --embedding-model your-model --embedding-dimension 1024 \
+  --embedding-version your-model-v1 \
+  --embedding-api-key-env PRIVATE_EMBED_API_KEY
 
 storybook uninstall                     # 恢复 setup 写入的节点，默认保留全部记忆
 storybook uninstall --dry-run
@@ -133,6 +139,8 @@ storybook uninstall --yes --purge-data --confirm-purge  # 非交互双重显式�
 重复 MCP 节点或 hook。卸载只恢复名为 `storybook` 的受管节点，保留其他 server、hook
 和设置；若节点在安装后被人工修改，会报告 drift 并保留恢复状态，避免覆盖用户改动。
 旧项目级 `data/memory.db` 只会在计划/结果中提示，不会由 setup 擅自迁移或删除。
+
+`--embedding-preset ollama` 自动填入本地地址、推荐模型、1024 维和 Ollama adapter。`custom` 需显式提供 base URL、model 和 dimension；只持久凭据环境变量名。选择会保存在用户级 setup state，之后的 CLI/MCP 进程自动复用，而显式环境变量仍优先。非 loopback endpoint 始终显示“文本将离开本机”警告。
 
 ## 👤 用户级 Profile 与共享存储
 
@@ -282,6 +290,7 @@ storybook status --performance --json
 已配置 adapter 不可用时返回 `status=ready_degraded`，并通过稳定的
 `degraded_reasons`（例如 `llm_credentials_missing`、`endpoint_unreachable:embedding`、`authentication_failed:embedding`、`credentials_missing:embedding`、`model_unavailable:embedding`、`response_protocol_incompatible:embedding`、`dimension_mismatch:embedding`、
 `adapter_unavailable:codex`）解释降级，不把可用的本地数据库误报为整体失败。
+`doctor` / `status` 还会对比 API 实际维度与 active `story_vectors` 维度、model/version；切换未完成时返回 `serving_index_mismatch:embedding`，保留旧索引并要求先做 shadow backfill。Ollama payload 额外暴露 `model_state=warm|cold`。不同维度的 backfill 完整后，activation 在同一事务内重建 vec0 表并切换。
 
 完整性能基准复用 `data/retrieval_benchmark.json` 的人工 ground truth，并在隔离临时库中构造固定 seed 的 10k Story 数据集。默认跑 50 条固定查询、每条重复 20 次、并发 1 和 5，报告机器/模型状态/规模/重复次数、所有阶段的 p50/p95/p99，以及按 exact/synonym/cross_lang 分组的 recall@1/3/5 和 MRR。基准不会污染用户数据库，也不会把原始 query、Story 内容、绝对路径或仓库 URL 写入报告。
 

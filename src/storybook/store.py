@@ -1312,6 +1312,34 @@ def story_vectors_table_exists() -> bool:
         db.close()
 
 
+def _serving_embedding_dimension(db: sqlite3.Connection) -> int | None:
+    row = db.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'story_vectors'"
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    match = re.search(
+        r"embedding\s+FLOAT\s*\[\s*(\d+)\s*\]", row[0], re.IGNORECASE
+    )
+    return int(match.group(1)) if match else None
+
+
+def serving_embedding_dimension() -> int | None:
+    """Return the active vec0 dimension without trusting target config.
+
+    The vec0 declaration is the serving contract.  It intentionally remains
+    unchanged while a different-dimension shadow backfill is incomplete.
+    """
+
+    if not config.DB_PATH.exists():
+        return None
+    db = sqlite3.connect(str(config.DB_PATH))
+    try:
+        return _serving_embedding_dimension(db)
+    finally:
+        db.close()
+
+
 def vector_consistency() -> dict:
     """检查 stories.embedding 与 story_vectors 的双写一致性。
 
@@ -1647,7 +1675,28 @@ def activate_embedding_backfill(
                 "content_hash": shadow["content_hash"],
                 "base_version": int(story["version"]),
             })
-        db.execute("DELETE FROM story_vectors")
+        target_dimensions = {
+            len(row["embedding"]) // np.dtype(np.float32).itemsize
+            for row in rows
+        }
+        if len(target_dimensions) > 1:
+            raise ValueError("embedding backfill contains mixed dimensions")
+        target_dimension = (
+            next(iter(target_dimensions)) if target_dimensions else config.EMBED_DIM
+        )
+        serving_dimension = _serving_embedding_dimension(db)
+        if serving_dimension != target_dimension:
+            # DDL participates in this transaction. Readers keep the old table
+            # until commit; a failed insert rolls the complete switch back.
+            db.execute("DROP TABLE story_vectors")
+            db.execute(f"""
+                CREATE VIRTUAL TABLE story_vectors USING vec0(
+                    story_id INTEGER PRIMARY KEY,
+                    embedding FLOAT[{target_dimension}]
+                )
+            """)
+        else:
+            db.execute("DELETE FROM story_vectors")
         for row in rows:
             db.execute(
                 "INSERT INTO story_vectors (story_id, embedding) VALUES (?, ?)",

@@ -133,9 +133,45 @@ def _print_setup_plan(plan: dict) -> None:
     type=click.Choice(["claude", "cursor", "codex"]),
     help="只配置指定 Agent；可重复。默认自动检测",
 )
+@click.option(
+    "--embedding-preset",
+    type=click.Choice(["ollama", "custom"]),
+    help="选择 Ollama（推荐）或自定义 OpenAI-compatible API",
+)
+@click.option("--embedding-base-url", help="embedding API base URL")
+@click.option("--embedding-model", help="embedding 模型名")
+@click.option("--embedding-dimension", type=click.IntRange(min=1), help="向量维度")
+@click.option("--embedding-version", help="不可变 embedding 版本；切换模型/维度时应使用新值")
+@click.option(
+    "--embedding-api-key-env",
+    help="凭据所在的环境变量名（不接受明文凭据）",
+)
 @click.option("--skip-models", is_flag=True, help="不下载缺失模型并进入 degraded")
-def setup_command(assume_yes, dry_run, as_json, agents, skip_models):
+def setup_command(
+    assume_yes, dry_run, as_json, agents, embedding_preset,
+    embedding_base_url, embedding_model, embedding_dimension, embedding_version,
+    embedding_api_key_env, skip_models,
+):
     """一键建立用户级存储、Agent 接入并执行端到端自检。"""
+
+    embedding_options = (
+        embedding_base_url, embedding_model, embedding_dimension,
+        embedding_version, embedding_api_key_env,
+    )
+    if not embedding_preset and any(value is not None for value in embedding_options):
+        raise click.UsageError("embedding 详细选项需与 --embedding-preset 同用")
+    if embedding_preset:
+        try:
+            config.apply_embedding_config(
+                preset=embedding_preset,
+                base_url=embedding_base_url,
+                model=embedding_model,
+                dimension=embedding_dimension,
+                version=embedding_version,
+                api_key_env=embedding_api_key_env,
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
 
     manager = SetupManager()
     try:

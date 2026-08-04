@@ -26,7 +26,9 @@ class EmbeddingAPIError(RuntimeError):
 
 
 def api_identity(
-    model: str | None = None, version: str | None = None
+    model: str | None = None,
+    version: str | None = None,
+    dimension: int | None = None,
 ) -> dict[str, object]:
     """返回会影响向量结果的非敏感身份，用于缓存隔离。"""
 
@@ -36,7 +38,7 @@ def api_identity(
         "adapter": config.EMBED_ADAPTER,
         "model": model or config.EMBED_MODEL,
         "version": version or config.EMBED_VERSION,
-        "dimension": config.EMBED_DIM,
+        "dimension": dimension or config.EMBED_DIM,
     }
 
 
@@ -139,20 +141,28 @@ def embed(
     - 维度不匹配 / 零向量时返回 None（上层据此标记 failed 或报错，不再传入坏向量）。
     - 归一化保证 store.search_by_vector 中 ``1 - dist²/2`` 等于 cosine 相似度（精确）。
     """
-    if model is None:
+    serving_request = model is None
+    expected_dimension = config.EMBED_DIM
+    if serving_request:
         try:
             from . import store
             state = store.get_embedding_index_state()
             model = state.get("active_model") or config.EMBED_MODEL
+            expected_dimension = (
+                store.serving_embedding_dimension() or config.EMBED_DIM
+            )
             cache_version = (
                 cache_version or state.get("active_version") or config.EMBED_VERSION
             )
         except Exception:  # schema may not exist during setup health probes
             model = config.EMBED_MODEL
     cache_version = cache_version or config.EMBED_VERSION
-    cache_payload = {**api_identity(model, cache_version), "text": text}
+    cache_payload = {
+        **api_identity(model, cache_version, expected_dimension),
+        "text": text,
+    }
     cached = inference_cache.get("embedding-v1", cache_payload)
-    if isinstance(cached, list) and len(cached) == config.EMBED_DIM:
+    if isinstance(cached, list) and len(cached) == expected_dimension:
         mark_model_used()
         return [float(value) for value in cached]
     timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
@@ -164,8 +174,11 @@ def embed(
             timeout_seconds=timeout_seconds,
             keep_alive=keep_alive if config.EMBED_ADAPTER == "ollama" else None,
         )
-        if not vec or len(vec) != config.EMBED_DIM:
-            logger.warning("向量维度不匹配: got %d, expect %d", len(vec or []), config.EMBED_DIM)
+        if not vec or len(vec) != expected_dimension:
+            logger.warning(
+                "向量维度不匹配: got %d, expect %d",
+                len(vec or []), expected_dimension,
+            )
             return None
         arr = np.asarray(vec, dtype=np.float32)
         norm = np.linalg.norm(arr)
