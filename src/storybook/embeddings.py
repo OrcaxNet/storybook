@@ -1,7 +1,6 @@
-"""
-嵌入层 — 封装 Ollama embedding API + 余弦相似度
-"""
+"""嵌入层 — 统一 API 抽象，内部适配 Ollama / OpenAI-compatible 协议。"""
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -18,19 +17,171 @@ _STATE_LOCK = threading.Lock()
 _LAST_SUCCESS_AT: float | None = None
 
 
-def serving_index_matches_config(state: dict) -> bool:
-    """Return whether the active index belongs to the configured embedding space."""
+class EmbeddingAPIError(RuntimeError):
+    """可稳定诊断的 embedding API 错误；message 不包含凭据。"""
 
-    active_provider = state.get("active_provider") or config.EMBED_PROVIDER
-    active_base_url = (
-        state.get("active_base_url") or config.EMBED_BASE_URL
-    ).rstrip("/")
-    active_model = state.get("active_model") or config.EMBED_MODEL
-    return (
-        active_provider == config.EMBED_PROVIDER
-        and active_base_url == config.EMBED_BASE_URL.rstrip("/")
-        and active_model == config.EMBED_MODEL
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def api_identity(
+    model: str | None = None,
+    version: str | None = None,
+    dimension: int | None = None,
+    *,
+    base_url: str | None = None,
+    adapter: str | None = None,
+    api_key_env: str | None = None,
+) -> dict[str, object]:
+    """返回会影响向量结果的非敏感身份，用于缓存隔离。"""
+
+    return {
+        "type": config.EMBED_TYPE,
+        "base_url": base_url or config.EMBED_BASE_URL,
+        "adapter": adapter or config.EMBED_ADAPTER,
+        "credential_env": (
+            config.EMBED_API_KEY_ENV if api_key_env is None else api_key_env
+        ),
+        "model": model or config.EMBED_MODEL,
+        "version": version or config.EMBED_VERSION,
+        "dimension": dimension or config.EMBED_DIM,
+    }
+
+
+def _request_embedding(
+    text: str,
+    model: str,
+    *,
+    timeout_seconds: float,
+    keep_alive: str | None,
+    base_url: str | None = None,
+    adapter: str | None = None,
+    api_key_env: str | None = None,
+    api_key_value: str | None = None,
+) -> list[float]:
+    request_base_url = (base_url or config.EMBED_BASE_URL).rstrip("/")
+    request_adapter = adapter or config.EMBED_ADAPTER
+    credential_env = config.EMBED_API_KEY_ENV if api_key_env is None else api_key_env
+    headers: dict[str, str] = {}
+    if credential_env:
+        credential = os.getenv(credential_env)
+        if not credential:
+            raise EmbeddingAPIError(
+                "credentials_missing",
+                f"credential environment variable {credential_env} is missing",
+            )
+        headers["Authorization"] = f"Bearer {credential}"
+    elif api_key_value:
+        headers["Authorization"] = f"Bearer {api_key_value}"
+
+    if request_adapter == "ollama":
+        url = f"{request_base_url}/api/embeddings"
+        payload = {"model": model, "prompt": text}
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+    else:
+        api_root = (
+            request_base_url if request_base_url.endswith("/v1")
+            else f"{request_base_url}/v1"
+        )
+        url = f"{api_root}/embeddings"
+        payload = {"model": model, "input": text}
+
+    try:
+        request_kwargs = {
+            "json": payload,
+            "timeout": (min(1.0, timeout_seconds), timeout_seconds),
+        }
+        if headers:
+            request_kwargs["headers"] = headers
+        response = requests.post(url, **request_kwargs)
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        raise EmbeddingAPIError("endpoint_unreachable", "embedding endpoint unavailable") from exc
+    except requests.RequestException as exc:
+        raise EmbeddingAPIError("endpoint_unreachable", "embedding request failed") from exc
+
+    status_code = getattr(response, "status_code", None)
+    if status_code in {401, 403}:
+        raise EmbeddingAPIError("authentication_failed", "embedding API rejected credentials")
+    if status_code in {404, 422}:
+        raise EmbeddingAPIError("model_unavailable", "embedding model is unavailable")
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise EmbeddingAPIError("model_unavailable", "embedding API rejected the request") from exc
+    try:
+        data = response.json()
+        if request_adapter == "ollama":
+            vector = data.get("embedding")
+        else:
+            rows = data.get("data")
+            vector = rows[0].get("embedding") if isinstance(rows, list) and rows else None
+        if not isinstance(vector, list) or not vector:
+            raise TypeError("missing embedding vector")
+        return [float(value) for value in vector]
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
+        raise EmbeddingAPIError(
+            "response_protocol_incompatible", "embedding response protocol is incompatible"
+        ) from exc
+
+
+def probe() -> dict[str, object]:
+    """无密钥泄露的 endpoint/model/protocol/dimension 探测结果。"""
+
+    try:
+        vector = _request_embedding(
+            "storybook embedding probe",
+            config.EMBED_MODEL,
+            timeout_seconds=30.0,
+            keep_alive=(
+                config.EMBED_KEEP_ALIVE
+                if config.EMBED_ADAPTER == "ollama"
+                else None
+            ),
+        )
+    except EmbeddingAPIError as exc:
+        return {"ok": False, "reason": exc.reason, "dimension": 0}
+    if config.EMBED_ADAPTER == "ollama":
+        # A successful Ollama request loads the model, even if a subsequent
+        # configured-dimension check reports an operator error.
+        mark_model_used()
+    actual = len(vector)
+    if actual != config.EMBED_DIM:
+        return {"ok": False, "reason": "dimension_mismatch", "dimension": actual}
+    return {"ok": True, "reason": None, "dimension": actual}
+
+
+def serving_index_matches_config(state: dict) -> bool:
+    """Return whether the active serving route is complete and usable.
+
+    Target configuration drift is diagnosed separately; queries intentionally
+    keep using this active route until shadow activation.
+    """
+
+    identity = serving_route_identity(state)
+    return bool(
+        state.get("active_model")
+        and identity["base_url"]
+        and identity["adapter"]
+        and identity["credential_known"]
+        and state.get("active_dimension")
     )
+
+
+def serving_route_identity(state: dict) -> dict[str, object]:
+    """Resolve old provider aliases and new serving fields identically."""
+
+    provider = state.get("active_provider")
+    adapter = state.get("active_adapter")
+    if not adapter and provider in {"ollama", "api"}:
+        adapter = "ollama" if provider == "ollama" else "openai_compatible"
+    return {
+        "base_url": state.get("active_endpoint") or state.get("active_base_url"),
+        "adapter": adapter,
+        "api_key_env": state.get("active_api_key_env"),
+        "credential_known": state.get("active_api_key_env") is not None,
+    }
 
 
 def embed(
@@ -41,67 +192,85 @@ def embed(
     keep_alive: str | None = None,
     cache_version: str | None = None,
 ) -> Optional[list[float]]:
-    """调用 Ollama 生成语义向量，返回 L2 归一化后的向量。
+    """调用配置的 API 生成语义向量，返回 L2 归一化后的向量。
 
     - 维度不匹配 / 零向量时返回 None（上层据此标记 failed 或报错，不再传入坏向量）。
     - 归一化保证 store.search_by_vector 中 ``1 - dist²/2`` 等于 cosine 相似度（精确）。
     """
-    provider = config.EMBED_PROVIDER
-    base_url = config.EMBED_BASE_URL.rstrip("/")
-    if model is None:
+    serving_request = model is None
+    expected_dimension = config.EMBED_DIM
+    request_base_url = config.EMBED_BASE_URL
+    request_adapter = (
+        "openai_compatible"
+        if config.EMBED_PROVIDER == "api"
+        or config.EMBED_ADAPTER == "openai_compatible"
+        else "ollama"
+    )
+    request_api_key_env = config.EMBED_API_KEY_ENV
+    request_api_key_value = config.EMBED_API_KEY if not serving_request else None
+    if serving_request:
         try:
             from . import store
             state = store.get_embedding_index_state()
-            active_model = state.get("active_model") or config.EMBED_MODEL
-            if not serving_index_matches_config(state):
-                logger.error(
-                    "Embedding index configuration mismatch; refusing default embedding",
-                )
-                return None
-            model = active_model
+            model = state.get("active_model") or config.EMBED_MODEL
+            expected_dimension = (
+                store.serving_embedding_dimension() or config.EMBED_DIM
+            )
             cache_version = (
                 cache_version or state.get("active_version") or config.EMBED_VERSION
             )
+            identity = serving_route_identity(state)
+            request_base_url = identity["base_url"]
+            request_adapter = identity["adapter"]
+            request_api_key_env = identity["api_key_env"]
+            if (
+                not request_base_url or not request_adapter
+                or not identity["credential_known"]
+            ):
+                raise EmbeddingAPIError(
+                    "active_index_identity_unknown",
+                    "active embedding index endpoint identity is unknown; backfill required",
+                )
         except Exception:  # schema may not exist during setup health probes
+            if config.DB_PATH.exists():
+                logger.error("Active embedding index identity is unavailable")
+                return None
             model = config.EMBED_MODEL
+            request_base_url = config.EMBED_BASE_URL
+            request_adapter = config.EMBED_ADAPTER
+            request_api_key_env = config.EMBED_API_KEY_ENV
+            request_api_key_value = config.EMBED_API_KEY
     cache_version = cache_version or config.EMBED_VERSION
     cache_payload = {
-        "provider": provider,
-        "base_url": base_url,
-        "model": model,
-        "version": cache_version,
-        "dimension": config.EMBED_DIM,
+        **api_identity(
+            model, cache_version, expected_dimension,
+            base_url=request_base_url, adapter=request_adapter,
+            api_key_env=request_api_key_env,
+        ),
         "text": text,
     }
     cached = inference_cache.get("embedding-v1", cache_payload)
-    if isinstance(cached, list) and len(cached) == config.EMBED_DIM:
+    if isinstance(cached, list) and len(cached) == expected_dimension:
         mark_model_used()
         return [float(value) for value in cached]
     timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
     keep_alive = config.EMBED_KEEP_ALIVE if keep_alive is None else keep_alive
     try:
-        if config.EMBED_PROVIDER == "api":
-            resp = requests.post(
-                f"{config.EMBED_BASE_URL.rstrip('/')}/v1/embeddings",
-                headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"},
-                json={"model": model, "input": text},
-                timeout=(min(1.0, timeout_seconds), timeout_seconds),
+        vec = _request_embedding(
+            text,
+            model,
+            timeout_seconds=timeout_seconds,
+            keep_alive=keep_alive if request_adapter == "ollama" else None,
+            base_url=request_base_url,
+            adapter=request_adapter,
+            api_key_env=request_api_key_env,
+            api_key_value=request_api_key_value,
+        )
+        if not vec or len(vec) != expected_dimension:
+            logger.warning(
+                "向量维度不匹配: got %d, expect %d",
+                len(vec or []), expected_dimension,
             )
-        else:
-            resp = requests.post(
-                f"{config.EMBED_BASE_URL.rstrip('/')}/api/embeddings",
-                json={"model": model, "prompt": text, "keep_alive": keep_alive},
-                timeout=(min(1.0, timeout_seconds), timeout_seconds),
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        if config.EMBED_PROVIDER == "api":
-            rows = data.get("data") if isinstance(data, dict) else None
-            vec = rows[0].get("embedding") if isinstance(rows, list) and rows else None
-        else:
-            vec = data.get("embedding")
-        if not vec or len(vec) != config.EMBED_DIM:
-            logger.warning("向量维度不匹配: got %d, expect %d", len(vec or []), config.EMBED_DIM)
             return None
         arr = np.asarray(vec, dtype=np.float32)
         norm = np.linalg.norm(arr)

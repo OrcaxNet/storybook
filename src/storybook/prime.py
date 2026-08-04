@@ -19,7 +19,7 @@
     主动注入是"不打扰"的，只有较相关的记忆才进简报，避免噪声。
   - **token 预算控制** ``config.PRIME_TOKEN_BUDGET``（默认 2000）：超额时按相似度从低到高
     丢弃候选，并对单条摘要按字符裁剪，保证简报不污染上下文。
-  - **静默不注入**：召回为空 / 相关度不足 / Ollama 不可用时，``injected=False``、
+  - **静默不注入**：召回为空 / 相关度不足 / embedding API 不可用时，``injected=False``、
     ``briefing=""``、不抛错（晨间简报须非侵入：宁可静默也不报错污染上下文）。
 """
 from __future__ import annotations
@@ -253,7 +253,7 @@ def prime_context(
     **静默不注入**（``injected=False``、``briefing=""``、不抛错）的情况：
       - 无可用 query（cwd 与 first_prompt 均为空）
       - 召回为空或全部低于 ``PRIME_MIN_SIMILARITY``（相关度不足，避免噪声）
-      - embedding 不可用（Ollama 未运行等）--``note`` 给出排查提示，但不报错
+      - embedding API 不可用--``note`` 给出排查提示，但不报错
 
     复用 ``search.search`` 的全部语义与副作用（``access_count`` 自增、共同召回边权提权）。
     """
@@ -299,7 +299,7 @@ def prime_context(
     if result.get("error"):
         # embedding 不可用等环境问题：晨间简报须非侵入，静默不注入并记 note 供排查
         base["note"] = (
-            f"召回失败：{result['error']}。请确认 Ollama 已运行且 embedding 模型"
+            f"召回失败：{result['error']}。请确认 embedding API 与模型"
             f"（{config.EMBED_MODEL}）可用，可运行 `storybook doctor` 排查。"
         )
         return base

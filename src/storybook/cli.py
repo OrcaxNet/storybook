@@ -114,6 +114,14 @@ def _print_setup_plan(plan: dict) -> None:
         click.echo(f"  Agent     {adapter['display_name']}: {marker}")
         for target in adapter["targets"]:
             click.echo(f"            {target}")
+    embedding = plan["embedding"]
+    label = "Ollama (recommended)" if embedding["preset"] == "ollama" else "Custom API"
+    click.echo(
+        f"  Embedding API: {label}; adapter={embedding['adapter']}; "
+        f"model={embedding['model']}; dimension={embedding['dimension']}"
+    )
+    if embedding["remote_text_disclosure"]:
+        click.echo("            Warning: embedding text is sent to the configured endpoint")
     click.echo(f"  Models    {', '.join(plan['models'])}")
     if plan["legacy_databases"]:
         click.echo("  Legacy    found; migration is not automatic:")
@@ -133,17 +141,31 @@ def _print_setup_plan(plan: dict) -> None:
     type=click.Choice(["claude", "cursor", "codex"]),
     help="只配置指定 Agent；可重复。默认自动检测",
 )
+@click.option(
+    "--embedding-preset",
+    type=click.Choice(["ollama", "custom"]),
+    help="选择 Ollama（推荐）或自定义 OpenAI-compatible API",
+)
+@click.option("--embedding-base-url", help="embedding API base URL")
+@click.option("--embedding-model", help="embedding 模型名")
+@click.option("--embedding-dimension", type=click.IntRange(min=1), help="向量维度")
+@click.option("--embedding-version", help="不可变 embedding 版本；切换模型/维度时应使用新值")
+@click.option(
+    "--embedding-api-key-env",
+    help="凭据所在的环境变量名（不接受明文凭据）",
+)
 @click.option("--provider", type=click.Choice(["ollama", "api"]), help="模型 provider")
 @click.option("--base-url", help="provider 根 URL（不得包含凭据或 query）")
 @click.option("--llm-model", help="generation 模型名")
-@click.option("--embedding-model", help="embedding 模型名（当前索引要求 1024 维）")
 @click.option("--api-key-env", help="API key 所在环境变量名；只保存变量名")
 @click.option("--enable-schedule", is_flag=True, help="配置用户级 watch schedule")
 @click.option("--skip-models", "--skip-download", is_flag=True,
               help="不下载缺失 Ollama 模型并进入 degraded")
 def setup_command(
     assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
-    embedding_model, api_key_env, enable_schedule, skip_models,
+    embedding_model, api_key_env, embedding_preset, embedding_base_url,
+    embedding_dimension, embedding_version, embedding_api_key_env,
+    enable_schedule, skip_models,
 ):
     """兼容 alias；canonical onboarding 命令为 ``book init``。"""
 
@@ -157,6 +179,11 @@ def setup_command(
         llm_model=llm_model,
         embedding_model=embedding_model,
         api_key_env=api_key_env,
+        embedding_preset=embedding_preset,
+        embedding_base_url=embedding_base_url,
+        embedding_dimension=embedding_dimension,
+        embedding_version=embedding_version,
+        embedding_api_key_env=embedding_api_key_env,
         enable_schedule=enable_schedule,
         skip_models=skip_models,
         full_onboarding=False,
@@ -165,13 +192,38 @@ def setup_command(
 
 def _run_onboarding(
     *, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
-    embedding_model, api_key_env, enable_schedule, skip_models, full_onboarding,
+    embedding_model, api_key_env, embedding_preset, embedding_base_url,
+    embedding_dimension, embedding_version, embedding_api_key_env,
+    enable_schedule, skip_models, full_onboarding,
 ):
     """Shared, rerunnable implementation for ``book init`` and setup alias."""
 
+    embedding_options = (
+        embedding_base_url, embedding_dimension, embedding_version,
+        embedding_api_key_env,
+    )
+    if embedding_preset and provider:
+        raise click.UsageError(
+            "--embedding-preset and --provider are alternative setup interfaces"
+        )
+    if not embedding_preset and any(value is not None for value in embedding_options):
+        raise click.UsageError("embedding 详细选项需与 --embedding-preset 同用")
+    if embedding_preset:
+        try:
+            config.apply_embedding_config(
+                preset=embedding_preset,
+                base_url=embedding_base_url,
+                model=embedding_model,
+                dimension=embedding_dimension,
+                version=embedding_version,
+                api_key_env=embedding_api_key_env,
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
     manager = SetupManager()
     agents = tuple(agents) if agents else None
-    model_options_supplied = any(
+    model_options_supplied = not embedding_preset and any(
         value is not None
         for value in (provider, base_url, llm_model, embedding_model, api_key_env)
     )
@@ -224,7 +276,10 @@ def _run_onboarding(
             return _run_onboarding(
                 assume_yes=False, dry_run=False, as_json=False, agents=None,
                 provider=None, base_url=None, llm_model=None,
-                embedding_model=None, api_key_env=None, enable_schedule=False,
+                embedding_model=None, api_key_env=None, embedding_preset=None,
+                embedding_base_url=None, embedding_dimension=None,
+                embedding_version=None, embedding_api_key_env=None,
+                enable_schedule=False,
                 skip_models=skip_models, full_onboarding=True,
             )
         if agent_answer.lower() == "skip":
@@ -254,7 +309,10 @@ def _run_onboarding(
             return _run_onboarding(
                 assume_yes=False, dry_run=False, as_json=False, agents=None,
                 provider=None, base_url=None, llm_model=None,
-                embedding_model=None, api_key_env=None, enable_schedule=False,
+                embedding_model=None, api_key_env=None, embedding_preset=None,
+                embedding_base_url=None, embedding_dimension=None,
+                embedding_version=None, embedding_api_key_env=None,
+                enable_schedule=False,
                 skip_models=skip_models, full_onboarding=True,
             )
         enable_schedule = schedule_answer == "enable"
@@ -763,12 +821,23 @@ def _legacy_init_db() -> None:
 @click.option("--llm-model", help="generation 模型名")
 @click.option("--embedding-model", help="embedding 模型名")
 @click.option("--api-key-env", help="API key 环境变量名；只保存变量名")
+@click.option(
+    "--embedding-preset",
+    type=click.Choice(["ollama", "custom"]),
+    help="选择 Ollama（推荐）或自定义 OpenAI-compatible API",
+)
+@click.option("--embedding-base-url", help="embedding API base URL")
+@click.option("--embedding-dimension", type=click.IntRange(min=1), help="向量维度")
+@click.option("--embedding-version", help="不可变 embedding 版本")
+@click.option("--embedding-api-key-env", help="embedding 凭据环境变量名")
 @click.option("--enable-schedule", is_flag=True, help="配置用户级 watch schedule")
 @click.option("--skip-models", "--skip-download", is_flag=True, help="跳过模型下载")
 @click.pass_context
 def init_command(
     ctx, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
-    embedding_model, api_key_env, enable_schedule, skip_models,
+    embedding_model, api_key_env, embedding_preset, embedding_base_url,
+    embedding_dimension, embedding_version, embedding_api_key_env,
+    enable_schedule, skip_models,
 ):
     """Canonical ``book init`` onboarding; legacy ``storybook init`` initializes DB."""
 
@@ -776,8 +845,9 @@ def init_command(
     if executable != "book":
         supplied = (
             assume_yes or dry_run or as_json or agents or provider or base_url
-            or llm_model or embedding_model or api_key_env or enable_schedule
-            or skip_models
+            or llm_model or embedding_model or api_key_env or embedding_preset
+            or embedding_base_url or embedding_dimension or embedding_version
+            or embedding_api_key_env or enable_schedule or skip_models
         )
         if supplied:
             raise click.UsageError(
@@ -795,6 +865,11 @@ def init_command(
         llm_model=llm_model,
         embedding_model=embedding_model,
         api_key_env=api_key_env,
+        embedding_preset=embedding_preset,
+        embedding_base_url=embedding_base_url,
+        embedding_dimension=embedding_dimension,
+        embedding_version=embedding_version,
+        embedding_api_key_env=embedding_api_key_env,
         enable_schedule=enable_schedule,
         skip_models=skip_models,
         full_onboarding=True,
@@ -1251,7 +1326,7 @@ def search(
 
 
 @cli.command(name="embedding-backfill")
-@click.option("--model", default=None, help="目标 Ollama embedding 模型")
+@click.option("--model", default=None, help="目标 embedding API 模型")
 @click.option("--version", required=True, help="不可变的目标 embedding 版本")
 @click.option(
     "--representation",
@@ -1485,14 +1560,17 @@ def eval(part, report, benchmark_path, transform_cache):
     并按 exact/synonym/cross-language/cross-tool/ambiguous 执行默认启用门禁。
     exact-term 隔离度量精确错误码在纯向量与 Hybrid 下的 recall@3。
 
-    需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染用户 Profile 数据库。
+    需要配置的 embedding API 可用。评测在隔离临时库中进行，不污染用户 Profile 数据库。
     用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
     """
     parts = (
         "retrieval", "processing", "split", "ablation", "strategy",
         "exact_term",
     ) if part == "all" else (part.replace("-", "_"),)
-    click.echo(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
+    click.echo(
+        f"📐 运行评测: {', '.join(parts)}"
+        f"（embedding type=api, adapter={config.EMBED_ADAPTER}）\n"
+    )
 
     bp = benchmark_path
     try:
@@ -1513,7 +1591,11 @@ def eval(part, report, benchmark_path, transform_cache):
         click.echo(f"❌ 评测失败: {ex}")
         raise
 
-    rep.meta["embed_mode"] = "ollama"
+    rep.meta["embed_mode"] = "api"
+    rep.meta["embedding_adapter"] = config.EMBED_ADAPTER
+    rep.meta["embedding_model"] = config.EMBED_MODEL
+    rep.meta["embedding_dimension"] = config.EMBED_DIM
+    rep.meta["embedding_version"] = config.EMBED_VERSION
     rep.meta["part"] = part
     click.echo(eval_module.format_report(rep))
 

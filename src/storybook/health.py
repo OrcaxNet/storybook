@@ -1,10 +1,10 @@
 """环境与健康自检 - ``storybook doctor``
 
-逐项检查 Ollama 可达性 / DeepSeek LLM 配置 / Embedding 模型 / 向量维度 /
+逐项检查 Embedding API / DeepSeek LLM 配置 / Embedding 模型 / 向量维度 /
 sqlite-vec 扩展与虚表 / 向量双写一致性，给出 ✅/❌ 与可操作修复建议；
 ``--fix`` 可修复向量双写不一致。
 
-优先级与依赖：Ollama 不可达时模型/维度检查跳过；sqlite-vec 或虚表缺失时一致性检查跳过。
+优先级与依赖：API 不可用时维度检查跳过；sqlite-vec 或虚表缺失时一致性检查跳过。
 """
 import logging
 from dataclasses import dataclass
@@ -13,6 +13,7 @@ import click
 import requests
 
 from . import config
+from . import embeddings
 from . import store
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ class CheckResult:
 def _check_ollama_reachable() -> tuple[bool, dict | None, str]:
     """GET {OLLAMA_HOST}/api/tags。返回 (可达, tags JSON, 错误信息)。"""
     try:
-        resp = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=5)
+        resp = requests.get(f"{config.EMBED_BASE_URL}/api/tags", timeout=5)
         resp.raise_for_status()
         return True, resp.json(), ""
     except Exception as e:
@@ -53,31 +54,63 @@ def _model_pulled(tags: dict | None, model: str) -> bool:
 
 
 def _probe_embed_dim() -> tuple[bool, int, str]:
-    """用 EMBED_MODEL 探测实际向量维度。返回 (成功, 维度, 错误信息)。"""
+    """用统一 API 探测实际向量维度。"""
+    result = embeddings.probe()
+    return bool(result["ok"]), int(result["dimension"]), str(result["reason"] or "")
+
+
+def serving_index_compatibility(actual_dimension: int | None) -> dict:
+    """Compare configured API target with the immutable active index contract."""
+
     try:
-        if config.EMBED_PROVIDER == "api":
-            resp = requests.post(
-                f"{config.EMBED_BASE_URL}/v1/embeddings",
-                headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"},
-                json={"model": config.EMBED_MODEL, "input": "storybook doctor probe"},
-                timeout=30,
-            )
-        else:
-            resp = requests.post(
-                f"{config.EMBED_BASE_URL}/api/embeddings",
-                json={"model": config.EMBED_MODEL, "prompt": "storybook doctor probe"},
-                timeout=30,
-            )
-        resp.raise_for_status()
-        payload = resp.json()
-        if config.EMBED_PROVIDER == "api":
-            rows = payload.get("data", [])
-            vec = rows[0].get("embedding", []) if rows else []
-        else:
-            vec = payload.get("embedding") or []
-        return True, len(vec), ""
-    except Exception as e:
-        return False, 0, str(e)
+        state = store.get_embedding_index_state()
+        serving_dimension = store.serving_embedding_dimension()
+    except Exception:  # schema can be absent during first-run diagnostics
+        state, serving_dimension = {}, None
+    mismatches: list[str] = []
+    active_model = state.get("active_model")
+    active_version = state.get("active_version")
+    identity = embeddings.serving_route_identity(state)
+    active_endpoint = identity["base_url"]
+    active_adapter = identity["adapter"]
+    active_dimension = state.get("active_dimension")
+    active_api_key_env = identity["api_key_env"]
+    if state and not identity["credential_known"]:
+        mismatches.append("credential reference for active index is unknown")
+    if state and active_endpoint != config.EMBED_BASE_URL:
+        mismatches.append(
+            f"endpoint active={active_endpoint or 'unknown'} target={config.EMBED_BASE_URL}"
+        )
+    if state and active_adapter != config.EMBED_ADAPTER:
+        mismatches.append(
+            f"adapter active={active_adapter or 'unknown'} target={config.EMBED_ADAPTER}"
+        )
+    if state and active_api_key_env != config.EMBED_API_KEY_ENV:
+        mismatches.append("credential reference differs from active index")
+    if state and active_dimension != serving_dimension:
+        mismatches.append(
+            f"dimension identity={active_dimension or 'unknown'} active={serving_dimension}"
+        )
+    if serving_dimension and actual_dimension and serving_dimension != actual_dimension:
+        mismatches.append(
+            f"dimension active={serving_dimension} api={actual_dimension}"
+        )
+    if active_model and active_model != config.EMBED_MODEL:
+        mismatches.append(f"model active={active_model} target={config.EMBED_MODEL}")
+    if active_version and active_version != config.EMBED_VERSION:
+        mismatches.append(
+            f"version active={active_version} target={config.EMBED_VERSION}"
+        )
+    return {
+        "ok": not mismatches,
+        "reason": None if not mismatches else "serving_index_mismatch",
+        "serving_dimension": serving_dimension,
+        "active_model": active_model,
+        "active_version": active_version,
+        "active_endpoint": active_endpoint,
+        "active_adapter": active_adapter,
+        "detail": "; ".join(mismatches),
+    }
 
 
 # ═══════════════════════════════════════════════
@@ -92,41 +125,35 @@ def run_doctor(fix: bool = False) -> bool:
     """
     results: list[CheckResult] = []
 
-    # [1] Provider reachability. Legacy installs retain the no-cost generation
-    # check and only probe their local Ollama embedding dependency.
-    ollama_ok, tags, ollama_err = _check_ollama_reachable() if config.EMBED_PROVIDER == "ollama" else (True, {}, "")
-    if config.EMBED_PROVIDER != "ollama":
+    # [1] 顶层始终是 API；只有 Ollama adapter 会枚举本地模型。
+    tags = None
+    if config.EMBED_ADAPTER == "ollama":
+        endpoint_ok, tags, endpoint_err = _check_ollama_reachable()
+        detail = f"type=api，adapter=ollama，{config.EMBED_BASE_URL}"
+        if endpoint_ok:
+            detail += f"（已加载 {len(tags.get('models', []))} 个模型）"
+        else:
+            detail += f"，reason=endpoint_unreachable：{endpoint_err}"
         results.append(CheckResult(
-            "模型 Provider", bool(config.EMBED_API_KEY),
-            detail=(f"provider=api，generation={config.LLM_MODEL}，embedding={config.EMBED_MODEL}，"
-                    f"status={'configured' if config.EMBED_API_KEY else 'degraded'}"),
-            suggestion=(f"设置 {config.MODEL_CONFIG.embedding.credential_env}"
-                        if not config.EMBED_API_KEY else "")))
-    elif ollama_ok:
-        n = len(tags.get("models", []))
-        results.append(CheckResult(
-            "Ollama 服务", True,
-            detail=f"{config.OLLAMA_HOST}（已加载 {n} 个模型）"))
+            "Embedding API", endpoint_ok, detail=detail,
+            suggestion="启动 Ollama：`ollama serve`（或设置 STORYBOOK_EMBED_BASE_URL）"
+            if not endpoint_ok else ""))
+        model_ready = endpoint_ok and _model_pulled(tags, config.EMBED_MODEL)
+        probe_result = None
     else:
+        probe_result = embeddings.probe()
+        endpoint_ok = bool(probe_result["ok"]) or probe_result["reason"] == "dimension_mismatch"
+        model_ready = endpoint_ok
         results.append(CheckResult(
-            "Ollama 服务", False,
-            detail=f"{config.OLLAMA_HOST} 不可达：{ollama_err}",
-            suggestion="启动 Ollama：`ollama serve`（或设置 OLLAMA_HOST 指向正确地址）"))
-
-    embed_pulled = (
-        bool(config.EMBED_API_KEY)
-        if config.EMBED_PROVIDER == "api"
-        else ollama_ok and _model_pulled(tags, config.EMBED_MODEL)
-    )
+            "Embedding API", endpoint_ok,
+            detail=(f"type=api，adapter={config.EMBED_ADAPTER}，"
+                    f"{config.EMBED_BASE_URL}"
+                    + ("" if endpoint_ok else f"，reason={probe_result['reason']}")),
+            suggestion="检查 endpoint、凭据环境变量、模型名与响应协议"
+            if not endpoint_ok else ""))
 
     # [2] 云端生成式 LLM 只做无费用的配置就绪检查，不发送生成请求，也不依赖 Ollama。
-    if config.LLM_PROVIDER == "ollama":
-        generation_ready = ollama_ok and _model_pulled(tags, config.LLM_MODEL)
-        results.append(CheckResult(
-            "LLM 配置", generation_ready,
-            detail=f"provider=ollama，model={config.LLM_MODEL}，status={'ready' if generation_ready else 'model_missing'}",
-            suggestion=(f"`ollama pull {config.LLM_MODEL}`" if not generation_ready else "")))
-    elif config.LLM_API_KEY:
+    if config.LLM_API_KEY:
         results.append(CheckResult(
             "LLM 配置",
             True,
@@ -141,24 +168,28 @@ def run_doctor(fix: bool = False) -> bool:
                         "也可通过 STORYBOOK_LLM_ENV_FILE 指定配置文件")))
 
     # [3] Embedding 模型已拉取
-    if config.EMBED_PROVIDER == "api" and not config.EMBED_API_KEY:
+    if not endpoint_ok:
         results.append(CheckResult("Embedding 模型", False, skipped=True,
-                                   detail=f"{config.EMBED_MODEL}（credential 缺失，跳过）"))
-    elif not ollama_ok:
-        results.append(CheckResult("Embedding 模型", False, skipped=True,
-                                   detail=f"{config.EMBED_MODEL}（Ollama 不可达，跳过）"))
-    elif embed_pulled:
+                                   detail=f"{config.EMBED_MODEL}（API 不可用，跳过）"))
+    elif model_ready:
         results.append(CheckResult("Embedding 模型", True, detail=config.EMBED_MODEL))
     else:
         results.append(CheckResult("Embedding 模型", False, detail=config.EMBED_MODEL,
-                                   suggestion=f"`ollama pull {config.EMBED_MODEL}`"))
+                                   suggestion=f"`ollama pull {config.EMBED_MODEL}`"
+                                   if config.EMBED_ADAPTER == "ollama"
+                                   else "检查 API 中的模型名与授权"))
 
     # [4] Embedding 维度一致
-    if not embed_pulled:
+    if not model_ready:
         results.append(CheckResult("Embedding 维度", False, skipped=True,
                                    detail=f"期望 {config.EMBED_DIM}（Embedding 模型不可用，跳过）"))
     else:
-        dim_ok, actual, dim_err = _probe_embed_dim()
+        if probe_result is None:
+            dim_ok, actual, dim_err = _probe_embed_dim()
+        else:
+            actual = int(probe_result["dimension"])
+            dim_ok = bool(probe_result["ok"])
+            dim_err = str(probe_result["reason"] or "")
         if dim_ok:
             if actual == config.EMBED_DIM:
                 results.append(CheckResult(
@@ -174,9 +205,30 @@ def run_doctor(fix: bool = False) -> bool:
             results.append(CheckResult(
                 "Embedding 维度", False,
                 detail=f"探测失败：{dim_err}",
-                suggestion="检查 Ollama embedding 接口与模型是否正常"))
+                suggestion="检查 embedding endpoint、凭据、模型与响应协议"))
+    if config.EMBED_ADAPTER == "ollama":
+        results.append(CheckResult(
+            "Ollama warm/cold", True,
+            detail=f"model_state={embeddings.model_state()}"))
 
-    # [5] sqlite-vec 扩展 + story_vectors 虚表
+    # [5] Target config must not masquerade as the active serving index.
+    compatibility = serving_index_compatibility(actual if model_ready else None)
+    if compatibility["ok"]:
+        results.append(CheckResult(
+            "Serving index 兼容性", True,
+            detail=(f"dimension={compatibility['serving_dimension'] or 'uninitialized'}，"
+                    f"model={compatibility['active_model'] or 'uninitialized'}，"
+                    f"version={compatibility['active_version'] or 'uninitialized'}，"
+                    f"adapter={compatibility['active_adapter'] or 'uninitialized'}，"
+                    f"endpoint={compatibility['active_endpoint'] or 'uninitialized'}")))
+    else:
+        results.append(CheckResult(
+            "Serving index 兼容性", False,
+            detail=f"reason=serving_index_mismatch：{compatibility['detail']}",
+            suggestion=("保留当前 serving index；使用 `storybook embedding-backfill` "
+                        "完成 shadow 后再原子切换")))
+
+    # [6] sqlite-vec 扩展 + story_vectors 虚表
     ext_ok = store.check_vec_extension()
     db_exists = config.DB_PATH.exists()
     stories_exists = store.stories_table_exists()
@@ -201,7 +253,7 @@ def run_doctor(fix: bool = False) -> bool:
             "sqlite-vec 扩展 + story_vectors 虚表", True,
             detail="扩展加载成功，虚表存在"))
 
-    # [6] 向量双写一致性
+    # [7] 向量双写一致性
     can_check = ext_ok and db_exists and stories_exists and vec_exists
     if not can_check:
         results.append(CheckResult("向量双写一致性", False, skipped=True,

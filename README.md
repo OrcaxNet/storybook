@@ -2,7 +2,7 @@
 
 > 离线 Coding 记忆系统 —— 把每一次 AI 编程会话在"梦境"里整理成一条 Story，再连成一张可被联想唤醒的记忆网。
 >
-> A local-first coding memory system that consolidates AI-coding sessions into structured *Stories* via a "dream cycle" and links them into a weighted association graph. Generative work uses DeepSeek; embeddings remain local in Ollama.
+> A local-first coding memory system that consolidates AI-coding sessions into structured *Stories* via a "dream cycle" and links them into a weighted association graph. Generative work uses DeepSeek; embeddings use a unified API abstraction with local Ollama as the recommended preset.
 
 ## 这是什么 / What it is
 
@@ -10,7 +10,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 
 检索时，Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。Auto 仅在 zero/low-confidence、复合、跨语言或强环境歧义时进入独立预算的 Query Transformation/HyDE 第二阶段；Deep 必须由调用方显式选择。每条结果返回来源路径与分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
 
-系统采用**混合 provider**：生成式 LLM 通过 DeepSeek Anthropic-compatible Messages API，1024 维 embedding 与索引仍完全留在本机 Ollama。Fast 查询不调用生成式 LLM；只有做梦加工以及门控后的 Auto/Deep transformation 会把对应文本发送给 DeepSeek。
+系统采用**混合 provider**：生成式 LLM 通过 DeepSeek Anthropic-compatible Messages API；embedding 顶层统一为 `type=api`，默认使用本地 Ollama 推荐 preset，也可改用 OpenAI-compatible API。Fast 查询不调用生成式 LLM。选择远程 embedding API 时，待向量化的 Story/query 文本会离开本机。
 
 ## ✨ 特性
 
@@ -21,7 +21,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
 - 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/lexical/fusion/transform/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 与离线策略消融同时守护质量/时延
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
-- 🏠 **本地优先**：Profile、原始证据、数据库与 embedding 留在本机；云端生成调用可明确门控并快速降级
+- 🏠 **本地优先**：Profile、原始证据与数据库留在本机；embedding 默认走本地 Ollama，选择远程 API 时会明确披露文本离机；云端调用均可快速降级
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
 - 🌅 **晨间简报**：会话启动时基于 cwd / 首条提问**主动召回**相关记忆并注入上下文（`SessionStart` hook 或 `prime_context` MCP 工具），实现"下意识回忆"--更贴近初衷；token 预算内、相关度不足时**静默不注入**
 
@@ -79,7 +79,8 @@ storybook embedding-backfill --model qwen3-embedding:0.6b \
 
 - **Python 3.11+**（推荐用 [uv](https://github.com/astral-sh/uv) 建 venv）
 - **DeepSeek API 凭据**：优先 `ANTHROPIC_AUTH_TOKEN`，兼容 `DEEPSEEK_KEY`；默认读取 `~/.chrc/dpsk.sh`
-- **Ollama** 运行于 `http://localhost:11434`（可用 `OLLAMA_HOST` 覆盖），仅需拉取 embedding 模型 `qwen3-embedding:0.6b`，**1024 维**（可用 `STORYBOOK_EMBED_MODEL` 覆盖）；需与 `config.EMBED_DIM` 一致
+- **Ollama（推荐）**：本地 preset 默认为 `http://localhost:11434` + `qwen3-embedding:0.6b` + 1024 维。旧 `OLLAMA_HOST` / `STORYBOOK_EMBED_MODEL` 会自动映射，无需重建现有索引
+- **自定义 API（可选）**：设置 `STORYBOOK_EMBED_ADAPTER=openai_compatible`、base URL、model、dimension；凭据只通过 `STORYBOOK_EMBED_API_KEY_ENV` 引用环境变量
 
 ### 模型 Provider onboarding
 
@@ -99,8 +100,8 @@ book init --provider api --base-url https://gateway.example/v1-root \
   --api-key-env STORYBOOK_API_KEY
 ```
 
-外部 embedding 必须返回 1024 维，否则 setup 以
-`SB_MODEL_EMBED_DIM_MISMATCH` 失败。base URL 中的 userinfo、query 和 fragment
+外部 embedding 必须返回当前 Profile 配置的 `STORYBOOK_EMBED_DIM` 维度，否则
+setup/doctor 会报告 dimension mismatch。base URL 中的 userinfo、query 和 fragment
 会被拒绝，doctor/status/JSON 输出不会包含 credential 值或 Authorization header。
 未生成 Profile 配置的旧安装继续按“Profile 配置 > 旧环境变量 > 默认值”的优先级
 只读解析 `ANTHROPIC_*`、`DEEPSEEK_KEY`、`OLLAMA_HOST` 与
@@ -170,7 +171,7 @@ PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 ### 一键 setup 与安全卸载
 
 `book init` 会先展示完整改动计划，再创建用户级 Profile/schema、检测并接入
-Claude Code、Cursor、Codex，只检查或下载本地 Ollama embedding 模型，最后执行 schema、embedding、
+Claude Code、Cursor、Codex。Ollama 推荐 preset 会检查/下载本地 embedding 模型；自定义 API 不会调用 Ollama 的 tags/pull 接口。最后执行 schema、embedding、
 adapter、recall smoke test。三类 Agent 都复用同一个 `storybook mcp` stdio server；Claude
 Code 还会安装幂等的 `SessionStart` recall hook。无需手工编辑 JSON/TOML。
 
@@ -182,6 +183,12 @@ book init --json                        # 结构化结果，便于自动化
 book init --agent codex --yes           # 可重复 --agent，覆盖自动检测
 book init --enable-schedule --yes       # 生成用户级 watch service（无需 sudo）
 book init --skip-models --yes           # 离线跳过缺失模型，状态为 degraded
+book init --yes --embedding-preset ollama
+book init --yes --embedding-preset custom \
+  --embedding-base-url https://embedding.example/v1 \
+  --embedding-model your-model --embedding-dimension 1024 \
+  --embedding-version your-model-v1 \
+  --embedding-api-key-env PRIVATE_EMBED_API_KEY
 
 storybook uninstall                     # 恢复 setup 写入的节点，默认保留全部记忆
 storybook uninstall --dry-run
@@ -193,6 +200,10 @@ storybook uninstall --yes --purge-data --confirm-purge  # 非交互双重显式�
 重复 MCP 节点或 hook。卸载只恢复名为 `storybook` 的受管节点，保留其他 server、hook
 和设置；若节点在安装后被人工修改，会报告 drift 并保留恢复状态，避免覆盖用户改动。
 旧项目级 `data/memory.db` 只会在计划/结果中提示，不会由 setup 擅自迁移或删除。
+
+`--embedding-preset ollama` 自动填入本地地址、推荐模型、1024 维和 Ollama adapter。`custom` 需显式提供 base URL、model 和 dimension；只持久符合 `[A-Za-z_][A-Za-z0-9_]*` 的凭据环境变量名，疑似明文凭据会在任何写入前被拒绝。选择会保存在用户级 setup state，之后的 CLI/MCP 进程自动复用，而显式环境变量仍优先。非 loopback endpoint 始终显示“文本将离开本机”警告。
+
+Serving index 的身份包含 endpoint、adapter、model、version、dimension 和非敏感的 credential-env 引用。修改任一项会进入 `serving_index_mismatch`；默认查询继续使用旧 index 对应的 API 与凭据引用，直到 `embedding-backfill` 完成 shadow generation 并原子切换，避免将不同向量空间混入同一索引。旧版 schema 只支持 Ollama，因此升级时会按既有 `OLLAMA_HOST`/默认地址映射 active identity，不改写 Story 或向量索引；custom API identity 不会被猜测。
 
 ## 👤 用户级 Profile 与共享存储
 
@@ -286,7 +297,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 ## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
 
 PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段。`storybook eval` 建立可重复的检索质量基线，
-作为调参与算法改进的度量依据。**需要 Ollama 运行**（embedding 走真实 `qwen3-embedding`），评测在隔离临时库中进行，不污染用户 Profile 数据库。
+作为调参与算法改进的度量依据。评测需要已配置的 embedding API 可用，并在隔离临时库中运行，不污染用户 Profile 数据库。仓库现有固定评测证据使用本地 Ollama `qwen3-embedding:0.6b`；不同 endpoint、adapter、模型、维度或版本的指标不可直接等同。
 
 ```bash
 storybook eval all                              # 跑全部六轮评测（默认）
@@ -340,10 +351,13 @@ storybook status --performance --json
 `status --json` 同时返回当前 `profile`、混合 provider `model`、setup 管理的
 `adapter`、`sync` 与计数字段。组件全部可用时 `status=ready`；Profile、模型或
 已配置 adapter 不可用时返回 `status=ready_degraded`，并通过稳定的
-`degraded_reasons`（例如 `llm_credentials_missing`、`ollama_unavailable`、`model_missing:embedding`、
+`degraded_reasons`（例如 `llm_credentials_missing`、`endpoint_unreachable:embedding`、`authentication_failed:embedding`、`credentials_missing:embedding`、`model_unavailable:embedding`、`response_protocol_incompatible:embedding`、`dimension_mismatch:embedding`、
 `adapter_unavailable:codex`）解释降级，不把可用的本地数据库误报为整体失败。
+`doctor` / `status` 还会对比 API 实际维度与 active `story_vectors` 维度、model/version；切换未完成时返回 `serving_index_mismatch:embedding`，保留旧索引并要求先做 shadow backfill。Ollama payload 额外暴露 `model_state=warm|cold`。不同维度的 backfill 完整后，activation 在同一事务内重建 vec0 表并切换。
 
 完整性能基准复用 `data/retrieval_benchmark.json` 的人工 ground truth，并在隔离临时库中构造固定 seed 的 10k Story 数据集。默认跑 50 条固定查询、每条重复 20 次、并发 1 和 5，报告机器/模型状态/规模/重复次数、所有阶段的 p50/p95/p99，以及按 exact/synonym/cross_lang 分组的 recall@1/3/5 和 MRR。基准不会污染用户数据库，也不会把原始 query、Story 内容、绝对路径或仓库 URL 写入报告。
+
+仓库内已有固定评测证据使用 `type=api`、`adapter=ollama`、完整模型名 `qwen3-embedding:0.6b`、1024 维和 `story-v2-default-v1` 版本。新报告会同时记录 type/adapter/model/dimension/version；任一字段不同时，指标不应直接等同。
 
 ```bash
 # warm：先预热模型，再跑 10k × 50 × 20 × concurrency(1,5)
@@ -540,16 +554,16 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`）, `graph_enabled?` | 返回直接/图扩散命中；图命中含 `seed_story_id/graph_path/score_components`，顶层 `truncated` 表示图预算安全截断 |
-| `get_story` | `story_id`（必填） | 查看完整 `detail/sources/revisions` 与兼容 `title/content/version`，剥离 1024 维 embedding |
+| `get_story` | `story_id`（必填） | 查看完整 `detail/sources/revisions` 与兼容 `title/content/version`，不返回原始 embedding 向量 |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
-| `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / Ollama 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
+| `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / embedding API 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
 
 ### 说明
 
 - server、CLI、Claude/Cursor collector 和 Codex 等 MCP 客户端都经 Profile registry 共享同一数据目录（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
 - `recall` 复用 CLI `search` 的全部语义；命中记忆的 `access_count` 自增、共同召回边权提权会进入后台反馈队列，不阻塞查询响应。
-- `recall` 优先使用本地 Ollama 生成查询向量；Ollama 不可用或超时时返回显式 degraded 状态和 FTS/关键词可用结果，不抛出伪装成“无匹配”的环境错误。`get_story` / `stats` 不依赖 Ollama。
-- `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**--Ollama 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
+- `recall` 优先使用配置的 embedding API 生成查询向量；API 不可用或超时时返回显式 degraded 状态和 FTS/关键词可用结果，不抛出伪装成“无匹配”的环境错误。`get_story` / `stats` 不依赖 embedding API。
+- `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**--embedding API 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
 - server 启动时自动 `init_db`：全新环境下 `recall` 返回空、`stats` 返回 0、`get_story` 报不存在、`prime_context` 返回 `injected=false`。
 
 ## 🌅 会话启动注入（晨间简报 / 上下文预热）
@@ -566,7 +580,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 ### 行为保证（验收标准）
 
 1. **有匹配时自动注入**：召回 ≥ `PRIME_MIN_SIMILARITY`（默认 0.60，高于检索 0.50）的记忆，渲染为精简简报。
-2. **无相关记忆时静默不注入、不报错**：召回为空 / 全低于门槛 / Ollama 不可用 / DB 未初始化 -> `injected=false`、`briefing=""`、hook 输出空 stdout（什么都不注入）。
+2. **无相关记忆时静默不注入、不报错**：召回为空 / 全低于门槛 / embedding API 不可用 / DB 未初始化 -> `injected=false`、`briefing=""`、hook 输出空 stdout（什么都不注入）。
 3. **token 预算内、有针对性**：简报 ≤ `PRIME_TOKEN_BUDGET`（默认 2000）token，超额时按相似度从低到高丢弃候选并对单条摘要裁剪（`truncated=true`）；每条摘要 ≤ `PRIME_CONTENT_EXCERPT_CHARS`（默认 140）字符。
 4. **hook / 接入说明**：见下文。
 
@@ -639,12 +653,17 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 |----------|--------|------|
 | `STORYBOOK_PROFILE` | registry 当前项 | 仅当前进程选择 Profile（UUID 或显示名），不改 registry |
 | `STORYBOOK_HOME` | 平台用户目录 | 显式收拢/隔离 registry、数据、缓存与日志 |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama 服务地址 |
+| `STORYBOOK_EMBED_PRESET` | `ollama` | embedding 预设；Ollama 是推荐的本地 preset |
+| `STORYBOOK_EMBED_ADAPTER` | `ollama` | 内部请求协议：`ollama` / `openai_compatible` |
+| `STORYBOOK_EMBED_BASE_URL` | `OLLAMA_HOST` 或 `http://localhost:11434` | embedding API base URL |
+| `OLLAMA_HOST` | `http://localhost:11434` | 旧配置兼容别名；映射为 API base URL |
+| `STORYBOOK_EMBED_API_KEY_ENV` | 无 | 凭据所在的环境变量名；密钥不持久化/输出 |
 | `STORYBOOK_LLM_ENV_FILE` | `~/.chrc/dpsk.sh` | DeepSeek shell-env 配置文件（纯文本解析） |
 | `ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic-compatible Base URL |
 | `ANTHROPIC_AUTH_TOKEN` / `DEEPSEEK_KEY` | 无 | API key 与兼容回退变量；不会写入日志/status |
 | `STORYBOOK_LLM_MODEL` | `deepseek-v4-flash` | 生成模型；其次读取 `ANTHROPIC_DEFAULT_HAIKU_MODEL` |
-| `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型（必须 1024 维） |
+| `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型；输出维度必须与 `STORYBOOK_EMBED_DIM` 一致 |
+| `STORYBOOK_EMBED_DIM` | `1024` | API 响应必须匹配的向量维度 |
 | `STORYBOOK_EMBED_VERSION` | `story-v2-default-v1` | 活跃表示的不可变版本标识 |
 | `STORYBOOK_EMBED_REPRESENTATION` | `default` | 默认 `title + abstract + applicability` |
 | `STORYBOOK_INFERENCE_CACHE_ENABLED` | `1` | Profile 私有 LLM/embedding 输入哈希缓存；`0` 禁用 |
@@ -700,7 +719,7 @@ storybook/
 │   ├── store.py        # SQLite + sqlite-vec 存储层
 │   ├── processor.py    # 做梦周期（dream cycle）
 │   ├── llm.py          # DeepSeek Anthropic-compatible Messages API
-│   ├── embeddings.py   # Ollama embedding 调用
+│   ├── embeddings.py   # 统一 embedding API 与 Ollama/OpenAI-compatible adapter
 │   ├── search.py       # 版本化缓存 + 向量/词法降级 + 关联激活
 │   ├── query_cache.py  # index_version 隔离的向量/结果 LRU+TTL 缓存
 │   ├── feedback.py     # access_count/边权异步反馈队列
@@ -721,10 +740,10 @@ storybook/
 
 ## 📝 说明
 
-- **隐私边界**：Profile、数据库、原始证据和 embedding 均留在本机；生成式操作会把其 prompt 发送到 DeepSeek，Fast 查询不会。
+- **隐私边界**：Profile、数据库与原始证据留在本机；本地 Ollama preset 不发送文本离机，远程 embedding/generation API 会接收各自请求文本并在 setup/status 中披露；Fast 查询不调用生成式 LLM。
 - **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖真实 provider（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
 - **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「🔌 MCP 接入」）。
-- **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / Ollama 不可用时静默不注入（见上文「🌅 会话启动注入」）。
+- **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / embedding API 不可用时静默不注入（见上文「🌅 会话启动注入」）。
 - `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「🧪 测试」与「🌙 做梦周期自动化」）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 

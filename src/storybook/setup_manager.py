@@ -83,7 +83,7 @@ def _format_size(size: int | None) -> str | None:
 
 
 def _ollama_tags() -> dict[str, dict[str, Any]]:
-    response = requests.get(f"{config.OLLAMA_HOST}/api/tags", timeout=3)
+    response = requests.get(f"{config.EMBED_BASE_URL}/api/tags", timeout=3)
     response.raise_for_status()
     payload = response.json()
     return {
@@ -95,7 +95,7 @@ def _ollama_tags() -> dict[str, dict[str, Any]]:
 
 def _pull_model(model: str, progress: Progress | None = None) -> None:
     with requests.post(
-        f"{config.OLLAMA_HOST}/api/pull",
+        f"{config.EMBED_BASE_URL}/api/pull",
         json={"name": model, "stream": True},
         stream=True,
         timeout=(3, None),
@@ -131,6 +131,7 @@ def _pull_model(model: str, progress: Progress | None = None) -> None:
 @dataclass(frozen=True)
 class SetupPlan:
     profile: dict[str, Any]
+    embedding: dict[str, Any]
     adapters: tuple[dict[str, Any], ...]
     models: tuple[str, ...]
     legacy_databases: tuple[str, ...]
@@ -138,6 +139,7 @@ class SetupPlan:
     def as_dict(self) -> dict[str, Any]:
         return {
             "profile": self.profile,
+            "embedding": self.embedding,
             "adapters": list(self.adapters),
             "models": list(self.models),
             "legacy_databases": list(self.legacy_databases),
@@ -304,6 +306,18 @@ class SetupManager:
         }
         return SetupPlan(
             profile=profile_plan,
+            embedding={
+                "type": config.EMBED_TYPE,
+                "preset": config.EMBED_PRESET,
+                "adapter": config.EMBED_ADAPTER,
+                "base_url": config.EMBED_BASE_URL,
+                "model": config.EMBED_MODEL,
+                "dimension": config.EMBED_DIM,
+                "version": config.EMBED_VERSION,
+                "config_source": config.EMBED_CONFIG_SOURCE,
+                "config_normalized": config.EMBED_CONFIG_NORMALIZED,
+                "remote_text_disclosure": config.embedding_text_leaves_device(),
+            },
             adapters=tuple(adapter_plans),
             models=(config.EMBED_MODEL,),
             legacy_databases=self._legacy_databases(),
@@ -351,6 +365,34 @@ class SetupManager:
         args = launcher.get("args")
         if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
             raise self._invalid_state("launcher.args 必须是 string array")
+
+        embedding = state.get("embedding")
+        if embedding is not None:
+            if not isinstance(embedding, dict):
+                raise self._invalid_state("embedding 必须是 object")
+            expected_strings = (
+                "type", "preset", "adapter", "base_url", "model", "version",
+                "api_key_env",
+            )
+            if any(not isinstance(embedding.get(name), str) for name in expected_strings):
+                raise self._invalid_state("embedding 字段类型无效")
+            if embedding["type"] != "api":
+                raise self._invalid_state("embedding.type 必须是 api")
+            if embedding["preset"] not in {"ollama", "custom"}:
+                raise self._invalid_state("embedding.preset 无效")
+            if embedding["adapter"] not in {"ollama", "openai_compatible"}:
+                raise self._invalid_state("embedding.adapter 无效")
+            if type(embedding.get("dimension")) is not int or embedding["dimension"] < 1:
+                raise self._invalid_state("embedding.dimension 必须是正整数")
+            if embedding["api_key_env"] and not config.valid_environment_variable_name(
+                embedding["api_key_env"]
+            ):
+                raise self._invalid_state(
+                    "embedding.api_key_env 必须是环境变量名"
+                )
+            forbidden = {"api_key", "token", "credential", "authorization"}
+            if forbidden.intersection(embedding):
+                raise self._invalid_state("embedding 不得持久化明文凭据")
 
         adapter_states = state.get("adapters")
         if not isinstance(adapter_states, dict):
@@ -540,6 +582,18 @@ class SetupManager:
             if provider_config is not None
             else (config.EMBED_MODEL,)
         ))
+        if provider_config is None and config.EMBED_ADAPTER != "ollama":
+            # 通用 API 的模型生命周期由服务端管理；setup 不得调用
+            # Ollama 的 tags/pull 端点。可用性由后续 embedding smoke 验证。
+            return (
+                [{
+                    "name": name,
+                    "status": "configured",
+                    "provider": "api",
+                    "adapter": config.EMBED_ADAPTER,
+                } for name in required],
+                [],
+            )
         try:
             installed = _ollama_tags()
         except Exception as exc:  # noqa: BLE001 -- 网络/daemon 统一降级
@@ -927,6 +981,16 @@ class SetupManager:
                     "command": self.launcher.command,
                     "args": list(self.launcher.args),
                 },
+                "embedding": {
+                    "type": config.EMBED_TYPE,
+                    "preset": config.EMBED_PRESET,
+                    "adapter": config.EMBED_ADAPTER,
+                    "base_url": config.EMBED_BASE_URL,
+                    "model": config.EMBED_MODEL,
+                    "dimension": config.EMBED_DIM,
+                    "version": config.EMBED_VERSION,
+                    "api_key_env": config.EMBED_API_KEY_ENV,
+                },
                 "adapters": adapter_states,
                 "schedule": schedule,
             }
@@ -1020,58 +1084,69 @@ class SetupManager:
         if not llm_ready:
             degraded_reasons.append("llm_credentials_missing")
 
-        if config.EMBED_PROVIDER == "api":
-            embedding_ready = bool(config.EMBED_API_KEY)
-            model_payload = {
-                "provider": "api",
-                "status": "ready" if llm_ready and embedding_ready else "degraded",
-                "llm": llm_payload,
-                "embedding": {
-                    "provider": "api", "name": config.EMBED_MODEL,
-                    "status": "ready" if embedding_ready else "credentials_missing",
-                },
-            }
-            if not embedding_ready:
-                degraded_reasons.append("embedding_credentials_missing")
-            ollama_ok, tags = True, {}
-        else:
-            ollama_ok, tags, _ = health._check_ollama_reachable()
-        if config.EMBED_PROVIDER == "api":
-            pass
-        elif not ollama_ok:
-            model_payload = {
-                "provider": "ollama" if config.LLM_PROVIDER == "ollama" else "hybrid",
-                "status": "degraded",
-                "llm": llm_payload,
-                "embedding": {
-                    "provider": "ollama",
-                    "name": config.EMBED_MODEL,
-                    "status": "unavailable",
-                },
-            }
-            degraded_reasons.append("ollama_unavailable")
-        else:
-            embedding_ready = health._model_pulled(tags, config.EMBED_MODEL)
-            generation_ready = (
-                health._model_pulled(tags, config.LLM_MODEL)
-                if config.LLM_PROVIDER == "ollama" else llm_ready
+        actual_dimension = None
+        if config.EMBED_ADAPTER == "ollama":
+            endpoint_ok, tags, _ = health._check_ollama_reachable()
+            embedding_ready = endpoint_ok and health._model_pulled(
+                tags, config.EMBED_MODEL
             )
-            if config.LLM_PROVIDER == "ollama":
-                llm_payload["status"] = "ready" if generation_ready else "missing"
-            model_payload = {
-                "provider": "ollama" if config.LLM_PROVIDER == "ollama" else "hybrid",
-                "status": "ready" if generation_ready and embedding_ready else "degraded",
-                "llm": llm_payload,
-                "embedding": {
-                    "provider": "ollama",
-                    "name": config.EMBED_MODEL,
-                    "status": "ready" if embedding_ready else "missing",
-                },
-            }
+            if not endpoint_ok:
+                embedding_status = "unavailable"
+                degraded_reasons.append("endpoint_unreachable:embedding")
+            elif not embedding_ready:
+                embedding_status = "missing"
+                degraded_reasons.append("model_unavailable:embedding")
+            else:
+                probe = embeddings.probe()
+                actual_dimension = int(probe["dimension"])
+                embedding_ready = bool(probe["ok"])
+                reason = str(probe["reason"] or "")
+                embedding_status = "ready" if embedding_ready else reason
+                if not embedding_ready:
+                    degraded_reasons.append(f"{reason}:embedding")
+        else:
+            probe = embeddings.probe()
+            actual_dimension = int(probe["dimension"])
+            embedding_ready = bool(probe["ok"])
+            reason = str(probe["reason"] or "")
+            embedding_status = "ready" if embedding_ready else reason
             if not embedding_ready:
-                degraded_reasons.append("model_missing:embedding")
-            if config.LLM_PROVIDER == "ollama" and not generation_ready:
-                degraded_reasons.append("model_missing:generation")
+                degraded_reasons.append(f"{reason}:embedding")
+
+        compatibility = health.serving_index_compatibility(actual_dimension)
+        if embedding_ready and not compatibility["ok"]:
+            embedding_ready = False
+            embedding_status = "serving_index_mismatch"
+            degraded_reasons.append("serving_index_mismatch:embedding")
+
+        model_payload = {
+            "provider": "hybrid",
+            "status": "ready" if llm_ready and embedding_ready else "degraded",
+            "llm": llm_payload,
+            "embedding": {
+                "type": config.EMBED_TYPE,
+                "provider": "api",
+                "preset": config.EMBED_PRESET,
+                "adapter": config.EMBED_ADAPTER,
+                "base_url": config.EMBED_BASE_URL,
+                "name": config.EMBED_MODEL,
+                "dimension": config.EMBED_DIM,
+                "actual_dimension": actual_dimension,
+                "serving_dimension": compatibility["serving_dimension"],
+                "active_model": compatibility["active_model"],
+                "active_version": compatibility["active_version"],
+                "version": config.EMBED_VERSION,
+                "config_source": config.EMBED_CONFIG_SOURCE,
+                "config_normalized": config.EMBED_CONFIG_NORMALIZED,
+                "remote_text_disclosure": config.embedding_text_leaves_device(),
+                "model_state": (
+                    embeddings.model_state()
+                    if config.EMBED_ADAPTER == "ollama"
+                    else None
+                ),
+                "status": embedding_status,
+            },
+        }
 
         try:
             state = self._load_state()

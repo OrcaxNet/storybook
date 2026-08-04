@@ -8,7 +8,9 @@ import uuid
 import numpy as np
 import pytest
 
-from storybook import config, embeddings, mcp_server, processor, store, story_v2
+from storybook import (
+    config, embeddings, health, mcp_server, processor, query_cache, store, story_v2,
+)
 
 from ._helpers import basis, vector_in_index
 
@@ -172,6 +174,40 @@ def test_embedding_backfill_failure_resumes_and_switches_atomically(monkeypatch)
     state = store.get_embedding_index_state()
     assert state["active_model"] == "new-model"
     assert state["active_version"] == "v2-test"
+    assert state["active_endpoint"] == config.EMBED_BASE_URL
+    assert state["active_adapter"] == config.EMBED_ADAPTER
+    assert state["active_dimension"] == config.EMBED_DIM
+
+
+def test_endpoint_switch_requires_shadow_and_activates_full_identity(monkeypatch):
+    from storybook import health
+
+    store.add_story("endpoint identity", "content", [], basis(0))
+    active_before = store.get_embedding_index_state()
+    monkeypatch.setattr(config, "EMBED_BASE_URL", "https://endpoint-b.example/v1")
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
+
+    compatibility = health.serving_index_compatibility(config.EMBED_DIM)
+    assert compatibility["ok"] is False
+    assert "endpoint active=" in compatibility["detail"]
+    assert "adapter active=ollama target=openai_compatible" in compatibility["detail"]
+    assert store.get_embedding_index_state()["active_endpoint"] == active_before[
+        "active_endpoint"
+    ]
+
+    monkeypatch.setattr(embeddings, "embed", lambda *args, **kwargs: basis(1))
+    result = embeddings.backfill(
+        model=active_before["active_model"],
+        version=active_before["active_version"],
+        batch_size=10,
+    )
+
+    assert result["activation"]["activated"] == 1
+    active_after = store.get_embedding_index_state()
+    assert active_after["active_endpoint"] == "https://endpoint-b.example/v1"
+    assert active_after["active_adapter"] == "openai_compatible"
+    assert active_after["active_dimension"] == config.EMBED_DIM
+    assert health.serving_index_compatibility(config.EMBED_DIM)["ok"] is True
 
 
 @pytest.mark.parametrize("extra_updates", [1, 3])
@@ -400,3 +436,230 @@ def test_legacy_vector_requires_shadow_backfill_before_v2_activation(monkeypatch
     assert [
         event["operation"] for event in store.get_memory_events(1)
     ] == ["create", "update"]
+
+
+def test_legacy_ollama_index_identity_migrates_without_vector_rewrite(monkeypatch):
+    story_id = store.add_story("legacy identity", "content", [], basis(0))
+    story_before = store.get_story(story_id)
+    vector_before = vector_in_index(story_id)
+    active = store.get_embedding_index_state()
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute("DROP TABLE embedding_index_state")
+        db.execute(
+            """CREATE TABLE embedding_index_state (
+                   id INTEGER PRIMARY KEY CHECK(id = 1),
+                   active_model TEXT NOT NULL,
+                   active_version TEXT NOT NULL,
+                   active_representation TEXT NOT NULL,
+                   target_model TEXT,
+                   target_version TEXT,
+                   target_representation TEXT,
+                   backfill_status TEXT NOT NULL DEFAULT 'idle',
+                   updated_at TEXT DEFAULT (datetime('now'))
+               )"""
+        )
+        db.execute(
+            """INSERT INTO embedding_index_state (
+                   id, active_model, active_version, active_representation,
+                   backfill_status
+               ) VALUES (1, ?, ?, ?, 'idle')""",
+            (
+                active["active_model"], active["active_version"],
+                active["active_representation"],
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    store.init_db()
+
+    migrated = store.get_embedding_index_state()
+    assert migrated["active_endpoint"] == config.EMBED_BASE_URL
+    assert migrated["active_adapter"] == "ollama"
+    assert migrated["active_api_key_env"] == ""
+    assert store.get_story(story_id) == story_before
+    assert vector_in_index(story_id) == vector_before
+
+    requested = {}
+
+    def fake_post(url, **kwargs):
+        requested.update({"url": url, **kwargs})
+
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"embedding": basis(0)}
+
+        return Response()
+
+    monkeypatch.setattr(embeddings.requests, "post", fake_post)
+    assert embeddings.embed("legacy recall") == basis(0)
+    assert requested["url"] == f"{config.EMBED_BASE_URL}/api/embeddings"
+
+
+def _replace_index_state_with_main_provider_schema(active: dict, base_url: str):
+    """Recreate the provider-registry schema from main before FLO-183."""
+
+    db = store.get_db(load_vector_extension=False)
+    try:
+        db.execute("DROP TABLE embedding_index_state")
+        db.execute(
+            """CREATE TABLE embedding_index_state (
+                   id INTEGER PRIMARY KEY CHECK(id = 1),
+                   active_model TEXT NOT NULL,
+                   active_provider TEXT,
+                   active_base_url TEXT,
+                   active_version TEXT NOT NULL,
+                   active_representation TEXT NOT NULL,
+                   target_model TEXT,
+                   target_provider TEXT,
+                   target_base_url TEXT,
+                   target_version TEXT,
+                   target_representation TEXT,
+                   backfill_status TEXT NOT NULL DEFAULT 'idle',
+                   updated_at TEXT DEFAULT (datetime('now'))
+               )"""
+        )
+        db.execute(
+            """INSERT INTO embedding_index_state (
+                   id, active_model, active_provider, active_base_url,
+                   active_version, active_representation, backfill_status
+               ) VALUES (1, ?, 'api', ?, ?, ?, 'idle')""",
+            (
+                active["active_model"], base_url, active["active_version"],
+                active["active_representation"],
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_main_custom_api_identity_migrates_without_recall_or_cache_drift(
+    monkeypatch,
+):
+    story_id = store.add_story("main custom", "content", [], basis(0))
+    story_before = store.get_story(story_id)
+    vector_before = vector_in_index(story_id)
+    active = store.get_embedding_index_state()
+    endpoint = "https://existing-custom.example/v1"
+    _replace_index_state_with_main_provider_schema(active, endpoint)
+
+    monkeypatch.setattr(config, "EMBED_PROVIDER", "api")
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
+    monkeypatch.setattr(config, "EMBED_BASE_URL", endpoint)
+    monkeypatch.setattr(config, "EMBED_MODEL", active["active_model"])
+    monkeypatch.setattr(config, "EMBED_VERSION", active["active_version"])
+    monkeypatch.setattr(config, "EMBED_DIM", len(basis(0)))
+    monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "EXISTING_EMBED_TOKEN")
+    monkeypatch.setenv("EXISTING_EMBED_TOKEN", "migration-secret")
+    monkeypatch.setattr(
+        embeddings.requests, "post",
+        lambda *args, **kwargs: pytest.fail("init migration must be zero-network"),
+    )
+
+    store.init_db()
+
+    migrated = store.get_embedding_index_state()
+    assert migrated["active_provider"] == "api"
+    assert migrated["active_base_url"] == endpoint
+    assert migrated["active_endpoint"] == endpoint
+    assert migrated["active_adapter"] == "openai_compatible"
+    assert migrated["active_api_key_env"] == "EXISTING_EMBED_TOKEN"
+    assert store.get_story(story_id) == story_before
+    assert vector_in_index(story_id) == vector_before
+    assert health.serving_index_compatibility(config.EMBED_DIM)["ok"] is True
+    for database_file in config.DB_PATH.parent.glob(f"{config.DB_PATH.name}*"):
+        assert b"migration-secret" not in database_file.read_bytes()
+
+    cache_identity = query_cache.index_identity(1, embedding_spec=migrated)
+    assert endpoint in cache_identity
+    assert "openai_compatible" in cache_identity
+    assert "EXISTING_EMBED_TOKEN" in cache_identity
+    assert "migration-secret" not in cache_identity
+
+    requested = {}
+
+    def fake_post(url, **kwargs):
+        requested.update({"url": url, **kwargs})
+
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"data": [{"embedding": basis(0)}]}
+
+        return Response()
+
+    monkeypatch.setattr(embeddings.requests, "post", fake_post)
+    assert embeddings.embed("main custom recall") == basis(0)
+    assert requested["url"] == f"{endpoint}/embeddings"
+    assert requested["headers"] == {"Authorization": "Bearer migration-secret"}
+
+
+def test_main_custom_api_drift_keeps_active_credential_unknown(monkeypatch):
+    active = store.get_embedding_index_state()
+    old_endpoint = "https://active-custom.example/v1"
+    _replace_index_state_with_main_provider_schema(active, old_endpoint)
+
+    monkeypatch.setattr(config, "EMBED_PROVIDER", "api")
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
+    monkeypatch.setattr(config, "EMBED_BASE_URL", "https://target.example/v1")
+    monkeypatch.setattr(config, "EMBED_MODEL", active["active_model"])
+    monkeypatch.setattr(config, "EMBED_VERSION", active["active_version"])
+    monkeypatch.setattr(config, "EMBED_DIM", len(basis(0)))
+    monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "TARGET_TOKEN")
+    monkeypatch.setenv("TARGET_TOKEN", "target-secret")
+    monkeypatch.setattr(
+        embeddings.requests, "post",
+        lambda *args, **kwargs: pytest.fail("unknown active credential must not request"),
+    )
+
+    store.init_db()
+
+    migrated = store.get_embedding_index_state()
+    assert migrated["active_endpoint"] == old_endpoint
+    assert migrated["active_adapter"] == "openai_compatible"
+    assert migrated["active_api_key_env"] is None
+    assert embeddings.serving_index_matches_config(migrated) is False
+    assert health.serving_index_compatibility(config.EMBED_DIM)["ok"] is False
+    assert embeddings.embed("must not use target credential") is None
+    cache_identity = query_cache.index_identity(1, embedding_spec=migrated)
+    assert old_endpoint in cache_identity
+    assert "<unknown>" in cache_identity
+    assert "TARGET_TOKEN" not in cache_identity
+
+
+def test_backfill_atomically_switches_serving_vector_dimension(monkeypatch):
+    story_id = store.add_story("old", "old content", ["old"], basis(0))
+    assert store.serving_embedding_dimension() == config.EMBED_DIM
+    assert vector_in_index(story_id) == basis(0)
+
+    monkeypatch.setattr(config, "EMBED_DIM", 2)
+    monkeypatch.setattr(config, "EMBED_MODEL", "two-dimensional-model")
+    monkeypatch.setattr(config, "EMBED_VERSION", "two-dimensional-v1")
+    assert store.serving_embedding_dimension() != config.EMBED_DIM
+    assert vector_in_index(story_id) == basis(0)
+    monkeypatch.setattr(
+        embeddings, "embed", lambda *args, **kwargs: [1.0, 0.0]
+    )
+
+    result = embeddings.backfill(
+        model=config.EMBED_MODEL,
+        version=config.EMBED_VERSION,
+        representation="default",
+    )
+
+    assert result["activation"]["activated"] == 1
+    assert store.serving_embedding_dimension() == 2
+    assert vector_in_index(story_id) == [1.0, 0.0]
+    assert store.get_embedding_index_state()["active_version"] == config.EMBED_VERSION

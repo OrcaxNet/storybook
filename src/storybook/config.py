@@ -1,8 +1,11 @@
 """配置管理 — Profile 路径、模型名、阈值常量集中管理。"""
+import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 # ── 安装根与 .env ──
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -251,60 +254,243 @@ except profiles_module.ProfileError:
     PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
     _PROFILE_PERSISTED = False
 
-# ── Model providers ──
+# ── Embedding API ──
+# 顶层产品抽象始终是 API。Ollama 只是默认的本地 preset/adapter；
+# 旧 OLLAMA_HOST / STORYBOOK_EMBED_MODEL 配置会无损映射到这个抽象。
+_ENVIRONMENT_VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def valid_environment_variable_name(value: str) -> bool:
+    """Return whether value is a portable, non-secret environment key name."""
+
+    return bool(_ENVIRONMENT_VARIABLE_NAME.fullmatch(value))
+
+
+def _persisted_embedding_config() -> dict:
+    """Read setup's non-secret provider selection without importing setup."""
+
+    path = PROFILE_REGISTRY.roots.state / "setup-state.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = payload.get("embedding")
+        if not isinstance(value, dict):
+            return {}
+        if value.get("type") != "api":
+            return {}
+        if value.get("preset") not in {"ollama", "custom"}:
+            return {}
+        if value.get("adapter") not in {"ollama", "openai_compatible"}:
+            return {}
+        if type(value.get("dimension")) is not int or value["dimension"] < 1:
+            return {}
+        for name in ("base_url", "model", "version", "api_key_env"):
+            if not isinstance(value.get(name), str):
+                return {}
+        if value["api_key_env"] and not valid_environment_variable_name(
+            value["api_key_env"]
+        ):
+            return {}
+        return value
+    except (OSError, UnicodeError, ValueError, AttributeError):
+        return {}
+
+
 from . import model_config as model_config_module  # noqa: E402
 
 MODEL_CONFIG_PATH = PROFILE_PATHS.root / "model-config.json"
 
 
 def refresh_model_config(*, environ: dict[str, str] | None = None):
-    """Resolve Profile config first, then the read-only legacy environment."""
+    """Refresh generation provider config and its runtime credential value."""
 
     global MODEL_CONFIG_PATH, MODEL_CONFIG
-    global OLLAMA_HOST, LLM_PROVIDER, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
-    global EMBED_PROVIDER, EMBED_BASE_URL, EMBED_API_KEY, EMBED_MODEL
+    global LLM_PROVIDER, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+    global EMBED_PROVIDER, EMBED_ADAPTER, EMBED_PRESET, EMBED_BASE_URL
+    global EMBED_MODEL, EMBED_API_KEY_ENV, EMBED_API_KEY
+    global EMBED_DIM, EMBED_VERSION, EMBED_CONFIG_SOURCE
+    global EMBED_CONFIG_NORMALIZED, OLLAMA_HOST
     env = os.environ if environ is None else environ
     MODEL_CONFIG_PATH = PROFILE_PATHS.root / "model-config.json"
     MODEL_CONFIG = model_config_module.resolve(MODEL_CONFIG_PATH, env)
-    if MODEL_CONFIG.source == "legacy_env":
-        legacy_llm = resolve_llm_config(process_env=dict(env))
-        credential_env = (
-            "ANTHROPIC_AUTH_TOKEN"
-            if env.get("ANTHROPIC_AUTH_TOKEN")
-            else "DEEPSEEK_KEY"
-        )
-        MODEL_CONFIG = model_config_module.ModelConfig(
-            MODEL_CONFIG.schema_version,
-            model_config_module.ModelEndpoint(
-                "deepseek_anthropic",
-                model_config_module.safe_url(str(legacy_llm["base_url"])).rstrip("/"),
-                str(legacy_llm["model"]),
-                credential_env,
-            ),
-            MODEL_CONFIG.embedding,
-            source="legacy_env",
-        )
     generation = MODEL_CONFIG.generation
-    embedding = MODEL_CONFIG.embedding
     LLM_PROVIDER = generation.provider
     LLM_BASE_URL = generation.base_url
     LLM_MODEL = generation.model
     LLM_API_KEY = env.get(generation.credential_env or "") or None
     if MODEL_CONFIG.source == "legacy_env":
+        legacy_llm = resolve_llm_config(process_env=dict(env))
+        LLM_PROVIDER = "deepseek_anthropic"
+        LLM_BASE_URL = str(legacy_llm["base_url"])
+        LLM_MODEL = str(legacy_llm["model"])
         LLM_API_KEY = legacy_llm["api_key"]
-    EMBED_PROVIDER = embedding.provider
-    EMBED_BASE_URL = embedding.base_url
-    EMBED_MODEL = embedding.model
-    EMBED_API_KEY = env.get(embedding.credential_env or "") or None
-    OLLAMA_HOST = embedding.base_url if embedding.provider == "ollama" else os.getenv(
-        "OLLAMA_HOST", model_config_module.DEFAULT_OLLAMA_URL
-    )
+    if "EMBED_ADAPTER" in globals():
+        persisted = (
+            _persisted_embedding_config()
+            if "_persisted_embedding_config" in globals() else {}
+        )
+        embedding = MODEL_CONFIG.embedding
+        profile_selected = MODEL_CONFIG_PATH.is_file()
+        if profile_selected:
+            base_adapter = (
+                "ollama"
+                if embedding.provider == "ollama" else "openai_compatible"
+            )
+        else:
+            base_adapter = str(persisted.get("adapter", "")) or "ollama"
+        preset_value = env.get(
+            "STORYBOOK_EMBED_PRESET",
+            str(persisted.get("preset", ""))
+            or ("ollama" if base_adapter == "ollama" else "custom"),
+        ).strip().lower()
+        EMBED_ADAPTER = env.get(
+            "STORYBOOK_EMBED_ADAPTER", base_adapter
+        ).strip().lower()
+        EMBED_PRESET = "ollama" if EMBED_ADAPTER == "ollama" else "custom"
+        EMBED_CONFIG_NORMALIZED = bool(
+            preset_value and preset_value != EMBED_PRESET
+        )
+        base_url = (
+            embedding.base_url if profile_selected else
+            str(persisted.get("base_url", "")) or embedding.base_url
+        )
+        EMBED_BASE_URL = env.get(
+            "STORYBOOK_EMBED_BASE_URL", base_url
+        ).rstrip("/")
+        base_model = (
+            embedding.model if profile_selected else
+            str(persisted.get("model", "")) or embedding.model
+        )
+        EMBED_MODEL = env.get("STORYBOOK_EMBED_MODEL", base_model)
+        base_credential = (
+            embedding.credential_env or ""
+            if profile_selected
+            else str(persisted.get("api_key_env", ""))
+        )
+        EMBED_API_KEY_ENV = env.get(
+            "STORYBOOK_EMBED_API_KEY_ENV", base_credential
+        ).strip()
+        EMBED_API_KEY = env.get(EMBED_API_KEY_ENV) if EMBED_API_KEY_ENV else None
+        EMBED_PROVIDER = "ollama" if EMBED_ADAPTER == "ollama" else "api"
+        EMBED_DIM = int(env.get(
+            "STORYBOOK_EMBED_DIM", str(persisted.get("dimension", 1024))
+        ))
+        EMBED_VERSION = env.get(
+            "STORYBOOK_EMBED_VERSION",
+            str(persisted.get("version", "story-v2-default-v1")),
+        )
+        EMBED_CONFIG_SOURCE = (
+            "model_config" if profile_selected else
+            "setup_selection" if persisted else "legacy_ollama_env"
+        )
+        OLLAMA_HOST = (
+            EMBED_BASE_URL if EMBED_ADAPTER == "ollama" else
+            env.get("OLLAMA_HOST", model_config_module.DEFAULT_OLLAMA_URL)
+        )
     return MODEL_CONFIG
 
 
 refresh_model_config()
-EMBED_DIM = 1024
-EMBED_VERSION = os.getenv("STORYBOOK_EMBED_VERSION", "story-v2-default-v1")
+_PERSISTED_EMBED_CONFIG = _persisted_embedding_config()
+_PROFILE_EMBED_CONFIG = MODEL_CONFIG.embedding if MODEL_CONFIG_PATH.is_file() else None
+_EMBED_NEW_ENV_EXPLICIT = any(
+    os.getenv(name)
+    for name in (
+        "STORYBOOK_EMBED_PRESET",
+        "STORYBOOK_EMBED_ADAPTER",
+        "STORYBOOK_EMBED_BASE_URL",
+        "STORYBOOK_EMBED_API_KEY_ENV",
+        "STORYBOOK_EMBED_DIM",
+    )
+)
+_EMBED_LEGACY_ENV_EXPLICIT = bool(
+    os.getenv("OLLAMA_HOST") or os.getenv("STORYBOOK_EMBED_MODEL")
+)
+_EMBED_ENV_EXPLICIT = bool(
+    _EMBED_NEW_ENV_EXPLICIT
+    or _EMBED_LEGACY_ENV_EXPLICIT
+    or os.getenv("STORYBOOK_EMBED_VERSION")
+)
+
+EMBED_TYPE = "api"
+_BASE_PROVIDER = (
+    _PROFILE_EMBED_CONFIG.provider if _PROFILE_EMBED_CONFIG else ""
+)
+_BASE_ADAPTER = (
+    "ollama" if _BASE_PROVIDER == "ollama" else "openai_compatible"
+    if _BASE_PROVIDER == "api" else
+    str(_PERSISTED_EMBED_CONFIG.get("adapter", ""))
+)
+_EMBED_PRESET_VALUE = os.getenv(
+    "STORYBOOK_EMBED_PRESET",
+    str(_PERSISTED_EMBED_CONFIG.get("preset", ""))
+    or ("ollama" if _BASE_ADAPTER in {"", "ollama"} else "custom"),
+).strip().lower()
+EMBED_ADAPTER = os.getenv(
+    "STORYBOOK_EMBED_ADAPTER",
+    _BASE_ADAPTER
+    or ("ollama" if _EMBED_PRESET_VALUE in {"", "ollama"} else "openai_compatible"),
+).strip().lower()
+if EMBED_ADAPTER not in {"ollama", "openai_compatible"}:
+    raise ValueError(
+        "STORYBOOK_EMBED_ADAPTER must be ollama or openai_compatible"
+    )
+# Adapter is authoritative. Conflicting legacy/manual combinations are
+# normalized so a remote protocol can never be presented as local Ollama.
+EMBED_PRESET = "ollama" if EMBED_ADAPTER == "ollama" else "custom"
+EMBED_CONFIG_NORMALIZED = bool(
+    _EMBED_PRESET_VALUE and _EMBED_PRESET_VALUE != EMBED_PRESET
+)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+_BASE_EMBED_URL = (
+    _PROFILE_EMBED_CONFIG.base_url if _PROFILE_EMBED_CONFIG else
+    str(_PERSISTED_EMBED_CONFIG.get("base_url", "")) or OLLAMA_HOST
+)
+EMBED_BASE_URL = os.getenv(
+    "STORYBOOK_EMBED_BASE_URL",
+    _BASE_EMBED_URL,
+).rstrip("/")
+# 只保存凭据环境变量的名称；密钥本身不进入配置、缓存键或诊断输出。
+EMBED_API_KEY_ENV = os.getenv(
+    "STORYBOOK_EMBED_API_KEY_ENV",
+    (
+        _PROFILE_EMBED_CONFIG.credential_env or ""
+        if _PROFILE_EMBED_CONFIG else
+        str(_PERSISTED_EMBED_CONFIG.get("api_key_env", ""))
+    ),
+).strip()
+if EMBED_API_KEY_ENV and not valid_environment_variable_name(EMBED_API_KEY_ENV):
+    raise ValueError(
+        "STORYBOOK_EMBED_API_KEY_ENV must be an environment variable name"
+    )
+EMBED_CONFIG_SOURCE = (
+    "explicit_api"
+    if _EMBED_NEW_ENV_EXPLICIT
+    else "model_config"
+    if _PROFILE_EMBED_CONFIG
+    else "setup_selection"
+    if _PERSISTED_EMBED_CONFIG
+    else "legacy_ollama_env"
+    if _EMBED_LEGACY_ENV_EXPLICIT
+    else "explicit_embedding_env"
+    if _EMBED_ENV_EXPLICIT
+    else "ollama_recommended_preset"
+)
+EMBED_MODEL = os.getenv(
+    "STORYBOOK_EMBED_MODEL",
+    (
+        _PROFILE_EMBED_CONFIG.model if _PROFILE_EMBED_CONFIG else
+        str(_PERSISTED_EMBED_CONFIG.get("model", "qwen3-embedding:0.6b"))
+    ),
+)
+EMBED_DIM = int(os.getenv(
+    "STORYBOOK_EMBED_DIM", str(_PERSISTED_EMBED_CONFIG.get("dimension", 1024))
+))
+EMBED_VERSION = os.getenv(
+    "STORYBOOK_EMBED_VERSION",
+    str(_PERSISTED_EMBED_CONFIG.get("version", "story-v2-default-v1")),
+)
+EMBED_PROVIDER = "ollama" if EMBED_ADAPTER == "ollama" else "api"
+EMBED_API_KEY = os.getenv(EMBED_API_KEY_ENV) if EMBED_API_KEY_ENV else None
 EMBED_REPRESENTATION = os.getenv(
     "STORYBOOK_EMBED_REPRESENTATION", "default"
 )
@@ -323,6 +509,66 @@ EMBED_KEEP_ALIVE = os.getenv("STORYBOOK_EMBED_KEEP_ALIVE", "10m")
 EMBED_WARM_WINDOW_SECONDS = float(
     os.getenv("STORYBOOK_EMBED_WARM_WINDOW_SECONDS", "600")
 )
+
+
+def apply_embedding_config(
+    *,
+    preset: str,
+    base_url: str | None = None,
+    model: str | None = None,
+    dimension: int | None = None,
+    version: str | None = None,
+    api_key_env: str | None = None,
+) -> None:
+    """Apply a validated setup selection to the current process.
+
+    Credentials remain outside Storybook; only their environment-variable name
+    is accepted. Persistence is handled by setup's managed state.
+    """
+
+    global EMBED_PRESET, EMBED_ADAPTER, EMBED_BASE_URL, EMBED_MODEL, EMBED_DIM
+    global EMBED_VERSION, EMBED_PROVIDER, EMBED_API_KEY
+    global EMBED_API_KEY_ENV, EMBED_CONFIG_SOURCE, EMBED_CONFIG_NORMALIZED
+    credential_env = (api_key_env or "").strip()
+    if credential_env and not valid_environment_variable_name(credential_env):
+        raise ValueError(
+            "embedding API credential must be an environment variable name"
+        )
+    if preset not in {"ollama", "custom"}:
+        raise ValueError("embedding preset must be ollama or custom")
+    if preset == "ollama":
+        EMBED_PRESET = "ollama"
+        EMBED_ADAPTER = "ollama"
+        EMBED_BASE_URL = (base_url or "http://localhost:11434").rstrip("/")
+        EMBED_MODEL = model or "qwen3-embedding:0.6b"
+        EMBED_DIM = int(dimension or 1024)
+        EMBED_VERSION = version or EMBED_VERSION
+        EMBED_API_KEY_ENV = ""
+    else:
+        if not base_url or not model or not dimension:
+            raise ValueError(
+                "custom embedding API requires base_url, model and dimension"
+            )
+        EMBED_PRESET = "custom"
+        EMBED_ADAPTER = "openai_compatible"
+        EMBED_BASE_URL = base_url.rstrip("/")
+        EMBED_MODEL = model
+        EMBED_DIM = int(dimension)
+        EMBED_VERSION = version or EMBED_VERSION
+        EMBED_API_KEY_ENV = credential_env
+    EMBED_CONFIG_SOURCE = "setup_selection"
+    EMBED_CONFIG_NORMALIZED = False
+    EMBED_PROVIDER = "ollama" if EMBED_ADAPTER == "ollama" else "api"
+    EMBED_API_KEY = os.getenv(EMBED_API_KEY_ENV) if EMBED_API_KEY_ENV else None
+
+
+def embedding_text_leaves_device() -> bool:
+    """Conservatively disclose endpoints that are not explicit loopback hosts."""
+
+    hostname = (urlparse(EMBED_BASE_URL).hostname or "").lower()
+    return hostname not in {"localhost", "127.0.0.1", "::1"}
+
+
 QUERY_WARM_TIMEOUT_SECONDS = float(
     os.getenv("STORYBOOK_QUERY_WARM_TIMEOUT_SECONDS", "2")
 )

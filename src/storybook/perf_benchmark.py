@@ -90,8 +90,11 @@ def run_performance_benchmark(
         "generated_at": datetime.now(UTC).isoformat(),
         "machine": machine_metadata(),
         "model": {
+            "embedding_type": config.EMBED_TYPE,
+            "embedding_adapter": config.EMBED_ADAPTER,
             "embedding": config.EMBED_MODEL,
             "dimension": config.EMBED_DIM,
+            "version": config.EMBED_VERSION,
             "state": model_state,
             "retrieval_mode": retrieval_mode,
         },
@@ -192,8 +195,10 @@ def machine_metadata() -> dict:
 
 def unload_embedding_model() -> None:
     """通过 Ollama 官方 keep_alive=0 语义卸载 embedding 模型。"""
+    if config.EMBED_ADAPTER != "ollama":
+        return
     response = requests.post(
-        f"{config.OLLAMA_HOST}/api/generate",
+        f"{config.EMBED_BASE_URL}/api/generate",
         json={"model": config.EMBED_MODEL, "keep_alive": 0, "stream": False},
         timeout=15,
     )

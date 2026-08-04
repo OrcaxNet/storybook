@@ -2,12 +2,12 @@
 
 设计要点：
   * **隔离 DB** -- 每次评测把 ``config.DB_PATH`` 重定向到临时文件，绝不污染用户 Profile 数据库。
-  * **embedding 经 ``embeddings.embed`` 模块属性** -- 真实运行走 Ollama；测试用 fake_embedder 夹具
+  * **embedding 经 ``embeddings.embed`` 模块属性** -- 真实运行走配置的 API；测试用 fake_embedder 夹具
     monkeypatch 该属性即可注入确定性桩（processor 内部也走同一属性，故加工/分裂评测同样受控）。
   * **加工/分裂评测用确定性 CuratedLLM** -- 用 benchmark 里人工标注的 keywords/summary 替代 LLM 输出，
     使分支决策只由「真实 embedding 相似度 vs 阈值」决定，从而隔离度量 0.85/0.92 阈值是否合理
     （这正是 issue 的核心疑问）。检索评测不用 LLM（story 内容为人工标注）。
-  * **阈值敏感性曲线** -- 复用同一批 embedding，仅改阈值重过滤/重分类，零额外 Ollama 调用。
+  * **阈值敏感性曲线** -- 复用同一批 embedding，仅改阈值重过滤/重分类，零额外 API 调用。
 """
 from __future__ import annotations
 
@@ -592,8 +592,11 @@ def run_embedding_ablation(
     passes = default >= baseline - 0.02
     return {
         "benchmark_version": bench.version,
+        "embedding_type": config.EMBED_TYPE,
+        "embedding_adapter": config.EMBED_ADAPTER,
         "embedding_model": config.EMBED_MODEL,
         "embedding_dimension": config.EMBED_DIM,
+        "embedding_version": config.EMBED_VERSION,
         "similarity_threshold": config.SIM_THRESHOLD_SEARCH,
         "topic_count": len(bench.topics),
         "query_count": len(query_pairs),
@@ -1040,7 +1043,11 @@ def run_retrieval_strategy_ablation(
     provider_stats = provider_metadata.get("stats", {})
     return {
         "benchmark_version": bench.version,
+        "embedding_type": config.EMBED_TYPE,
+        "embedding_adapter": config.EMBED_ADAPTER,
         "embedding_model": config.EMBED_MODEL,
+        "embedding_dimension": config.EMBED_DIM,
+        "embedding_version": config.EMBED_VERSION,
         "topic_count": len(topic_to_sid),
         "query_count": len(pairs),
         "groups": [
