@@ -2,7 +2,7 @@
 """独立评测入口：``python scripts/eval.py [all|retrieval|processing|split|ablation|strategy]``
 
 等价于 ``storybook eval``，便于在未做 editable 安装时直接运行
-（自动把 src/ 加入 sys.path）。需要 Ollama 运行 embedding。
+（自动把 src/ 加入 sys.path）。需要配置的 embedding API 可用。
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from storybook import eval as eval_module  # noqa: E402
+from storybook import config, eval as eval_module  # noqa: E402
 
 
 def main() -> int:
@@ -37,7 +37,10 @@ def main() -> int:
         "retrieval", "processing", "split", "ablation", "strategy",
         "exact_term",
     ) if args.part == "all" else (args.part.replace("-", "_"),)
-    print(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
+    print(
+        f"📐 运行评测: {', '.join(parts)}"
+        f"（embedding type=api, adapter={config.EMBED_ADAPTER}）\n"
+    )
 
     transform_provider = None
     transform_source = "live_generated"
@@ -52,7 +55,11 @@ def main() -> int:
         transform_provider=transform_provider,
         transform_source=transform_source,
     )
-    rep.meta["embed_mode"] = "ollama"
+    rep.meta["embed_mode"] = "api"
+    rep.meta["embedding_adapter"] = config.EMBED_ADAPTER
+    rep.meta["embedding_model"] = config.EMBED_MODEL
+    rep.meta["embedding_dimension"] = config.EMBED_DIM
+    rep.meta["embedding_version"] = config.EMBED_VERSION
     rep.meta["part"] = args.part
     print(eval_module.format_report(rep))
 

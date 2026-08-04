@@ -1,7 +1,6 @@
-"""
-嵌入层 — 封装 Ollama embedding API + 余弦相似度
-"""
+"""嵌入层 — 统一 API 抽象，内部适配 Ollama / OpenAI-compatible 协议。"""
 import logging
+import os
 import threading
 import time
 from typing import Optional
@@ -18,6 +17,115 @@ _STATE_LOCK = threading.Lock()
 _LAST_SUCCESS_AT: float | None = None
 
 
+class EmbeddingAPIError(RuntimeError):
+    """可稳定诊断的 embedding API 错误；message 不包含凭据。"""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def api_identity(
+    model: str | None = None, version: str | None = None
+) -> dict[str, object]:
+    """返回会影响向量结果的非敏感身份，用于缓存隔离。"""
+
+    return {
+        "type": config.EMBED_TYPE,
+        "base_url": config.EMBED_BASE_URL,
+        "adapter": config.EMBED_ADAPTER,
+        "model": model or config.EMBED_MODEL,
+        "version": version or config.EMBED_VERSION,
+        "dimension": config.EMBED_DIM,
+    }
+
+
+def _request_embedding(
+    text: str,
+    model: str,
+    *,
+    timeout_seconds: float,
+    keep_alive: str | None,
+) -> list[float]:
+    headers: dict[str, str] = {}
+    if config.EMBED_API_KEY_ENV:
+        credential = os.getenv(config.EMBED_API_KEY_ENV)
+        if not credential:
+            raise EmbeddingAPIError(
+                "credentials_missing",
+                f"credential environment variable {config.EMBED_API_KEY_ENV} is missing",
+            )
+        headers["Authorization"] = f"Bearer {credential}"
+
+    if config.EMBED_ADAPTER == "ollama":
+        url = f"{config.EMBED_BASE_URL}/api/embeddings"
+        payload = {"model": model, "prompt": text}
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+    else:
+        url = f"{config.EMBED_BASE_URL}/embeddings"
+        payload = {"model": model, "input": text}
+
+    try:
+        request_kwargs = {
+            "json": payload,
+            "timeout": (min(1.0, timeout_seconds), timeout_seconds),
+        }
+        if headers:
+            request_kwargs["headers"] = headers
+        response = requests.post(url, **request_kwargs)
+    except (requests.ConnectionError, requests.Timeout) as exc:
+        raise EmbeddingAPIError("endpoint_unreachable", "embedding endpoint unavailable") from exc
+    except requests.RequestException as exc:
+        raise EmbeddingAPIError("endpoint_unreachable", "embedding request failed") from exc
+
+    status_code = getattr(response, "status_code", None)
+    if status_code in {401, 403}:
+        raise EmbeddingAPIError("authentication_failed", "embedding API rejected credentials")
+    if status_code in {404, 422}:
+        raise EmbeddingAPIError("model_unavailable", "embedding model is unavailable")
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise EmbeddingAPIError("model_unavailable", "embedding API rejected the request") from exc
+    try:
+        data = response.json()
+        if config.EMBED_ADAPTER == "ollama":
+            vector = data.get("embedding")
+        else:
+            rows = data.get("data")
+            vector = rows[0].get("embedding") if isinstance(rows, list) and rows else None
+        if not isinstance(vector, list) or not vector:
+            raise TypeError("missing embedding vector")
+        return [float(value) for value in vector]
+    except (TypeError, ValueError, KeyError, AttributeError) as exc:
+        raise EmbeddingAPIError(
+            "response_protocol_incompatible", "embedding response protocol is incompatible"
+        ) from exc
+
+
+def probe() -> dict[str, object]:
+    """无密钥泄露的 endpoint/model/protocol/dimension 探测结果。"""
+
+    try:
+        vector = _request_embedding(
+            "storybook embedding probe",
+            config.EMBED_MODEL,
+            timeout_seconds=30.0,
+            keep_alive=(
+                config.EMBED_KEEP_ALIVE
+                if config.EMBED_ADAPTER == "ollama"
+                else None
+            ),
+        )
+    except EmbeddingAPIError as exc:
+        return {"ok": False, "reason": exc.reason, "dimension": 0}
+    actual = len(vector)
+    if actual != config.EMBED_DIM:
+        return {"ok": False, "reason": "dimension_mismatch", "dimension": actual}
+    return {"ok": True, "reason": None, "dimension": actual}
+
+
 def embed(
     text: str,
     model: str = None,
@@ -26,7 +134,7 @@ def embed(
     keep_alive: str | None = None,
     cache_version: str | None = None,
 ) -> Optional[list[float]]:
-    """调用 Ollama 生成语义向量，返回 L2 归一化后的向量。
+    """调用配置的 API 生成语义向量，返回 L2 归一化后的向量。
 
     - 维度不匹配 / 零向量时返回 None（上层据此标记 failed 或报错，不再传入坏向量）。
     - 归一化保证 store.search_by_vector 中 ``1 - dist²/2`` 等于 cosine 相似度（精确）。
@@ -42,12 +150,7 @@ def embed(
         except Exception:  # schema may not exist during setup health probes
             model = config.EMBED_MODEL
     cache_version = cache_version or config.EMBED_VERSION
-    cache_payload = {
-        "model": model,
-        "version": cache_version,
-        "dimension": config.EMBED_DIM,
-        "text": text,
-    }
+    cache_payload = {**api_identity(model, cache_version), "text": text}
     cached = inference_cache.get("embedding-v1", cache_payload)
     if isinstance(cached, list) and len(cached) == config.EMBED_DIM:
         mark_model_used()
@@ -55,14 +158,12 @@ def embed(
     timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
     keep_alive = config.EMBED_KEEP_ALIVE if keep_alive is None else keep_alive
     try:
-        resp = requests.post(
-            f"{config.OLLAMA_HOST}/api/embeddings",
-            json={"model": model, "prompt": text, "keep_alive": keep_alive},
-            timeout=(min(1.0, timeout_seconds), timeout_seconds),
+        vec = _request_embedding(
+            text,
+            model,
+            timeout_seconds=timeout_seconds,
+            keep_alive=keep_alive if config.EMBED_ADAPTER == "ollama" else None,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        vec = data.get("embedding")
         if not vec or len(vec) != config.EMBED_DIM:
             logger.warning("向量维度不匹配: got %d, expect %d", len(vec or []), config.EMBED_DIM)
             return None

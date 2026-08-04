@@ -60,10 +60,18 @@ _result_cache = _TTLCache[dict](
 )
 
 
-def index_identity(index_version: int) -> tuple[str, int, str]:
+def index_identity(index_version: int) -> tuple:
     """绝对路径仅作为进程内隔离 key，不进入响应或诊断日志。"""
 
-    return (str(config.DB_PATH.resolve()), int(index_version), config.EMBED_MODEL)
+    return (
+        str(config.DB_PATH.resolve()),
+        int(index_version),
+        config.EMBED_TYPE,
+        config.EMBED_BASE_URL,
+        config.EMBED_ADAPTER,
+        config.EMBED_MODEL,
+        config.EMBED_VERSION,
+    )
 
 
 def get_query_vector(identity: tuple, query: str) -> list[float] | None:

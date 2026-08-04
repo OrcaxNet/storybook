@@ -106,6 +106,14 @@ def _print_setup_plan(plan: dict) -> None:
         click.echo(f"  Agent     {adapter['display_name']}: {marker}")
         for target in adapter["targets"]:
             click.echo(f"            {target}")
+    embedding = plan["embedding"]
+    label = "Ollama (recommended)" if embedding["preset"] == "ollama" else "Custom API"
+    click.echo(
+        f"  Embedding API: {label}; adapter={embedding['adapter']}; "
+        f"model={embedding['model']}; dimension={embedding['dimension']}"
+    )
+    if embedding["remote_text_disclosure"]:
+        click.echo("            Warning: embedding text is sent to the configured endpoint")
     click.echo(f"  Models    {', '.join(plan['models'])}")
     if plan["legacy_databases"]:
         click.echo("  Legacy    found; migration is not automatic:")
@@ -994,7 +1002,7 @@ def search(
 
 
 @cli.command(name="embedding-backfill")
-@click.option("--model", default=None, help="目标 Ollama embedding 模型")
+@click.option("--model", default=None, help="目标 embedding API 模型")
 @click.option("--version", required=True, help="不可变的目标 embedding 版本")
 @click.option(
     "--representation",
@@ -1228,14 +1236,17 @@ def eval(part, report, benchmark_path, transform_cache):
     并按 exact/synonym/cross-language/cross-tool/ambiguous 执行默认启用门禁。
     exact-term 隔离度量精确错误码在纯向量与 Hybrid 下的 recall@3。
 
-    需要 Ollama 运行（embedding）。评测在隔离临时库中进行，不污染用户 Profile 数据库。
+    需要配置的 embedding API 可用。评测在隔离临时库中进行，不污染用户 Profile 数据库。
     用 --report 把可复现的 JSON 报告落盘，便于阈值调整前后量化对比。
     """
     parts = (
         "retrieval", "processing", "split", "ablation", "strategy",
         "exact_term",
     ) if part == "all" else (part.replace("-", "_"),)
-    click.echo(f"📐 运行评测: {', '.join(parts)}（embedding 走真实 Ollama）\n")
+    click.echo(
+        f"📐 运行评测: {', '.join(parts)}"
+        f"（embedding type=api, adapter={config.EMBED_ADAPTER}）\n"
+    )
 
     bp = benchmark_path
     try:
@@ -1256,7 +1267,11 @@ def eval(part, report, benchmark_path, transform_cache):
         click.echo(f"❌ 评测失败: {ex}")
         raise
 
-    rep.meta["embed_mode"] = "ollama"
+    rep.meta["embed_mode"] = "api"
+    rep.meta["embedding_adapter"] = config.EMBED_ADAPTER
+    rep.meta["embedding_model"] = config.EMBED_MODEL
+    rep.meta["embedding_dimension"] = config.EMBED_DIM
+    rep.meta["embedding_version"] = config.EMBED_VERSION
     rep.meta["part"] = part
     click.echo(eval_module.format_report(rep))
 

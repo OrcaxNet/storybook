@@ -239,7 +239,7 @@ def prime_context_memories(cwd: str = "", first_prompt: str = "",
 
     单独包一层仅为与 ``recall_memories`` / ``get_story_detail`` / ``get_stats_overview``
     保持"模块级核心逻辑 + MCP 装配"的分层一致，便于不依赖 mcp SDK 直接单测。
-    语义见 ``prime.prime_context``：相关度不足 / 召回为空 / Ollama 不可用时
+    语义见 ``prime.prime_context``：相关度不足 / 召回为空 / embedding API 不可用时
     ``injected=False``、``briefing=""``，不抛错（晨间简报须非侵入）。
     """
     return prime_module.prime_context(

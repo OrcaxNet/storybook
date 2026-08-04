@@ -246,15 +246,48 @@ except profiles_module.ProfileError:
     PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
     _PROFILE_PERSISTED = False
 
-# ── Ollama ──
+# ── Embedding API ──
+# 顶层产品抽象始终是 API。Ollama 只是默认的本地 preset/adapter；
+# 旧 OLLAMA_HOST / STORYBOOK_EMBED_MODEL 配置会无损映射到这个抽象。
+EMBED_TYPE = "api"
+_EMBED_PRESET_VALUE = os.getenv("STORYBOOK_EMBED_PRESET", "").strip().lower()
+EMBED_ADAPTER = os.getenv(
+    "STORYBOOK_EMBED_ADAPTER",
+    "ollama" if _EMBED_PRESET_VALUE in {"", "ollama"} else "openai_compatible",
+).strip().lower()
+if EMBED_ADAPTER not in {"ollama", "openai_compatible"}:
+    raise ValueError(
+        "STORYBOOK_EMBED_ADAPTER must be ollama or openai_compatible"
+    )
+EMBED_PRESET = _EMBED_PRESET_VALUE or (
+    "ollama" if EMBED_ADAPTER == "ollama" else "custom"
+)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+EMBED_BASE_URL = os.getenv("STORYBOOK_EMBED_BASE_URL", OLLAMA_HOST).rstrip("/")
+# 只保存凭据环境变量的名称；密钥本身不进入配置、缓存键或诊断输出。
+EMBED_API_KEY_ENV = os.getenv("STORYBOOK_EMBED_API_KEY_ENV", "").strip()
+EMBED_CONFIG_SOURCE = (
+    "explicit_api"
+    if any(
+        os.getenv(name)
+        for name in (
+            "STORYBOOK_EMBED_PRESET",
+            "STORYBOOK_EMBED_ADAPTER",
+            "STORYBOOK_EMBED_BASE_URL",
+            "STORYBOOK_EMBED_API_KEY_ENV",
+        )
+    )
+    else "legacy_ollama_env"
+    if os.getenv("OLLAMA_HOST") or os.getenv("STORYBOOK_EMBED_MODEL")
+    else "ollama_recommended_preset"
+)
 LLM_PROVIDER = "deepseek_anthropic"
 _LLM_CONFIG = resolve_llm_config()
 LLM_BASE_URL = str(_LLM_CONFIG["base_url"])
 LLM_API_KEY = _LLM_CONFIG["api_key"]
 LLM_MODEL = str(_LLM_CONFIG["model"])
 EMBED_MODEL = os.getenv("STORYBOOK_EMBED_MODEL", "qwen3-embedding:0.6b")
-EMBED_DIM = 1024
+EMBED_DIM = int(os.getenv("STORYBOOK_EMBED_DIM", "1024"))
 EMBED_VERSION = os.getenv("STORYBOOK_EMBED_VERSION", "story-v2-default-v1")
 EMBED_REPRESENTATION = os.getenv(
     "STORYBOOK_EMBED_REPRESENTATION", "default"

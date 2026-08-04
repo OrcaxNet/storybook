@@ -729,6 +729,44 @@ def test_invalid_profile_registry_returns_json_error_without_writes(tmp_path):
     assert not user_home.exists()
 
 
+def test_setup_plan_exposes_unified_api_and_legacy_ollama_mapping(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    env = os.environ.copy()
+    env.update({
+        "STORYBOOK_HOME": str(storybook_home),
+        "OLLAMA_HOST": "http://legacy-ollama:11434",
+        "STORYBOOK_EMBED_MODEL": "qwen3-embedding:0.6b",
+        "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+    })
+    for name in (
+        "STORYBOOK_EMBED_PRESET",
+        "STORYBOOK_EMBED_ADAPTER",
+        "STORYBOOK_EMBED_BASE_URL",
+    ):
+        env.pop(name, None)
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "storybook.cli", "setup", "--dry-run", "--json"],
+        cwd=Path(__file__).parents[1], env=env, text=True,
+        capture_output=True, check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    embedding = json.loads(completed.stdout)["plan"]["embedding"]
+    assert embedding == {
+        "type": "api",
+        "preset": "ollama",
+        "adapter": "ollama",
+        "base_url": "http://legacy-ollama:11434",
+        "model": "qwen3-embedding:0.6b",
+        "dimension": 1024,
+        "version": "story-v2-default-v1",
+        "config_source": "legacy_ollama_env",
+        "remote_text_disclosure": False,
+    }
+    assert not storybook_home.exists()
+
+
 @pytest.mark.parametrize(
     ("adapters", "case"),
     [
@@ -842,12 +880,19 @@ def test_model_unavailable_returns_degraded_not_failed(isolated_setup, monkeypat
 
 
 def _invoke_runtime_status(
-    manager, monkeypatch, *, reachable=True, models=None, credentials=True
+    manager, monkeypatch, *, reachable=True, models=None, credentials=True,
+    embedding_probe=None,
 ):
     tags = {"models": [{"name": name} for name in (models or ())]}
     monkeypatch.setattr(
         "storybook.setup_manager.health._check_ollama_reachable",
         lambda: (reachable, tags if reachable else None, "offline"),
+    )
+    monkeypatch.setattr(
+        "storybook.setup_manager.embeddings.probe",
+        lambda: embedding_probe or {
+            "ok": True, "reason": None, "dimension": config.EMBED_DIM
+        },
     )
     monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
     monkeypatch.setattr(config, "LLM_API_KEY", "configured" if credentials else None)
@@ -885,7 +930,7 @@ def test_status_reports_ollama_unavailable(isolated_setup, monkeypatch):
 
     assert payload["status"] == "ready_degraded"
     assert payload["model"]["status"] == "degraded"
-    assert payload["degraded_reasons"] == ["ollama_unavailable"]
+    assert payload["degraded_reasons"] == ["endpoint_unreachable:embedding"]
 
 
 def test_status_reports_missing_embedding_model(isolated_setup, monkeypatch):
@@ -898,7 +943,24 @@ def test_status_reports_missing_embedding_model(isolated_setup, monkeypatch):
 
     assert payload["status"] == "ready_degraded"
     assert payload["model"]["embedding"]["status"] == "missing"
-    assert payload["degraded_reasons"] == ["model_missing:embedding"]
+    assert payload["degraded_reasons"] == ["model_unavailable:embedding"]
+
+
+def test_status_reports_embedding_dimension_mismatch(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    payload = _invoke_runtime_status(
+        manager,
+        monkeypatch,
+        models=(config.EMBED_MODEL,),
+        embedding_probe={
+            "ok": False,
+            "reason": "dimension_mismatch",
+            "dimension": 768,
+        },
+    )
+
+    assert payload["model"]["embedding"]["status"] == "dimension_mismatch"
+    assert payload["degraded_reasons"] == ["dimension_mismatch:embedding"]
 
 
 def test_status_reports_managed_adapter_missing(isolated_setup, monkeypatch):
@@ -955,7 +1017,8 @@ def test_status_reports_mixed_providers_and_missing_llm_credentials(
         "name": config.LLM_MODEL,
         "status": "credentials_missing",
     }
-    assert payload["model"]["embedding"]["provider"] == "ollama"
+    assert payload["model"]["embedding"]["provider"] == "api"
+    assert payload["model"]["embedding"]["adapter"] == "ollama"
     assert payload["degraded_reasons"] == ["llm_credentials_missing"]
 
 
@@ -980,6 +1043,32 @@ def test_ensure_models_only_checks_and_pulls_embedding(isolated_setup, monkeypat
     assert models == [
         {"name": config.EMBED_MODEL, "status": "downloaded", "size": None}
     ]
+    assert degraded == []
+
+
+def test_custom_api_never_calls_ollama_model_management(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.delattr(manager, "_ensure_models")
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
+    monkeypatch.setattr(
+        "storybook.setup_manager._ollama_tags",
+        lambda: (_ for _ in ()).throw(AssertionError("must not call /api/tags")),
+    )
+    monkeypatch.setattr(
+        "storybook.setup_manager._pull_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("must not call /api/pull")
+        ),
+    )
+
+    models, degraded = manager._ensure_models(download=True, progress=None)
+
+    assert models == [{
+        "name": config.EMBED_MODEL,
+        "status": "configured",
+        "provider": "api",
+        "adapter": "openai_compatible",
+    }]
     assert degraded == []
 
 
