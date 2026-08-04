@@ -69,6 +69,14 @@ class TestQueryDiagnostics:
         # degraded reasons are independent of the host environment.
         monkeypatch.setattr(config, "LLM_PROVIDER", "ollama")
         monkeypatch.setattr(
+            "storybook.setup_manager.embeddings.probe",
+            lambda: {
+                "ok": True,
+                "reason": None,
+                "dimension": config.EMBED_DIM,
+            },
+        )
+        monkeypatch.setattr(
             "storybook.setup_manager.health._check_ollama_reachable",
             lambda: (
                 True,

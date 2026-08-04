@@ -115,6 +115,16 @@ def _run(prefix: Path, env: dict[str, str], *args: str) -> subprocess.CompletedP
     )
 
 
+def _read_pty(fd: int, size: int) -> bytes:
+    """Read a PTY, treating Linux EIO after slave close as portable EOF."""
+    try:
+        return os.read(fd, size)
+    except OSError as exc:
+        if exc.errno == errno.EIO:
+            return b""
+        raise
+
+
 def _write_probe_wheel(path: Path, tag: str, *, both_entrypoints: bool = True) -> None:
     dist_info = "storybook-0.0.0.dist-info"
     module = f'''import os
@@ -150,27 +160,45 @@ def main():
         wheel.writestr(f"{dist_info}/RECORD", record)
 
 
-def _use_real_python_wheel(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
-    tools, env = _fake_tools(tmp_path)
-    # Keep the fake downloader, but never let fake preflight tools leak into a
-    # real venv. In particular, ensurepip's vendored distro calls `uname -rs`
-    # on Linux, which the installer preflight stub deliberately does not model.
-    (tools / "python3").unlink()
-    (tools / "uname").unlink()
+def _use_real_python_wheel(
+    tmp_path: Path, release_url: str
+) -> tuple[Path, dict[str, str], Path]:
     wheel = tmp_path / "storybook-0.0.0-py3-none-any.whl"
     _write_probe_wheel(wheel, "v1")
-    checksum = Path(env["FAKE_CHECKSUM"])
+    checksum = tmp_path / f"{wheel.name}.sha256"
     checksum.write_text(
         f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}\n",
         encoding="ascii",
     )
-    env.update({
-        "FAKE_ARCHIVE": str(wheel),
-        "STORYBOOK_INSTALL_ARCHIVE_URL": f"https://mirror.invalid/{wheel.name}",
+    env = {
+        **os.environ,
+        "STORYBOOK_INSTALL_ARCHIVE_URL": f"{release_url}/{wheel.name}",
+        "STORYBOOK_INSTALL_CHECKSUM_URL": f"{release_url}/{checksum.name}",
         "STORYBOOK_INSTALL_PYTHON": sys.executable,
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-    })
+    }
     return wheel, env, checksum
+
+
+@pytest.fixture
+def mutable_release_url(tmp_path: Path):
+    class QuietHandler(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass
+
+    handler = lambda *args, **kwargs: QuietHandler(  # noqa: E731
+        *args, directory=str(tmp_path), **kwargs
+    )
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 @pytest.fixture(scope="session")
@@ -280,7 +308,7 @@ def test_generated_official_asset_installs_with_real_downloader_and_rolls_back(
         "PIP_DISABLE_PIP_VERSION_CHECK": "1",
     }
 
-    installed = _run(prefix, env, "--version", "0.1.0")
+    installed = _run(prefix, env, "--version", "0.1.2")
     assert installed.returncode == 0, installed.stderr
     for entrypoint in ("book", "storybook"):
         checked = subprocess.run(
@@ -291,9 +319,9 @@ def test_generated_official_asset_installs_with_real_downloader_and_rolls_back(
         )
         assert checked.returncode == 0, checked.stderr
 
-    repeated = _run(prefix, env, "--version", "0.1.0")
+    repeated = _run(prefix, env, "--version", "0.1.2")
     assert repeated.returncode == 0, repeated.stderr
-    upgraded = _run(prefix, env, "--version", "0.1.1")
+    upgraded = _run(prefix, env, "--version", "0.1.3")
     assert upgraded.returncode == 0, upgraded.stderr
     active_before = (prefix / "lib" / "storybook" / "current").resolve()
 
@@ -301,7 +329,7 @@ def test_generated_official_asset_installs_with_real_downloader_and_rolls_back(
     original_checksum = checksum.read_text(encoding="ascii")
     checksum.write_text("0" * 64 + "  storybook.tar.gz\n", encoding="ascii")
     try:
-        failed = _run(prefix, env, "--version", "0.1.2")
+        failed = _run(prefix, env, "--version", "0.1.4")
     finally:
         checksum.write_text(original_checksum, encoding="ascii")
 
@@ -400,9 +428,9 @@ def test_package_install_failure_keeps_previous_release_running(tmp_path):
 
 
 def test_real_venv_entrypoints_survive_clean_install_upgrade_and_bad_release(
-    tmp_path,
+    tmp_path, mutable_release_url,
 ):
-    wheel, env, checksum = _use_real_python_wheel(tmp_path)
+    wheel, env, checksum = _use_real_python_wheel(tmp_path, mutable_release_url)
     prefix = tmp_path / "real prefix"
 
     installed = _run(prefix, env, "--version", "1.2.3")
@@ -441,8 +469,10 @@ def test_real_venv_entrypoints_survive_clean_install_upgrade_and_bad_release(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="installer onboarding TTY is POSIX-only")
-def test_path_missing_onboarding_exports_stable_launcher_to_book_init(tmp_path):
-    _, env, _ = _use_real_python_wheel(tmp_path)
+def test_path_missing_onboarding_exports_stable_launcher_to_book_init(
+    tmp_path, mutable_release_url,
+):
+    _, env, _ = _use_real_python_wheel(tmp_path, mutable_release_url)
     prefix = tmp_path / "prefix"
     probe = tmp_path / "launcher.txt"
     env["PROBE_FILE"] = str(probe)
@@ -462,14 +492,7 @@ def test_path_missing_onboarding_exports_stable_launcher_to_book_init(tmp_path):
                 pytest.fail(output.decode(errors="replace"))
             ready, _, _ = select.select([master], [], [], 0.1)
             if ready:
-                try:
-                    chunk = os.read(master, 8192)
-                except OSError as exc:
-                    # Linux PTYs report EIO when the slave closes; treat that
-                    # as EOF so a premature child exit reports captured output.
-                    if exc.errno != errno.EIO:
-                        raise
-                    chunk = b""
+                chunk = _read_pty(master, 8192)
                 if not chunk:
                     process.wait(timeout=5)
                     pytest.fail(output.decode(errors="replace"))
