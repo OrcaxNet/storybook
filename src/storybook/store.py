@@ -253,6 +253,8 @@ END;
 CREATE TABLE IF NOT EXISTS story_embedding_backfill (
     story_id INTEGER NOT NULL,
     embedding_model TEXT NOT NULL,
+    embedding_provider TEXT,
+    embedding_base_url TEXT,
     embedding_version TEXT NOT NULL,
     representation TEXT NOT NULL,
     content_hash TEXT NOT NULL,
@@ -268,9 +270,13 @@ CREATE TABLE IF NOT EXISTS story_embedding_backfill (
 CREATE TABLE IF NOT EXISTS embedding_index_state (
     id INTEGER PRIMARY KEY CHECK(id = 1),
     active_model TEXT NOT NULL,
+    active_provider TEXT,
+    active_base_url TEXT,
     active_version TEXT NOT NULL,
     active_representation TEXT NOT NULL,
     target_model TEXT,
+    target_provider TEXT,
+    target_base_url TEXT,
     target_version TEXT,
     target_representation TEXT,
     backfill_status TEXT NOT NULL DEFAULT 'idle'
@@ -348,6 +354,7 @@ def init_db(
         _ensure_context_columns(db)
         _ensure_story_v2_columns(db)
         _ensure_governance_columns(db)
+        _ensure_embedding_provider_columns(db)
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_stories_active ON stories(archived_at, deleted_at)"
         )
@@ -375,14 +382,49 @@ def init_db(
         )
         db.execute(
             """INSERT OR IGNORE INTO embedding_index_state (
-                   id, active_model, active_version, active_representation
-               ) VALUES (1, ?, ?, ?)""",
-            (config.EMBED_MODEL, initial_version, initial_representation),
+                   id, active_model, active_provider, active_base_url,
+                   active_version, active_representation
+               ) VALUES (1, ?, ?, ?, ?, ?)""",
+            (
+                config.EMBED_MODEL, config.EMBED_PROVIDER,
+                config.EMBED_BASE_URL, initial_version, initial_representation,
+            ),
         )
         db.commit()
         logger.info("数据库初始化完成")
     finally:
         db.close()
+
+
+def _ensure_embedding_provider_columns(db: sqlite3.Connection) -> None:
+    """Bind existing embedding state to its provider without rebuilding data."""
+
+    additions = {
+        "embedding_index_state": {
+            "active_provider": "TEXT",
+            "active_base_url": "TEXT",
+            "target_provider": "TEXT",
+            "target_base_url": "TEXT",
+        },
+        "story_embedding_backfill": {
+            "embedding_provider": "TEXT",
+            "embedding_base_url": "TEXT",
+        },
+    }
+    for table, fields in additions.items():
+        columns = {
+            row["name"] for row in db.execute(f"PRAGMA table_info({table})")
+        }
+        for name, declaration in fields.items():
+            if name not in columns:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    db.execute(
+        """UPDATE embedding_index_state
+           SET active_provider = COALESCE(active_provider, ?),
+               active_base_url = COALESCE(active_base_url, ?)
+           WHERE id = 1""",
+        (config.EMBED_PROVIDER, config.EMBED_BASE_URL),
+    )
 
 
 def _ensure_source_checkpoint_columns(db: sqlite3.Connection) -> None:
@@ -1418,6 +1460,8 @@ def _active_embedding_spec(db: sqlite3.Connection) -> dict:
     ).fetchone()
     return dict(row) if row else {
         "active_model": config.EMBED_MODEL,
+        "active_provider": config.EMBED_PROVIDER,
+        "active_base_url": config.EMBED_BASE_URL,
         "active_version": config.EMBED_VERSION,
         "active_representation": config.EMBED_REPRESENTATION,
     }
@@ -1427,19 +1471,27 @@ def begin_embedding_backfill(
     model: str,
     version: str,
     representation: str,
+    *,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> None:
     """Declare a shadow target without changing the serving index."""
 
+    provider = provider or config.EMBED_PROVIDER
+    base_url = (base_url or config.EMBED_BASE_URL).rstrip("/")
     db = get_db(load_vector_extension=False)
     try:
         existing = db.execute(
-            """SELECT DISTINCT embedding_model, representation
+            """SELECT DISTINCT embedding_model, embedding_provider,
+                              embedding_base_url, representation
                FROM story_embedding_backfill
                WHERE embedding_version = ?""",
             (version,),
         ).fetchall()
         if any(
             row["embedding_model"] != model
+            or (row["embedding_provider"] or provider) != provider
+            or (row["embedding_base_url"] or base_url).rstrip("/") != base_url
             or row["representation"] != representation
             for row in existing
         ):
@@ -1453,6 +1505,8 @@ def begin_embedding_backfill(
             active and active["active_version"] == version
             and (
                 active["active_model"] != model
+                or (active["active_provider"] or provider) != provider
+                or (active["active_base_url"] or base_url).rstrip("/") != base_url
                 or active["active_representation"] != representation
             )
         ):
@@ -1461,11 +1515,12 @@ def begin_embedding_backfill(
             )
         db.execute(
             """UPDATE embedding_index_state
-               SET target_model = ?, target_version = ?,
+               SET target_model = ?, target_provider = ?, target_base_url = ?,
+                   target_version = ?,
                    target_representation = ?, backfill_status = 'running',
                    updated_at = datetime('now')
                WHERE id = 1""",
-            (model, version, representation),
+            (model, provider, base_url, version, representation),
         )
         db.commit()
     finally:
@@ -1522,6 +1577,8 @@ def stage_embedding_backfill(
     content_hash: str,
     embedding: list[float] | None,
     error: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> None:
     """Persist one shadow result; failed rows are retryable on the next run."""
 
@@ -1530,15 +1587,20 @@ def stage_embedding_backfill(
         if embedding is not None else None
     )
     status = "ready" if embedding is not None else "failed"
+    provider = provider or config.EMBED_PROVIDER
+    base_url = (base_url or config.EMBED_BASE_URL).rstrip("/")
     db = get_db(load_vector_extension=False)
     try:
         db.execute(
             """INSERT INTO story_embedding_backfill (
-                   story_id, embedding_model, embedding_version,
+                   story_id, embedding_model, embedding_provider,
+                   embedding_base_url, embedding_version,
                    representation, content_hash, embedding, status, error
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(story_id, embedding_version) DO UPDATE SET
                    embedding_model = excluded.embedding_model,
+                   embedding_provider = excluded.embedding_provider,
+                   embedding_base_url = excluded.embedding_base_url,
                    representation = excluded.representation,
                    content_hash = excluded.content_hash,
                    embedding = excluded.embedding,
@@ -1547,7 +1609,8 @@ def stage_embedding_backfill(
                    attempts = story_embedding_backfill.attempts + 1,
                    updated_at = datetime('now')""",
             (
-                story_id, model, version, representation, content_hash,
+                story_id, model, provider, base_url, version,
+                representation, content_hash,
                 blob, status, (error or "")[:500] or None,
             ),
         )
@@ -1605,9 +1668,13 @@ def activate_embedding_backfill(
     model: str,
     version: str,
     representation: str,
+    provider: str | None = None,
+    base_url: str | None = None,
 ) -> dict:
     """Atomically replace the active vec0 rows after a complete shadow build."""
 
+    provider = provider or config.EMBED_PROVIDER
+    base_url = (base_url or config.EMBED_BASE_URL).rstrip("/")
     progress = embedding_backfill_progress(version, representation)
     if progress["pending"]:
         raise ValueError(
@@ -1627,8 +1694,9 @@ def activate_embedding_backfill(
             story = _row_to_story(story_row)
             expected_hash = story_v2.content_hash(story, representation)
             shadow = db.execute(
-                """SELECT embedding, content_hash, embedding_model, representation,
-                          status
+                """SELECT embedding, content_hash, embedding_model,
+                          embedding_provider, embedding_base_url,
+                          representation, status
                    FROM story_embedding_backfill
                    WHERE story_id = ? AND embedding_version = ?""",
                 (story["id"], version),
@@ -1637,6 +1705,8 @@ def activate_embedding_backfill(
                 shadow is None or shadow["status"] != "ready"
                 or shadow["content_hash"] != expected_hash
                 or shadow["embedding_model"] != model
+                or (shadow["embedding_provider"] or provider) != provider
+                or (shadow["embedding_base_url"] or base_url).rstrip("/") != base_url
                 or shadow["representation"] != representation
             ):
                 raise ValueError(
@@ -1677,12 +1747,14 @@ def activate_embedding_backfill(
             )
         db.execute(
             """UPDATE embedding_index_state
-               SET active_model = ?, active_version = ?,
+               SET active_model = ?, active_provider = ?, active_base_url = ?,
+                   active_version = ?,
                    active_representation = ?, target_model = NULL,
+                   target_provider = NULL, target_base_url = NULL,
                    target_version = NULL, target_representation = NULL,
                    backfill_status = 'idle', updated_at = datetime('now')
                WHERE id = 1""",
-            (model, version, representation),
+            (model, provider, base_url, version, representation),
         )
         _bump_index_version(db)
         db.commit()

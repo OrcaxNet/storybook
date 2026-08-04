@@ -116,7 +116,9 @@ def search(
 
     # ── Step 0: index_version 隔离的结果缓存 ──
     cache_started = performance.now()
-    identity = query_cache.index_identity(index_version)
+    identity = query_cache.index_identity(
+        index_version, embedding_spec=store.get_embedding_index_state()
+    )
     # Environment-aware results depend on the supplied envelope and scope. Keep
     # the existing fast result cache for context-free profile searches only;
     # the query-vector cache remains safe and shared for every variant.

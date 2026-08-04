@@ -195,7 +195,9 @@ def setup_command(
             _emit_setup_error(SetupError("SB_MODEL_CONFIG_INVALID", str(exc)), as_json=as_json)
             return
     try:
-        plan = manager.plan(agents or None).as_dict()
+        plan = manager.plan(
+            agents or None, provider_config=selected_model_config
+        ).as_dict()
     except SetupError as exc:
         _emit_setup_error(exc, as_json=as_json)
         return

@@ -105,6 +105,12 @@ book setup --provider api --base-url https://gateway.example/v1-root \
 未生成 Profile 配置的旧安装继续按“Profile 配置 > 旧环境变量 > 默认值”的优先级
 只读解析 `ANTHROPIC_*`、`DEEPSEEK_KEY`、`OLLAMA_HOST` 与
 `STORYBOOK_EMBED_MODEL`，无需迁移现有数据。
+
+已有 Profile 的 active 向量索引会持久化 provider、base URL、model 与 version
+身份。setup 若检测到目标 embedding space 不兼容，会在任何写入和网络探测前以
+`SB_MODEL_INDEX_INCOMPATIBLE` 失败；可保持原配置，或先运行
+`storybook profile create provider-migration --switch` 创建隔离 Profile 后重新
+setup。不同 provider/base URL 即使模型同名，也不会共享 inference/query cache。
 - 依赖：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
 
 ```bash

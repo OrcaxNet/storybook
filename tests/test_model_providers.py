@@ -16,7 +16,14 @@ from pathlib import Path
 import pytest
 import requests
 
-from storybook import config, model_config
+from storybook import (
+    config,
+    embeddings,
+    inference_cache,
+    model_config,
+    query_cache,
+    store,
+)
 from storybook.profiles import PlatformRoots, ProfileRegistry
 from storybook.setup_manager import SetupError, SetupManager
 
@@ -241,6 +248,121 @@ def test_api_missing_embedding_credential_fails_before_network(tmp_path, monkeyp
         manager._probe_provider(value)
     assert caught.value.code == "SB_MODEL_CREDENTIALS_MISSING"
     assert "embedding" in str(caught.value)
+
+
+def test_existing_index_provider_switch_fails_before_any_config_write(
+    tmp_path, monkeypatch
+):
+    roots = _roots(tmp_path)
+    registry = ProfileRegistry(roots.config / "profiles.json", roots=roots, environ={})
+    old_registry = config.PROFILE_REGISTRY
+    try:
+        config.PROFILE_REGISTRY = registry
+        config.refresh_profile(create=True)
+        original_config = model_config.build(
+            provider="ollama", base_url="http://127.0.0.1:11434",
+            llm_model="local-chat", embedding_model="shared-model",
+            api_key_env=None,
+        )
+        model_config.save(config.MODEL_CONFIG_PATH, original_config)
+        original_bytes = config.MODEL_CONFIG_PATH.read_bytes()
+        config.refresh_model_config(environ={})
+        store.init_db()
+        store.add_story("existing", "memory", [], [0.1] * config.EMBED_DIM)
+        before = store.get_embedding_index_state()
+        candidate = model_config.ModelConfig(
+            model_config.SCHEMA_VERSION,
+            model_config.endpoint(
+                "api", "https://new.example.test", "chat", "GEN_KEY"
+            ),
+            model_config.endpoint(
+                "api", "https://new.example.test", before["active_model"], "EMBED_KEY"
+            ),
+        )
+        manager = SetupManager(
+            environ={"GEN_KEY": SENTINEL, "EMBED_KEY": SENTINEL},
+            adapters=(), roots=roots,
+        )
+        monkeypatch.setattr(
+            manager,
+            "_probe_provider",
+            lambda value: pytest.fail("provider network probe must not run"),
+        )
+
+        with pytest.raises(SetupError) as dry_run_error:
+            manager.plan(requested_agents=(), provider_config=candidate)
+        assert dry_run_error.value.code == "SB_MODEL_INDEX_INCOMPATIBLE"
+
+        with pytest.raises(SetupError) as caught:
+            manager.execute(requested_agents=(), provider_config=candidate)
+
+        assert caught.value.code == "SB_MODEL_INDEX_INCOMPATIBLE"
+        assert "profile create provider-migration --switch" in caught.value.hint
+        assert config.MODEL_CONFIG_PATH.read_bytes() == original_bytes
+        assert not manager.state_path.exists()
+        assert store.get_embedding_index_state() == before
+        assert before["active_provider"] == "ollama"
+        assert before["active_base_url"] == "http://127.0.0.1:11434"
+    finally:
+        config.PROFILE_REGISTRY = old_registry
+        config.refresh_profile(create=False)
+        config.refresh_model_config()
+
+
+def test_embedding_inference_cache_isolated_by_provider_and_base_url(
+    monkeypatch
+):
+    values = {}
+    calls = []
+
+    def cache_get(namespace, payload):
+        return values.get((namespace, inference_cache.input_hash(payload)))
+
+    def cache_set(namespace, payload, value):
+        values[(namespace, inference_cache.input_hash(payload))] = value
+
+    class ProviderResponse(Response):
+        def json(self):
+            if config.EMBED_PROVIDER == "api":
+                return {"data": [{"embedding": [0.1] * config.EMBED_DIM}]}
+            return {"embedding": [0.1] * config.EMBED_DIM}
+
+    monkeypatch.setattr(inference_cache, "get", cache_get)
+    monkeypatch.setattr(inference_cache, "set", cache_set)
+    monkeypatch.setattr(
+        embeddings.requests,
+        "post",
+        lambda url, **kwargs: calls.append(url) or ProviderResponse(),
+    )
+    monkeypatch.setattr(config, "EMBED_PROVIDER", "ollama")
+    monkeypatch.setattr(config, "EMBED_BASE_URL", "http://provider-a.test")
+    assert embeddings.embed("same", model="shared-model") is not None
+
+    monkeypatch.setattr(config, "EMBED_PROVIDER", "api")
+    monkeypatch.setattr(config, "EMBED_BASE_URL", "https://provider-b.test")
+    monkeypatch.setattr(config, "EMBED_API_KEY", SENTINEL)
+    assert embeddings.embed("same", model="shared-model") is not None
+
+    assert calls == [
+        "http://provider-a.test/api/embeddings",
+        "https://provider-b.test/v1/embeddings",
+    ]
+
+
+def test_query_cache_identity_isolated_by_active_provider_spec():
+    first = query_cache.index_identity(7, embedding_spec={
+        "active_provider": "ollama",
+        "active_base_url": "http://provider-a.test",
+        "active_model": "shared-model",
+        "active_version": "v1",
+    })
+    second = query_cache.index_identity(7, embedding_spec={
+        "active_provider": "api",
+        "active_base_url": "https://provider-b.test",
+        "active_model": "shared-model",
+        "active_version": "v1",
+    })
+    assert first != second
 
 
 @pytest.mark.parametrize("status", [401, 403])

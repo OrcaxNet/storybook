@@ -60,10 +60,20 @@ _result_cache = _TTLCache[dict](
 )
 
 
-def index_identity(index_version: int) -> tuple[str, int, str]:
+def index_identity(
+    index_version: int, *, embedding_spec: dict | None = None
+) -> tuple[str, int, str, str, str, str]:
     """绝对路径仅作为进程内隔离 key，不进入响应或诊断日志。"""
 
-    return (str(config.DB_PATH.resolve()), int(index_version), config.EMBED_MODEL)
+    spec = embedding_spec or {}
+    return (
+        str(config.DB_PATH.resolve()),
+        int(index_version),
+        str(spec.get("active_provider") or config.EMBED_PROVIDER),
+        str(spec.get("active_base_url") or config.EMBED_BASE_URL).rstrip("/"),
+        str(spec.get("active_model") or config.EMBED_MODEL),
+        str(spec.get("active_version") or config.EMBED_VERSION),
+    )
 
 
 def get_query_vector(identity: tuple, query: str) -> list[float] | None:

@@ -237,9 +237,16 @@ class SetupManager:
             if path.is_file() and path.resolve(strict=False) != current
         )
 
-    def plan(self, requested_agents: Iterable[str] | None = None) -> SetupPlan:
+    def plan(
+        self,
+        requested_agents: Iterable[str] | None = None,
+        *,
+        provider_config: model_config.ModelConfig | None = None,
+    ) -> SetupPlan:
         """只读生成完整计划；不得创建 Profile、目录或网络请求。"""
 
+        if provider_config is not None:
+            self._validate_embedding_index_compatibility(provider_config)
         selected = self._selected_names(requested_agents)
         adapter_plans: list[dict[str, Any]] = []
         try:
@@ -699,6 +706,81 @@ class SetupManager:
             })
         return result
 
+    def _validate_embedding_index_compatibility(
+        self, value: model_config.ModelConfig
+    ) -> None:
+        """Reject provider drift before setup performs any write.
+
+        The serving vec0 rows are one immutable embedding space.  Changing the
+        Profile endpoint without rebuilding that index would make runtime
+        requests use a provider/model that does not match the stored vectors.
+        """
+
+        profile = config.PROFILE_REGISTRY.peek_active_profile()
+        if profile is None:
+            return
+        database = config.PROFILE_REGISTRY.paths_for(profile).database
+        if not database.is_file():
+            return
+        try:
+            db = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+            db.row_factory = sqlite3.Row
+            try:
+                table = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embedding_index_state'"
+                ).fetchone()
+                if table is None:
+                    return
+                row = db.execute(
+                    "SELECT * FROM embedding_index_state WHERE id = 1"
+                ).fetchone()
+            finally:
+                db.close()
+        except sqlite3.Error as exc:
+            raise SetupError(
+                "SB_MODEL_INDEX_STATE_INVALID",
+                "无法只读检查 active embedding index",
+                hint="运行 `storybook doctor` 修复数据库后重试",
+            ) from exc
+        if row is None:
+            return
+
+        fields = set(row.keys())
+        current = config.MODEL_CONFIG.embedding
+        active = {
+            "provider": (
+                row["active_provider"]
+                if "active_provider" in fields and row["active_provider"]
+                else current.provider
+            ),
+            "base_url": (
+                row["active_base_url"]
+                if "active_base_url" in fields and row["active_base_url"]
+                else current.base_url
+            ).rstrip("/"),
+            "model": row["active_model"],
+            "version": row["active_version"],
+        }
+        candidate = value.embedding
+        if (
+            active["provider"] == candidate.provider
+            and active["base_url"] == candidate.base_url.rstrip("/")
+            and active["model"] == candidate.model
+        ):
+            return
+        raise SetupError(
+            "SB_MODEL_INDEX_INCOMPATIBLE",
+            (
+                "目标 embedding provider/model 与 active index 不兼容："
+                f"active={active['provider']}/{active['model']}@{active['version']}，"
+                f"target={candidate.provider}/{candidate.model}"
+            ),
+            hint=(
+                "保持当前配置，或运行 `storybook profile create provider-migration "
+                "--switch` 创建隔离 Profile 并重新执行 setup；禁止在旧索引上静默切换"
+            ),
+        )
+
     def execute(
         self,
         *,
@@ -707,11 +789,12 @@ class SetupManager:
         progress: Progress | None = None,
         provider_config: model_config.ModelConfig | None = None,
     ) -> dict[str, Any]:
-        plan = self.plan(requested_agents)
+        plan = self.plan(requested_agents, provider_config=provider_config)
         selected = {
             item["adapter"] for item in plan.adapters if item["selected"]
         }
-        # 受管 state 决定升级与卸载恢复行为，必须在任何 Profile/DB 写入前校验。
+        # Provider/index compatibility and managed state must be validated
+        # before Profile, config, database, or adapter writes.
         existing_state = self._load_state() or {}
         if provider_config is not None and provider_config.generation.provider == "api":
             # Validate remote credentials and both capabilities before any write.

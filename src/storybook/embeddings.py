@@ -31,11 +31,22 @@ def embed(
     - 维度不匹配 / 零向量时返回 None（上层据此标记 failed 或报错，不再传入坏向量）。
     - 归一化保证 store.search_by_vector 中 ``1 - dist²/2`` 等于 cosine 相似度（精确）。
     """
+    provider = config.EMBED_PROVIDER
+    base_url = config.EMBED_BASE_URL.rstrip("/")
     if model is None:
         try:
             from . import store
             state = store.get_embedding_index_state()
             model = state.get("active_model") or config.EMBED_MODEL
+            active_provider = state.get("active_provider") or provider
+            active_base_url = (state.get("active_base_url") or base_url).rstrip("/")
+            if active_provider != provider or active_base_url != base_url:
+                logger.error(
+                    "Embedding index provider mismatch active=%s configured=%s",
+                    active_provider,
+                    provider,
+                )
+                return None
             cache_version = (
                 cache_version or state.get("active_version") or config.EMBED_VERSION
             )
@@ -43,6 +54,8 @@ def embed(
             model = config.EMBED_MODEL
     cache_version = cache_version or config.EMBED_VERSION
     cache_payload = {
+        "provider": provider,
+        "base_url": base_url,
         "model": model,
         "version": cache_version,
         "dimension": config.EMBED_DIM,
@@ -151,7 +164,11 @@ def backfill(
     from . import store
     from . import story_v2
 
-    store.begin_embedding_backfill(model, version, representation)
+    store.begin_embedding_backfill(
+        model, version, representation,
+        provider=config.EMBED_PROVIDER,
+        base_url=config.EMBED_BASE_URL,
+    )
     pending = store.stories_pending_embedding_backfill(
         version,
         representation,
@@ -174,6 +191,8 @@ def backfill(
                 representation=representation,
                 content_hash=story["target_content_hash"],
                 embedding=vector,
+                provider=config.EMBED_PROVIDER,
+                base_url=config.EMBED_BASE_URL,
             )
         else:
             failed += 1
@@ -185,6 +204,8 @@ def backfill(
                 content_hash=story["target_content_hash"],
                 embedding=None,
                 error="embedding unavailable or dimension mismatch",
+                provider=config.EMBED_PROVIDER,
+                base_url=config.EMBED_BASE_URL,
             )
 
     progress = store.embedding_backfill_progress(version, representation)
@@ -194,6 +215,8 @@ def backfill(
             model=model,
             version=version,
             representation=representation,
+            provider=config.EMBED_PROVIDER,
+            base_url=config.EMBED_BASE_URL,
         )
     elif progress["pending"] == 0:
         store.mark_embedding_backfill_ready()
