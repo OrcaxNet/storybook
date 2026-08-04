@@ -18,6 +18,21 @@ _STATE_LOCK = threading.Lock()
 _LAST_SUCCESS_AT: float | None = None
 
 
+def serving_index_matches_config(state: dict) -> bool:
+    """Return whether the active index belongs to the configured embedding space."""
+
+    active_provider = state.get("active_provider") or config.EMBED_PROVIDER
+    active_base_url = (
+        state.get("active_base_url") or config.EMBED_BASE_URL
+    ).rstrip("/")
+    active_model = state.get("active_model") or config.EMBED_MODEL
+    return (
+        active_provider == config.EMBED_PROVIDER
+        and active_base_url == config.EMBED_BASE_URL.rstrip("/")
+        and active_model == config.EMBED_MODEL
+    )
+
+
 def embed(
     text: str,
     model: str = None,
@@ -38,13 +53,7 @@ def embed(
             from . import store
             state = store.get_embedding_index_state()
             active_model = state.get("active_model") or config.EMBED_MODEL
-            active_provider = state.get("active_provider") or provider
-            active_base_url = (state.get("active_base_url") or base_url).rstrip("/")
-            if (
-                active_provider != provider
-                or active_base_url != base_url
-                or active_model != config.EMBED_MODEL
-            ):
+            if not serving_index_matches_config(state):
                 logger.error(
                     "Embedding index configuration mismatch; refusing default embedding",
                 )

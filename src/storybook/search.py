@@ -116,8 +116,12 @@ def search(
 
     # ── Step 0: index_version 隔离的结果缓存 ──
     cache_started = performance.now()
+    embedding_spec = store.get_embedding_index_state()
+    serving_index_compatible = embeddings.serving_index_matches_config(
+        embedding_spec
+    )
     identity = query_cache.index_identity(
-        index_version, embedding_spec=store.get_embedding_index_state()
+        index_version, embedding_spec=embedding_spec
     )
     # Environment-aware results depend on the supplied envelope and scope. Keep
     # the existing fast result cache for context-free profile searches only;
@@ -131,7 +135,7 @@ def search(
     )
     cached = (
         query_cache.get_result(identity, result_cache_query, top_k)
-        if result_cache_enabled else None
+        if result_cache_enabled and serving_index_compatible else None
     )
     latency["cache"] = performance.elapsed_ms(cache_started)
     if cached is not None:
@@ -146,10 +150,15 @@ def search(
     # 直接 embed 原始 query。早先用 llm.extract_keywords 抽关键词再拼 query 做 embedding，
     # 但搜索 query 通常很短，关键词提取器为凑 5-10 个配额会幻觉出无关词（如"内存泄漏""无限循环"），
     # 污染向量、把检索带偏。短 query 本身已是聚焦点，直接 embed 更准且省一次 LLM 调用。
-    query_vec = query_cache.get_query_vector(identity, normalized_query)
+    query_vec = (
+        query_cache.get_query_vector(identity, normalized_query)
+        if serving_index_compatible else None
+    )
     query_vector_cache_hit = query_vec is not None
     embed_failure_reason = None
-    if query_vec is None:
+    if not serving_index_compatible:
+        embed_failure_reason = "embedding_unavailable"
+    elif query_vec is None:
         embed_started = performance.now()
         timeout_seconds = (
             config.QUERY_WARM_TIMEOUT_SECONDS
