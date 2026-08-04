@@ -1,6 +1,7 @@
 """配置管理 — Profile 路径、模型名、阈值常量集中管理。"""
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -251,6 +252,15 @@ except profiles_module.ProfileError:
 # ── Embedding API ──
 # 顶层产品抽象始终是 API。Ollama 只是默认的本地 preset/adapter；
 # 旧 OLLAMA_HOST / STORYBOOK_EMBED_MODEL 配置会无损映射到这个抽象。
+_ENVIRONMENT_VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def valid_environment_variable_name(value: str) -> bool:
+    """Return whether value is a portable, non-secret environment key name."""
+
+    return bool(_ENVIRONMENT_VARIABLE_NAME.fullmatch(value))
+
+
 def _persisted_embedding_config() -> dict:
     """Read setup's non-secret provider selection without importing setup."""
 
@@ -271,6 +281,10 @@ def _persisted_embedding_config() -> dict:
         for name in ("base_url", "model", "version", "api_key_env"):
             if not isinstance(value.get(name), str):
                 return {}
+        if value["api_key_env"] and not valid_environment_variable_name(
+            value["api_key_env"]
+        ):
+            return {}
         return value
     except (OSError, UnicodeError, ValueError, AttributeError):
         return {}
@@ -327,6 +341,10 @@ EMBED_API_KEY_ENV = os.getenv(
     "STORYBOOK_EMBED_API_KEY_ENV",
     str(_PERSISTED_EMBED_CONFIG.get("api_key_env", "")),
 ).strip()
+if EMBED_API_KEY_ENV and not valid_environment_variable_name(EMBED_API_KEY_ENV):
+    raise ValueError(
+        "STORYBOOK_EMBED_API_KEY_ENV must be an environment variable name"
+    )
 EMBED_CONFIG_SOURCE = (
     "explicit_api"
     if _EMBED_NEW_ENV_EXPLICIT
@@ -392,6 +410,11 @@ def apply_embedding_config(
     global EMBED_PRESET, EMBED_ADAPTER, EMBED_BASE_URL, EMBED_MODEL, EMBED_DIM
     global EMBED_VERSION
     global EMBED_API_KEY_ENV, EMBED_CONFIG_SOURCE, EMBED_CONFIG_NORMALIZED
+    credential_env = (api_key_env or "").strip()
+    if credential_env and not valid_environment_variable_name(credential_env):
+        raise ValueError(
+            "embedding API credential must be an environment variable name"
+        )
     if preset not in {"ollama", "custom"}:
         raise ValueError("embedding preset must be ollama or custom")
     if preset == "ollama":
@@ -413,7 +436,7 @@ def apply_embedding_config(
         EMBED_MODEL = model
         EMBED_DIM = int(dimension)
         EMBED_VERSION = version or EMBED_VERSION
-        EMBED_API_KEY_ENV = (api_key_env or "").strip()
+        EMBED_API_KEY_ENV = credential_env
     EMBED_CONFIG_SOURCE = "setup_selection"
     EMBED_CONFIG_NORMALIZED = False
 

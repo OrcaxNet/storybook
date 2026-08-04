@@ -172,6 +172,40 @@ def test_embedding_backfill_failure_resumes_and_switches_atomically(monkeypatch)
     state = store.get_embedding_index_state()
     assert state["active_model"] == "new-model"
     assert state["active_version"] == "v2-test"
+    assert state["active_endpoint"] == config.EMBED_BASE_URL
+    assert state["active_adapter"] == config.EMBED_ADAPTER
+    assert state["active_dimension"] == config.EMBED_DIM
+
+
+def test_endpoint_switch_requires_shadow_and_activates_full_identity(monkeypatch):
+    from storybook import health
+
+    store.add_story("endpoint identity", "content", [], basis(0))
+    active_before = store.get_embedding_index_state()
+    monkeypatch.setattr(config, "EMBED_BASE_URL", "https://endpoint-b.example/v1")
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
+
+    compatibility = health.serving_index_compatibility(config.EMBED_DIM)
+    assert compatibility["ok"] is False
+    assert "endpoint active=" in compatibility["detail"]
+    assert "adapter active=ollama target=openai_compatible" in compatibility["detail"]
+    assert store.get_embedding_index_state()["active_endpoint"] == active_before[
+        "active_endpoint"
+    ]
+
+    monkeypatch.setattr(embeddings, "embed", lambda *args, **kwargs: basis(1))
+    result = embeddings.backfill(
+        model=active_before["active_model"],
+        version=active_before["active_version"],
+        batch_size=10,
+    )
+
+    assert result["activation"]["activated"] == 1
+    active_after = store.get_embedding_index_state()
+    assert active_after["active_endpoint"] == "https://endpoint-b.example/v1"
+    assert active_after["active_adapter"] == "openai_compatible"
+    assert active_after["active_dimension"] == config.EMBED_DIM
+    assert health.serving_index_compatibility(config.EMBED_DIM)["ok"] is True
 
 
 @pytest.mark.parametrize("extra_updates", [1, 3])

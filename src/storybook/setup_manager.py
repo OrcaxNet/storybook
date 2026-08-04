@@ -361,6 +361,12 @@ class SetupManager:
                 raise self._invalid_state("embedding.adapter 无效")
             if type(embedding.get("dimension")) is not int or embedding["dimension"] < 1:
                 raise self._invalid_state("embedding.dimension 必须是正整数")
+            if embedding["api_key_env"] and not config.valid_environment_variable_name(
+                embedding["api_key_env"]
+            ):
+                raise self._invalid_state(
+                    "embedding.api_key_env 必须是环境变量名"
+                )
             forbidden = {"api_key", "token", "credential", "authorization"}
             if forbidden.intersection(embedding):
                 raise self._invalid_state("embedding 不得持久化明文凭据")

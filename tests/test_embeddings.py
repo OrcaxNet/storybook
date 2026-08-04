@@ -66,13 +66,17 @@ def test_default_embed_uses_active_serving_model_during_config_switch(monkeypatc
 
     def fake_post(url, *, json, timeout):
         captured.update(json)
+        captured["url"] = url
         return _Response()
 
     monkeypatch.setattr(embeddings.requests, "post", fake_post)
     monkeypatch.setattr(config, "EMBED_MODEL", "future-target-model")
+    monkeypatch.setattr(config, "EMBED_BASE_URL", "https://endpoint-b.example/v1")
+    monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
 
     assert embeddings.embed("query") == basis(0)
     assert captured["model"] == active_model
+    assert captured["url"] == f"{config.OLLAMA_HOST}/api/embeddings"
 
 
 def test_default_embed_rejects_target_dimension_before_serving_index(monkeypatch):
@@ -112,7 +116,9 @@ def test_openai_compatible_api_uses_no_ollama_endpoint_or_parameters(monkeypatch
     monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "")
     monkeypatch.setattr(embeddings.requests, "post", fake_post)
 
-    assert embeddings.embed("query", keep_alive="7m") == basis(0)
+    assert embeddings.embed(
+        "query", model=config.EMBED_MODEL, keep_alive="7m"
+    ) == basis(0)
     assert captured["url"] == "https://embed.example/v1/embeddings"
     assert captured["json"] == {"model": config.EMBED_MODEL, "input": "query"}
     assert "headers" not in captured
@@ -134,7 +140,7 @@ def test_api_credential_is_read_from_named_environment_variable(monkeypatch):
         lambda url, **kwargs: captured.update(kwargs) or Response(),
     )
 
-    assert embeddings.embed("query") == basis(0)
+    assert embeddings.embed("query", model=config.EMBED_MODEL) == basis(0)
     assert captured["headers"] == {"Authorization": "Bearer never-log-this"}
     assert "never-log-this" not in str(embeddings.api_identity())
 
@@ -178,6 +184,14 @@ def test_probe_classifies_endpoint_and_authentication_failures(monkeypatch):
 
     monkeypatch.setattr(embeddings.requests, "post", lambda *a, **k: Unauthorized())
     assert embeddings.probe()["reason"] == "authentication_failed"
+
+
+def test_successful_ollama_probe_marks_model_warm(monkeypatch):
+    embeddings.mark_model_cold()
+    monkeypatch.setattr(embeddings.requests, "post", lambda *a, **k: _Response())
+
+    assert embeddings.probe()["ok"] is True
+    assert embeddings.model_state() == "warm"
 
 
 def test_embedding_cache_identity_isolated_by_endpoint_adapter_model_and_version(

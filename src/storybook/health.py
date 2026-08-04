@@ -70,6 +70,21 @@ def serving_index_compatibility(actual_dimension: int | None) -> dict:
     mismatches: list[str] = []
     active_model = state.get("active_model")
     active_version = state.get("active_version")
+    active_endpoint = state.get("active_endpoint")
+    active_adapter = state.get("active_adapter")
+    active_dimension = state.get("active_dimension")
+    if state and active_endpoint != config.EMBED_BASE_URL:
+        mismatches.append(
+            f"endpoint active={active_endpoint or 'unknown'} target={config.EMBED_BASE_URL}"
+        )
+    if state and active_adapter != config.EMBED_ADAPTER:
+        mismatches.append(
+            f"adapter active={active_adapter or 'unknown'} target={config.EMBED_ADAPTER}"
+        )
+    if state and active_dimension != serving_dimension:
+        mismatches.append(
+            f"dimension identity={active_dimension or 'unknown'} active={serving_dimension}"
+        )
     if serving_dimension and actual_dimension and serving_dimension != actual_dimension:
         mismatches.append(
             f"dimension active={serving_dimension} api={actual_dimension}"
@@ -86,6 +101,8 @@ def serving_index_compatibility(actual_dimension: int | None) -> dict:
         "serving_dimension": serving_dimension,
         "active_model": active_model,
         "active_version": active_version,
+        "active_endpoint": active_endpoint,
+        "active_adapter": active_adapter,
         "detail": "; ".join(mismatches),
     }
 
@@ -117,9 +134,6 @@ def run_doctor(fix: bool = False) -> bool:
             if not endpoint_ok else ""))
         model_ready = endpoint_ok and _model_pulled(tags, config.EMBED_MODEL)
         probe_result = None
-        results.append(CheckResult(
-            "Ollama warm/cold", True,
-            detail=f"model_state={embeddings.model_state()}"))
     else:
         probe_result = embeddings.probe()
         endpoint_ok = bool(probe_result["ok"]) or probe_result["reason"] == "dimension_mismatch"
@@ -186,6 +200,10 @@ def run_doctor(fix: bool = False) -> bool:
                 "Embedding 维度", False,
                 detail=f"探测失败：{dim_err}",
                 suggestion="检查 embedding endpoint、凭据、模型与响应协议"))
+    if config.EMBED_ADAPTER == "ollama":
+        results.append(CheckResult(
+            "Ollama warm/cold", True,
+            detail=f"model_state={embeddings.model_state()}"))
 
     # [5] Target config must not masquerade as the active serving index.
     compatibility = serving_index_compatibility(actual if model_ready else None)
@@ -194,7 +212,9 @@ def run_doctor(fix: bool = False) -> bool:
             "Serving index 兼容性", True,
             detail=(f"dimension={compatibility['serving_dimension'] or 'uninitialized'}，"
                     f"model={compatibility['active_model'] or 'uninitialized'}，"
-                    f"version={compatibility['active_version'] or 'uninitialized'}")))
+                    f"version={compatibility['active_version'] or 'uninitialized'}，"
+                    f"adapter={compatibility['active_adapter'] or 'uninitialized'}，"
+                    f"endpoint={compatibility['active_endpoint'] or 'uninitialized'}")))
     else:
         results.append(CheckResult(
             "Serving index 兼容性", False,

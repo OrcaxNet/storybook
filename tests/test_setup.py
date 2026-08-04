@@ -837,6 +837,34 @@ def test_setup_cli_selects_and_persists_custom_api(tmp_path):
     assert embedding["config_source"] == "setup_selection"
 
 
+def test_setup_rejects_plaintext_credential_before_any_write(tmp_path):
+    storybook_home = tmp_path / "storybook-home"
+    env = os.environ.copy()
+    env.update({
+        "STORYBOOK_HOME": str(storybook_home),
+        "PYTHONPATH": str(Path(__file__).parents[1] / "src"),
+    })
+    for name in tuple(env):
+        if name.startswith("STORYBOOK_EMBED_") or name == "OLLAMA_HOST":
+            env.pop(name)
+
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "storybook.cli", "setup", "--yes", "--json",
+            "--embedding-preset", "custom",
+            "--embedding-base-url", "https://embed.example/v1",
+            "--embedding-model", "test-embed", "--embedding-dimension", "2",
+            "--embedding-api-key-env", "sk-demo-secret-value",
+        ],
+        cwd=Path(__file__).parents[1], env=env, text=True,
+        capture_output=True, check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "environment variable name" in completed.stderr
+    assert not storybook_home.exists()
+
+
 def test_setup_help_exposes_embedding_provider_selection():
     result = CliRunner().invoke(cli, ["setup", "--help"])
 
