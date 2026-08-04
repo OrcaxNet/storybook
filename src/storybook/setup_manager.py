@@ -46,6 +46,18 @@ class SetupError(RuntimeError):
 def default_launcher() -> Launcher:
     """优先使用安装后的 console script，源码运行时回退到 ``python -m``。"""
 
+    installer_launcher = os.environ.get("STORYBOOK_LAUNCHER", "").strip()
+    if installer_launcher:
+        candidate = os.path.abspath(os.path.expanduser(installer_launcher))
+        if Path(candidate).name in {"book", "storybook"} and os.access(
+            candidate, os.X_OK
+        ):
+            return Launcher(candidate)
+    invoked_as = os.path.abspath(sys.argv[0])
+    if Path(invoked_as).name in {"book", "storybook"} and os.access(
+        invoked_as, os.X_OK
+    ):
+        return Launcher(invoked_as)
     executable = shutil.which("book") or shutil.which("storybook")
     if executable:
         # Persist the stable user-facing shim (for example ~/.local/bin/book),

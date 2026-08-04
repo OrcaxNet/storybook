@@ -11,6 +11,8 @@ RUN_INIT=1
 PYTHON=${STORYBOOK_INSTALL_PYTHON:-python3}
 REPOSITORY=${STORYBOOK_INSTALL_REPOSITORY:-https://github.com/OrcaxNet/storybook}
 TEMP_DIR=
+TARGET_CREATED=0
+TARGET=
 
 usage() {
     cat <<'EOF'
@@ -38,6 +40,9 @@ fail() {
 }
 
 cleanup() {
+    if [ "$TARGET_CREATED" -eq 1 ] && [ -n "$TARGET" ] && [ -d "$TARGET" ]; then
+        rm -rf "$TARGET"
+    fi
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
     fi
@@ -134,7 +139,10 @@ download() {
 }
 
 TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/storybook-install.XXXXXX") || fail SB_INSTALL_TEMP_FAILED "cannot create temporary directory"
-ARCHIVE=$TEMP_DIR/storybook.tar.gz
+case $ARCHIVE_URL in
+    *.whl) ARCHIVE=$TEMP_DIR/storybook-0.0.0-py3-none-any.whl ;;
+    *) ARCHIVE=$TEMP_DIR/storybook.tar.gz ;;
+esac
 CHECKSUM=$TEMP_DIR/storybook.tar.gz.sha256
 download "$ARCHIVE_URL" "$ARCHIVE" || fail SB_INSTALL_DOWNLOAD_FAILED "release download failed; the previous installation is unchanged"
 download "$CHECKSUM_URL" "$CHECKSUM" || fail SB_INSTALL_CHECKSUM_DOWNLOAD_FAILED "checksum download failed; the previous installation is unchanged"
@@ -152,19 +160,26 @@ else
 fi
 [ "$EXPECTED" = "$ACTUAL" ] || fail SB_INSTALL_CHECKSUM_MISMATCH "release checksum mismatch; the previous installation is unchanged"
 
-STAGED=$TEMP_DIR/release
-"$PYTHON" -m venv "$STAGED" || fail SB_INSTALL_VENV_FAILED "could not create the isolated environment"
-[ -x "$STAGED/bin/pip" ] || fail SB_INSTALL_PIP_MISSING "venv did not provide pip; repair the Python installation"
-"$STAGED/bin/pip" install --disable-pip-version-check "$ARCHIVE" >/dev/null || fail SB_INSTALL_PACKAGE_FAILED "package installation failed; the previous installation is unchanged"
-[ -x "$STAGED/bin/book" ] && [ -x "$STAGED/bin/storybook" ] || fail SB_INSTALL_ENTRYPOINT_MISSING "installed package did not provide book and storybook"
-
 mkdir -p "$INSTALL_ROOT/releases" "$BIN_DIR"
-TARGET_NAME=$RELEASE_NAME-$(printf '%s' "$ACTUAL" | cut -c1-16)
+TARGET_NAME=$RELEASE_NAME-$(printf '%s' "$ACTUAL" | cut -c1-16)-venv2
 TARGET=$INSTALL_ROOT/releases/$TARGET_NAME
-if [ -e "$TARGET" ]; then
-    rm -rf "$STAGED"
-elif ! mv "$STAGED" "$TARGET"; then
-    fail SB_INSTALL_SWITCH_FAILED "could not stage the new release; the previous installation is unchanged"
+if [ ! -f "$TARGET/.storybook-ready" ]; then
+    [ ! -e "$TARGET" ] || fail SB_INSTALL_TARGET_INCOMPLETE "release target exists without a ready marker; the previous installation is unchanged"
+    mkdir "$TARGET" || fail SB_INSTALL_TARGET_FAILED "could not reserve the release target; the previous installation is unchanged"
+    TARGET_CREATED=1
+    "$PYTHON" -m venv "$TARGET" || fail SB_INSTALL_VENV_FAILED "could not create the isolated environment"
+    [ -x "$TARGET/bin/pip" ] || fail SB_INSTALL_PIP_MISSING "venv did not provide pip; repair the Python installation"
+    "$TARGET/bin/pip" install --disable-pip-version-check "$ARCHIVE" >/dev/null || fail SB_INSTALL_PACKAGE_FAILED "package installation failed; the previous installation is unchanged"
+    [ -x "$TARGET/bin/book" ] && [ -x "$TARGET/bin/storybook" ] || fail SB_INSTALL_ENTRYPOINT_MISSING "installed package did not provide book and storybook"
+    if ! "$TARGET/bin/book" --help >/dev/null 2>&1 || ! "$TARGET/bin/storybook" --help >/dev/null 2>&1; then
+        fail SB_INSTALL_ENTRYPOINT_BROKEN "installed entrypoints failed before activation; the previous installation is unchanged"
+    fi
+    : >"$TARGET/.storybook-ready"
+    TARGET_CREATED=0
+else
+    if ! "$TARGET/bin/book" --help >/dev/null 2>&1 || ! "$TARGET/bin/storybook" --help >/dev/null 2>&1; then
+        fail SB_INSTALL_ENTRYPOINT_BROKEN "cached release entrypoints are invalid; the previous installation is unchanged"
+    fi
 fi
 
 CURRENT_TMP=$INSTALL_ROOT/.current.$$
@@ -198,7 +213,10 @@ if [ "$RUN_INIT" -eq 1 ]; then
     if [ -t 0 ] && [ -t 1 ]; then
         printf 'Run onboarding now? [Y/n] '
         read -r answer || answer=n
-        case $answer in n|N|no|NO) printf 'Next: book init\n' ;; *) "$BIN_DIR/book" init ;; esac
+        case $answer in
+            n|N|no|NO) printf 'Next: book init\n' ;;
+            *) STORYBOOK_LAUNCHER="$BIN_DIR/book" "$BIN_DIR/book" init ;;
+        esac
     else
         printf 'Next: book init\n'
     fi

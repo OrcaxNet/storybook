@@ -514,6 +514,17 @@ def test_default_launcher_keeps_stable_shim_across_release_switch(tmp_path, monk
     assert launcher.command == str(shim)
     assert Path(launcher.command).resolve() == releases / "v2" / "bin" / "book"
 
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("STORYBOOK_LAUNCHER", str(shim))
+    without_path = default_launcher()
+    assert without_path.command == str(shim)
+    assert Path(without_path.command).resolve() == releases / "v2" / "bin" / "book"
+
+    monkeypatch.delenv("STORYBOOK_LAUNCHER")
+    monkeypatch.setattr(sys, "argv", [str(shim), "init"])
+    absolute_invocation = default_launcher()
+    assert absolute_invocation.command == str(shim)
+
 
 def test_state_write_failure_rolls_back_launcher_upgrade_and_preserves_old_state(
     isolated_setup, monkeypatch

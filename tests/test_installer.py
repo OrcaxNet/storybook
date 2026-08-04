@@ -3,7 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pty
+import select
 import subprocess
+import sys
+import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -102,6 +107,59 @@ def _run(prefix: Path, env: dict[str, str], *args: str) -> subprocess.CompletedP
         capture_output=True,
         check=False,
     )
+
+
+def _write_probe_wheel(path: Path, tag: str, *, both_entrypoints: bool = True) -> None:
+    dist_info = "storybook-0.0.0.dist-info"
+    module = f'''import os
+import pathlib
+import sys
+
+def main():
+    if sys.argv[1:] == ["init"] and os.environ.get("PROBE_FILE"):
+        pathlib.Path(os.environ["PROBE_FILE"]).write_text(
+            os.environ.get("STORYBOOK_LAUNCHER", ""), encoding="utf-8"
+        )
+    print({tag!r})
+'''
+    entrypoints = "[console_scripts]\nbook = storybook_probe:main\n"
+    if both_entrypoints:
+        entrypoints += "storybook = storybook_probe:main\n"
+    files = {
+        "storybook_probe.py": module,
+        f"{dist_info}/METADATA": (
+            "Metadata-Version: 2.1\nName: storybook\nVersion: 0.0.0\n"
+        ),
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: storybook-tests\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n"
+        ),
+        f"{dist_info}/entry_points.txt": entrypoints,
+    }
+    record = "".join(f"{name},,\n" for name in files)
+    record += f"{dist_info}/RECORD,,\n"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as wheel:
+        for name, content in files.items():
+            wheel.writestr(name, content)
+        wheel.writestr(f"{dist_info}/RECORD", record)
+
+
+def _use_real_python_wheel(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
+    _, env = _fake_tools(tmp_path)
+    wheel = tmp_path / "storybook-0.0.0-py3-none-any.whl"
+    _write_probe_wheel(wheel, "v1")
+    checksum = Path(env["FAKE_CHECKSUM"])
+    checksum.write_text(
+        f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}\n",
+        encoding="ascii",
+    )
+    env.update({
+        "FAKE_ARCHIVE": str(wheel),
+        "STORYBOOK_INSTALL_ARCHIVE_URL": f"https://mirror.invalid/{wheel.name}",
+        "STORYBOOK_INSTALL_PYTHON": sys.executable,
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    })
+    return wheel, env, checksum
 
 
 @pytest.mark.parametrize(("system", "architecture"), [("Darwin", "arm64"), ("Linux", "x86_64")])
@@ -203,3 +261,77 @@ def test_package_install_failure_keeps_previous_release_running(tmp_path):
     assert failed.returncode == 1
     assert "SB_INSTALL_PACKAGE_FAILED" in failed.stderr
     assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "known-good"
+
+
+def test_real_venv_entrypoints_survive_clean_install_upgrade_and_bad_release(
+    tmp_path,
+):
+    wheel, env, checksum = _use_real_python_wheel(tmp_path)
+    prefix = tmp_path / "real prefix"
+
+    installed = _run(prefix, env, "--version", "1.2.3")
+
+    assert installed.returncode == 0, installed.stderr
+    for name in ("book", "storybook"):
+        completed = subprocess.run(
+            [prefix / "bin" / name, "--help"], text=True,
+            capture_output=True, check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.strip() == "v1"
+
+    _write_probe_wheel(wheel, "v2")
+    checksum.write_text(
+        f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}\n",
+        encoding="ascii",
+    )
+    upgraded = _run(prefix, env, "--version", "1.2.4")
+    assert upgraded.returncode == 0, upgraded.stderr
+    assert subprocess.check_output(
+        [prefix / "bin" / "book", "--help"], text=True
+    ).strip() == "v2"
+
+    _write_probe_wheel(wheel, "broken", both_entrypoints=False)
+    checksum.write_text(
+        f"{hashlib.sha256(wheel.read_bytes()).hexdigest()}  {wheel.name}\n",
+        encoding="ascii",
+    )
+    failed = _run(prefix, env, "--version", "1.2.5")
+    assert failed.returncode == 1
+    assert "SB_INSTALL_ENTRYPOINT_MISSING" in failed.stderr
+    assert subprocess.check_output(
+        [prefix / "bin" / "book", "--help"], text=True
+    ).strip() == "v2"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="installer onboarding TTY is POSIX-only")
+def test_path_missing_onboarding_exports_stable_launcher_to_book_init(tmp_path):
+    _, env, _ = _use_real_python_wheel(tmp_path)
+    prefix = tmp_path / "prefix"
+    probe = tmp_path / "launcher.txt"
+    env["PROBE_FILE"] = str(probe)
+    assert str(prefix / "bin") not in env["PATH"].split(os.pathsep)
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        ["sh", str(INSTALLER), "--prefix", str(prefix), "--version", "1.2.3"],
+        cwd=ROOT, env=env, stdin=slave, stdout=slave, stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    output = bytearray()
+    deadline = time.monotonic() + 30
+    try:
+        while b"Run onboarding now?" not in output:
+            if time.monotonic() > deadline or process.poll() is not None:
+                pytest.fail(output.decode(errors="replace"))
+            ready, _, _ = select.select([master], [], [], 0.1)
+            if ready:
+                output.extend(os.read(master, 8192))
+        os.write(master, b"\n")
+        assert process.wait(timeout=20) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+        os.close(master)
+
+    assert probe.read_text(encoding="utf-8") == str(prefix / "bin" / "book")
