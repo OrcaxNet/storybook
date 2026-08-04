@@ -55,13 +55,26 @@ def _model_pulled(tags: dict | None, model: str) -> bool:
 def _probe_embed_dim() -> tuple[bool, int, str]:
     """用 EMBED_MODEL 探测实际向量维度。返回 (成功, 维度, 错误信息)。"""
     try:
-        resp = requests.post(
-            f"{config.OLLAMA_HOST}/api/embeddings",
-            json={"model": config.EMBED_MODEL, "prompt": "storybook doctor probe"},
-            timeout=30,
-        )
+        if config.EMBED_PROVIDER == "api":
+            resp = requests.post(
+                f"{config.EMBED_BASE_URL}/v1/embeddings",
+                headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"},
+                json={"model": config.EMBED_MODEL, "input": "storybook doctor probe"},
+                timeout=30,
+            )
+        else:
+            resp = requests.post(
+                f"{config.EMBED_BASE_URL}/api/embeddings",
+                json={"model": config.EMBED_MODEL, "prompt": "storybook doctor probe"},
+                timeout=30,
+            )
         resp.raise_for_status()
-        vec = resp.json().get("embedding") or []
+        payload = resp.json()
+        if config.EMBED_PROVIDER == "api":
+            rows = payload.get("data", [])
+            vec = rows[0].get("embedding", []) if rows else []
+        else:
+            vec = payload.get("embedding") or []
         return True, len(vec), ""
     except Exception as e:
         return False, 0, str(e)
@@ -79,9 +92,17 @@ def run_doctor(fix: bool = False) -> bool:
     """
     results: list[CheckResult] = []
 
-    # [1] Ollama 可达
-    ollama_ok, tags, ollama_err = _check_ollama_reachable()
-    if ollama_ok:
+    # [1] Provider reachability. Legacy installs retain the no-cost generation
+    # check and only probe their local Ollama embedding dependency.
+    ollama_ok, tags, ollama_err = _check_ollama_reachable() if config.EMBED_PROVIDER == "ollama" else (True, {}, "")
+    if config.EMBED_PROVIDER != "ollama":
+        results.append(CheckResult(
+            "模型 Provider", bool(config.EMBED_API_KEY),
+            detail=(f"provider=api，generation={config.LLM_MODEL}，embedding={config.EMBED_MODEL}，"
+                    f"status={'configured' if config.EMBED_API_KEY else 'degraded'}"),
+            suggestion=(f"设置 {config.MODEL_CONFIG.embedding.credential_env}"
+                        if not config.EMBED_API_KEY else "")))
+    elif ollama_ok:
         n = len(tags.get("models", []))
         results.append(CheckResult(
             "Ollama 服务", True,
@@ -92,10 +113,20 @@ def run_doctor(fix: bool = False) -> bool:
             detail=f"{config.OLLAMA_HOST} 不可达：{ollama_err}",
             suggestion="启动 Ollama：`ollama serve`（或设置 OLLAMA_HOST 指向正确地址）"))
 
-    embed_pulled = ollama_ok and _model_pulled(tags, config.EMBED_MODEL)
+    embed_pulled = (
+        bool(config.EMBED_API_KEY)
+        if config.EMBED_PROVIDER == "api"
+        else ollama_ok and _model_pulled(tags, config.EMBED_MODEL)
+    )
 
     # [2] 云端生成式 LLM 只做无费用的配置就绪检查，不发送生成请求，也不依赖 Ollama。
-    if config.LLM_API_KEY:
+    if config.LLM_PROVIDER == "ollama":
+        generation_ready = ollama_ok and _model_pulled(tags, config.LLM_MODEL)
+        results.append(CheckResult(
+            "LLM 配置", generation_ready,
+            detail=f"provider=ollama，model={config.LLM_MODEL}，status={'ready' if generation_ready else 'model_missing'}",
+            suggestion=(f"`ollama pull {config.LLM_MODEL}`" if not generation_ready else "")))
+    elif config.LLM_API_KEY:
         results.append(CheckResult(
             "LLM 配置",
             True,
@@ -110,7 +141,10 @@ def run_doctor(fix: bool = False) -> bool:
                         "也可通过 STORYBOOK_LLM_ENV_FILE 指定配置文件")))
 
     # [3] Embedding 模型已拉取
-    if not ollama_ok:
+    if config.EMBED_PROVIDER == "api" and not config.EMBED_API_KEY:
+        results.append(CheckResult("Embedding 模型", False, skipped=True,
+                                   detail=f"{config.EMBED_MODEL}（credential 缺失，跳过）"))
+    elif not ollama_ok:
         results.append(CheckResult("Embedding 模型", False, skipped=True,
                                    detail=f"{config.EMBED_MODEL}（Ollama 不可达，跳过）"))
     elif embed_pulled:

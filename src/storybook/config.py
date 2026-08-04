@@ -155,6 +155,7 @@ def refresh_profile(profile_ref: str | None = None, *, create: bool = True):
     global ACTIVE_PROFILE, PROFILE_PATHS, PROFILE_ID, PROFILE_MODE, SYNC_STATE
     global DATA_DIR, DB_DIR, DB_PATH, INDEX_DIR, CACHE_DIR, LOG_DIR
     global PERFORMANCE_LOG_PATH
+    global MODEL_CONFIG_PATH
 
     global _PROFILE_PERSISTED
 
@@ -185,6 +186,8 @@ def refresh_profile(profile_ref: str | None = None, *, create: bool = True):
     CACHE_DIR = paths.cache_dir
     LOG_DIR = paths.log_dir
     PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
+    if "model_config_module" in globals():
+        MODEL_CONFIG_PATH = PROFILE_PATHS.root / "model-config.json"
     return profile
 
 
@@ -224,6 +227,8 @@ def switch_profile(profile_ref: str):
 
     profile = PROFILE_REGISTRY.switch_profile(profile_ref)
     refresh_profile(profile.id)
+    if "refresh_model_config" in globals():
+        refresh_model_config()
     return profile
 
 
@@ -246,20 +251,64 @@ except profiles_module.ProfileError:
     PERFORMANCE_LOG_PATH = LOG_DIR / "query_performance.jsonl"
     _PROFILE_PERSISTED = False
 
-# ── Ollama ──
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-LLM_PROVIDER = "deepseek_anthropic"
-_LLM_CONFIG = resolve_llm_config()
-LLM_BASE_URL = str(_LLM_CONFIG["base_url"])
-LLM_API_KEY = _LLM_CONFIG["api_key"]
-LLM_MODEL = str(_LLM_CONFIG["model"])
-EMBED_MODEL = os.getenv("STORYBOOK_EMBED_MODEL", "qwen3-embedding:0.6b")
+# ── Model providers ──
+from . import model_config as model_config_module  # noqa: E402
+
+MODEL_CONFIG_PATH = PROFILE_PATHS.root / "model-config.json"
+
+
+def refresh_model_config(*, environ: dict[str, str] | None = None):
+    """Resolve Profile config first, then the read-only legacy environment."""
+
+    global MODEL_CONFIG_PATH, MODEL_CONFIG
+    global OLLAMA_HOST, LLM_PROVIDER, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
+    global EMBED_PROVIDER, EMBED_BASE_URL, EMBED_API_KEY, EMBED_MODEL
+    env = os.environ if environ is None else environ
+    MODEL_CONFIG_PATH = PROFILE_PATHS.root / "model-config.json"
+    MODEL_CONFIG = model_config_module.resolve(MODEL_CONFIG_PATH, env)
+    if MODEL_CONFIG.source == "legacy_env":
+        legacy_llm = resolve_llm_config(process_env=dict(env))
+        credential_env = (
+            "ANTHROPIC_AUTH_TOKEN"
+            if env.get("ANTHROPIC_AUTH_TOKEN")
+            else "DEEPSEEK_KEY"
+        )
+        MODEL_CONFIG = model_config_module.ModelConfig(
+            MODEL_CONFIG.schema_version,
+            model_config_module.ModelEndpoint(
+                "deepseek_anthropic",
+                model_config_module.safe_url(str(legacy_llm["base_url"])).rstrip("/"),
+                str(legacy_llm["model"]),
+                credential_env,
+            ),
+            MODEL_CONFIG.embedding,
+            source="legacy_env",
+        )
+    generation = MODEL_CONFIG.generation
+    embedding = MODEL_CONFIG.embedding
+    LLM_PROVIDER = generation.provider
+    LLM_BASE_URL = generation.base_url
+    LLM_MODEL = generation.model
+    LLM_API_KEY = env.get(generation.credential_env or "") or None
+    if MODEL_CONFIG.source == "legacy_env":
+        LLM_API_KEY = legacy_llm["api_key"]
+    EMBED_PROVIDER = embedding.provider
+    EMBED_BASE_URL = embedding.base_url
+    EMBED_MODEL = embedding.model
+    EMBED_API_KEY = env.get(embedding.credential_env or "") or None
+    OLLAMA_HOST = embedding.base_url if embedding.provider == "ollama" else os.getenv(
+        "OLLAMA_HOST", model_config_module.DEFAULT_OLLAMA_URL
+    )
+    return MODEL_CONFIG
+
+
+refresh_model_config()
 EMBED_DIM = 1024
 EMBED_VERSION = os.getenv("STORYBOOK_EMBED_VERSION", "story-v2-default-v1")
 EMBED_REPRESENTATION = os.getenv(
     "STORYBOOK_EMBED_REPRESENTATION", "default"
 )
-LLM_THINK = bool(_LLM_CONFIG["think"])
+LLM_THINK = bool(resolve_llm_config()["think"])
 
 # ── 加工缓存与并行 ──
 INFERENCE_CACHE_ENABLED = os.getenv(

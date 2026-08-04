@@ -18,6 +18,21 @@ _STATE_LOCK = threading.Lock()
 _LAST_SUCCESS_AT: float | None = None
 
 
+def serving_index_matches_config(state: dict) -> bool:
+    """Return whether the active index belongs to the configured embedding space."""
+
+    active_provider = state.get("active_provider") or config.EMBED_PROVIDER
+    active_base_url = (
+        state.get("active_base_url") or config.EMBED_BASE_URL
+    ).rstrip("/")
+    active_model = state.get("active_model") or config.EMBED_MODEL
+    return (
+        active_provider == config.EMBED_PROVIDER
+        and active_base_url == config.EMBED_BASE_URL.rstrip("/")
+        and active_model == config.EMBED_MODEL
+    )
+
+
 def embed(
     text: str,
     model: str = None,
@@ -31,11 +46,19 @@ def embed(
     - 维度不匹配 / 零向量时返回 None（上层据此标记 failed 或报错，不再传入坏向量）。
     - 归一化保证 store.search_by_vector 中 ``1 - dist²/2`` 等于 cosine 相似度（精确）。
     """
+    provider = config.EMBED_PROVIDER
+    base_url = config.EMBED_BASE_URL.rstrip("/")
     if model is None:
         try:
             from . import store
             state = store.get_embedding_index_state()
-            model = state.get("active_model") or config.EMBED_MODEL
+            active_model = state.get("active_model") or config.EMBED_MODEL
+            if not serving_index_matches_config(state):
+                logger.error(
+                    "Embedding index configuration mismatch; refusing default embedding",
+                )
+                return None
+            model = active_model
             cache_version = (
                 cache_version or state.get("active_version") or config.EMBED_VERSION
             )
@@ -43,6 +66,8 @@ def embed(
             model = config.EMBED_MODEL
     cache_version = cache_version or config.EMBED_VERSION
     cache_payload = {
+        "provider": provider,
+        "base_url": base_url,
         "model": model,
         "version": cache_version,
         "dimension": config.EMBED_DIM,
@@ -55,14 +80,26 @@ def embed(
     timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
     keep_alive = config.EMBED_KEEP_ALIVE if keep_alive is None else keep_alive
     try:
-        resp = requests.post(
-            f"{config.OLLAMA_HOST}/api/embeddings",
-            json={"model": model, "prompt": text, "keep_alive": keep_alive},
-            timeout=(min(1.0, timeout_seconds), timeout_seconds),
-        )
+        if config.EMBED_PROVIDER == "api":
+            resp = requests.post(
+                f"{config.EMBED_BASE_URL.rstrip('/')}/v1/embeddings",
+                headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"},
+                json={"model": model, "input": text},
+                timeout=(min(1.0, timeout_seconds), timeout_seconds),
+            )
+        else:
+            resp = requests.post(
+                f"{config.EMBED_BASE_URL.rstrip('/')}/api/embeddings",
+                json={"model": model, "prompt": text, "keep_alive": keep_alive},
+                timeout=(min(1.0, timeout_seconds), timeout_seconds),
+            )
         resp.raise_for_status()
         data = resp.json()
-        vec = data.get("embedding")
+        if config.EMBED_PROVIDER == "api":
+            rows = data.get("data") if isinstance(data, dict) else None
+            vec = rows[0].get("embedding") if isinstance(rows, list) and rows else None
+        else:
+            vec = data.get("embedding")
         if not vec or len(vec) != config.EMBED_DIM:
             logger.warning("向量维度不匹配: got %d, expect %d", len(vec or []), config.EMBED_DIM)
             return None
@@ -75,8 +112,13 @@ def embed(
         inference_cache.set("embedding-v1", cache_payload, result)
         mark_model_used()
         return result
-    except Exception as e:
-        logger.error("Embedding 失败: %s", e)
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error(
+            "Embedding failed provider=%s category=%s",
+            config.EMBED_PROVIDER,
+            f"http_{status}" if status else type(exc).__name__,
+        )
         return None
 
 
@@ -134,7 +176,11 @@ def backfill(
     from . import store
     from . import story_v2
 
-    store.begin_embedding_backfill(model, version, representation)
+    store.begin_embedding_backfill(
+        model, version, representation,
+        provider=config.EMBED_PROVIDER,
+        base_url=config.EMBED_BASE_URL,
+    )
     pending = store.stories_pending_embedding_backfill(
         version,
         representation,
@@ -157,6 +203,8 @@ def backfill(
                 representation=representation,
                 content_hash=story["target_content_hash"],
                 embedding=vector,
+                provider=config.EMBED_PROVIDER,
+                base_url=config.EMBED_BASE_URL,
             )
         else:
             failed += 1
@@ -168,6 +216,8 @@ def backfill(
                 content_hash=story["target_content_hash"],
                 embedding=None,
                 error="embedding unavailable or dimension mismatch",
+                provider=config.EMBED_PROVIDER,
+                base_url=config.EMBED_BASE_URL,
             )
 
     progress = store.embedding_backfill_progress(version, representation)
@@ -177,6 +227,8 @@ def backfill(
             model=model,
             version=version,
             representation=representation,
+            provider=config.EMBED_PROVIDER,
+            base_url=config.EMBED_BASE_URL,
         )
     elif progress["pending"] == 0:
         store.mark_embedding_backfill_ready()

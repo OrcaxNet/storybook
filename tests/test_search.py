@@ -231,6 +231,63 @@ class TestFastPathCache:
         assert result["query_vector_cache_hit"] is True
         assert fake_embedder.calls == ["q"]
 
+    @pytest.mark.parametrize(
+        "config_field", ["EMBED_PROVIDER", "EMBED_BASE_URL", "EMBED_MODEL"]
+    )
+    def test_serving_spec_drift_bypasses_result_and_vector_caches(
+        self, fake_embedder, monkeypatch, config_field
+    ):
+        story_id = store.add_story(
+            "cache drift recovery phrase", "lexical fallback", [], basis(0)
+        )
+        fake_embedder.register("cache drift recovery phrase", basis(0))
+        original_value = getattr(config, config_field)
+        original_vector_search = store.search_by_vector
+        drifted_value = {
+            "EMBED_PROVIDER": "api" if original_value != "api" else "ollama",
+            "EMBED_BASE_URL": f"{original_value.rstrip('/')}/different",
+            "EMBED_MODEL": f"{original_value}-different",
+        }[config_field]
+
+        initial = search_module.search("cache drift recovery phrase", top_k=1)
+        assert initial["mode"] == "vector"
+
+        def unexpected_call(*args, **kwargs):
+            raise AssertionError(
+                "serving spec drift must bypass embedding and vector retrieval"
+            )
+
+        monkeypatch.setattr(config, config_field, drifted_value)
+        monkeypatch.setattr(embeddings, "embed", unexpected_call)
+        monkeypatch.setattr(store, "search_by_vector", unexpected_call)
+
+        for top_k in (1, 2):
+            degraded = search_module.search(
+                "cache drift recovery phrase", top_k=top_k
+            )
+            assert degraded["mode"] == "lexical_fallback"
+            assert degraded["degraded_reason"] == "embedding_unavailable"
+            assert degraded["query_vector_cache_hit"] is False
+            assert degraded["top_matches"][0]["story_id"] == story_id
+            assert degraded["top_matches"][0]["retrieval_source"] == "lexical"
+
+        monkeypatch.setattr(config, config_field, original_value)
+        assert search_module.search(
+            "cache drift recovery phrase", top_k=1
+        )["mode"] == "cache"
+
+        vector_calls = []
+
+        def tracked_vector_search(*args, **kwargs):
+            vector_calls.append(1)
+            return original_vector_search(*args, **kwargs)
+
+        monkeypatch.setattr(store, "search_by_vector", tracked_vector_search)
+        restored = search_module.search("cache drift recovery phrase", top_k=3)
+        assert restored["mode"] == "vector"
+        assert restored["query_vector_cache_hit"] is True
+        assert vector_calls == [1]
+
     def test_feedback_writes_do_not_invalidate_retrieval_cache(self, fake_embedder):
         story_id = _seed("A", basis(0))
         fake_embedder.register("q", basis(0))

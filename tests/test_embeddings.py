@@ -52,20 +52,36 @@ def test_prewarm_uses_cold_budget_and_configured_keep_alive(monkeypatch):
     assert captured["keep_alive"] == config.EMBED_KEEP_ALIVE
 
 
-def test_default_embed_uses_active_serving_model_during_config_switch(monkeypatch):
-    """Changing target config must not mix query vectors into the old index."""
+def test_default_embed_rejects_configured_model_drift_before_cache_or_network(
+    monkeypatch,
+):
+    """A configured model change must fail closed until its index is active."""
 
-    from storybook import store
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("model drift must fail before cache or network access")
 
-    active_model = store.get_embedding_index_state()["active_model"]
+    monkeypatch.setattr(embeddings.inference_cache, "get", unexpected_call)
+    monkeypatch.setattr(embeddings.requests, "post", unexpected_call)
+    monkeypatch.setattr(config, "EMBED_MODEL", "future-target-model")
+
+    assert embeddings.embed("query") is None
+
+
+def test_explicit_shadow_model_remains_available_during_config_switch(monkeypatch):
+    """Backfill may explicitly embed with the target model before activation."""
+
     captured = {}
 
     def fake_post(url, *, json, timeout):
         captured.update(json)
         return _Response()
 
+    monkeypatch.setattr(embeddings.inference_cache, "get", lambda *args: None)
+    monkeypatch.setattr(embeddings.inference_cache, "set", lambda *args: None)
     monkeypatch.setattr(embeddings.requests, "post", fake_post)
     monkeypatch.setattr(config, "EMBED_MODEL", "future-target-model")
 
-    assert embeddings.embed("query") == basis(0)
-    assert captured["model"] == active_model
+    assert embeddings.embed(
+        "query", model="future-target-model", cache_version="future-v"
+    ) == basis(0)
+    assert captured["model"] == "future-target-model"
