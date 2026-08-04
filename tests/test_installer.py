@@ -56,6 +56,10 @@ set -eu
 if [ "${1:-}" = - ]; then
   case ${2:-} in https://mirror.invalid/*) exit 0;; *) exit 1;; esac
 fi
+if [ "${1:-}" = -c ] && [ "${3:-}" = storybook-sqlite-extension-check ]; then
+  [ "${FAKE_SQLITE_EXTENSION_MISSING:-0}" = 1 ] && exit 1
+  exit 0
+fi
 if [ "${1:-}" = -c ] && [ "$#" -gt 2 ]; then rm -f "$4"; mv "$3" "$4"; exit 0; fi
 if [ "${1:-}" = -c ]; then echo 3.11; exit 0; fi
 if [ "${1:-}" = -m ] && [ "${2:-}" = venv ] && [ "${3:-}" = --help ]; then
@@ -264,6 +268,23 @@ def test_safe_https_download_url_passes_dry_run(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     assert "https://mirror.invalid/storybook.tar.gz" in completed.stdout
+
+
+def test_missing_sqlite_extension_fails_before_writes_with_macos_repair(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    env["FAKE_SQLITE_EXTENSION_MISSING"] = "1"
+    prefix = tmp_path / "must-not-exist"
+
+    failed = _run(prefix, env)
+
+    assert failed.returncode == 1
+    assert "SB_INSTALL_SQLITE_EXTENSION_UNAVAILABLE" in failed.stderr
+    assert "brew install python@3.11" in failed.stderr
+    assert (
+        "STORYBOOK_INSTALL_PYTHON=/opt/homebrew/opt/python@3.11/bin/python3.11"
+        in failed.stderr
+    )
+    assert not prefix.exists()
 
 
 def test_generated_official_asset_installs_with_real_downloader_and_rolls_back(

@@ -90,6 +90,25 @@ PYTHON_VERSION=$(
     "$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2]); raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null
 ) || fail SB_INSTALL_PYTHON_TOO_OLD "Python 3.11+ is required (found ${PYTHON_VERSION:-unknown})"
 "$PYTHON" -m venv --help >/dev/null 2>&1 || fail SB_INSTALL_VENV_MISSING "Python venv is unavailable; install python3-venv and retry"
+if ! "$PYTHON" -c '
+import sqlite3
+connection = sqlite3.connect(":memory:")
+connection.enable_load_extension(True)
+connection.enable_load_extension(False)
+connection.close()
+' storybook-sqlite-extension-check >/dev/null 2>&1; then
+    case $OS:$ARCH in
+        Darwin:arm64|Darwin:aarch64)
+            fail SB_INSTALL_SQLITE_EXTENSION_UNAVAILABLE 'Python SQLite must support loadable extensions; run: brew install python@3.11; then retry with STORYBOOK_INSTALL_PYTHON=/opt/homebrew/opt/python@3.11/bin/python3.11'
+            ;;
+        Darwin:*)
+            fail SB_INSTALL_SQLITE_EXTENSION_UNAVAILABLE 'Python SQLite must support loadable extensions; run: brew install python@3.11; then retry with STORYBOOK_INSTALL_PYTHON=/usr/local/opt/python@3.11/bin/python3.11'
+            ;;
+        *)
+            fail SB_INSTALL_SQLITE_EXTENSION_UNAVAILABLE 'Python SQLite must support loadable extensions; install a Python build compiled with --enable-loadable-sqlite-extensions and retry'
+            ;;
+    esac
+fi
 
 if command -v curl >/dev/null 2>&1; then
     DOWNLOADER=curl
