@@ -35,6 +35,15 @@ def _git_repository(path, remote):
     )
 
 
+def _set_git_remote(path, remote):
+    subprocess.run(
+        ["git", "-C", str(path), "remote", "set-url", "origin", remote],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_decay_archives_low_value_and_protects_frequent_story():
     low = store.add_story("low", "old low value", [], basis(0))
     high = store.add_story("high", "old frequent value", [], basis(1))
@@ -286,6 +295,101 @@ def test_remote_project_identity_keeps_different_repositories_isolated(tmp_path)
     catalog_import = context.normalize_envelope({"workspace": {"path": str(catalog)}})
 
     assert not context.story_matches_project(payments_context, [catalog_import])
+
+
+def test_different_remotes_at_same_path_have_authoritative_conflict(
+    tmp_path, fake_embedder
+):
+    repository = tmp_path / "reused"
+    _git_repository(repository, "https://github.com/acme/payments.git")
+    payments = context.capture_context(workspace_path=repository)
+    payments_session = store.add_session("codex", "payments", context=payments)
+    legacy_path = context.workspace_path_hash(repository)
+    legacy = context.normalize_envelope({
+        "workspace": {
+            "id": str(uuid.uuid5(uuid.UUID(config.PROFILE_ID), legacy_path)),
+            "repo_fingerprint": legacy_path,
+        }
+    })
+    legacy_session = store.add_session("codex", "legacy", context=legacy)
+    payments_story = store.add_story(
+        "needle payments", "old repository memory", ["needle"], basis(0),
+        source_session_ids=[payments_session, legacy_session],
+    )
+    _set_git_remote(repository, "https://github.com/acme/catalog.git")
+    catalog = context.capture_context(workspace_path=repository)
+    fake_embedder.register("needle", basis(0))
+
+    assert context.project_identity(payments) != context.project_identity(catalog)
+    assert not context.story_matches_project(catalog, [payments, legacy])
+    result = search.search(
+        "needle", top_k=1, context=catalog, scope="project", graph_enabled=False
+    )
+    assert payments_story not in [item["story_id"] for item in result["top_matches"]]
+
+
+def test_different_remotes_at_same_path_are_excluded_from_lexical_fallback(
+    tmp_path, fake_embedder
+):
+    repository = tmp_path / "reused"
+    _git_repository(repository, "https://github.com/acme/payments.git")
+    payments = context.capture_context(workspace_path=repository)
+    payments_session = store.add_session("codex", "payments", context=payments)
+    store.add_story(
+        "needle payments", "old repository memory", ["needle"], basis(0),
+        source_session_ids=[payments_session],
+    )
+    _set_git_remote(repository, "https://github.com/acme/catalog.git")
+    catalog = context.capture_context(workspace_path=repository)
+    fake_embedder.register("needle", None)
+
+    result = search.search(
+        "needle", top_k=1, context=catalog, scope="project", graph_enabled=False
+    )
+
+    assert result["mode"] == "lexical_fallback"
+    assert result["top_matches"] == []
+
+
+def test_graph_expansion_respects_remote_conflict_at_same_path(
+    tmp_path, fake_embedder
+):
+    repository = tmp_path / "reused"
+    _git_repository(repository, "https://github.com/acme/payments.git")
+    payments = context.capture_context(workspace_path=repository)
+    payments_session = store.add_session("codex", "payments", context=payments)
+    payments_story = store.add_story(
+        "payments", "cross-project graph memory", [], basis(5),
+        source_session_ids=[payments_session],
+    )
+    _set_git_remote(repository, "https://github.com/acme/catalog.git")
+    catalog = context.capture_context(workspace_path=repository)
+    catalog_session = store.add_session("codex", "catalog", context=catalog)
+    catalog_story = store.add_story(
+        "catalog", "needle current project", ["needle"], basis(0),
+        source_session_ids=[catalog_session],
+    )
+    store.add_or_update_edge(catalog_story, payments_story, 1.0, "causal")
+    fake_embedder.register("needle", basis(0))
+
+    result = search.search(
+        "needle", top_k=3, context=catalog, scope="project", graph_enabled=True
+    )
+
+    assert [item["story_id"] for item in result["top_matches"]] == [catalog_story]
+
+
+def test_same_remote_matches_across_different_clones(tmp_path):
+    first = tmp_path / "first" / "payments"
+    second = tmp_path / "second" / "payments"
+    remote = "https://github.com/acme/payments.git"
+    _git_repository(first, remote)
+    _git_repository(second, remote)
+
+    first_context = context.capture_context(workspace_path=first)
+    second_context = context.capture_context(workspace_path=second)
+
+    assert context.story_matches_project(second_context, [first_context])
 
 
 def test_llm_and_embedding_cache_skip_duplicate_provider_calls(monkeypatch):

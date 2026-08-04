@@ -906,15 +906,58 @@ def project_identity_values(envelope: dict | None) -> frozenset[str]:
     )
 
 
+def project_selector(
+    envelope: dict | None,
+) -> tuple[str | None, frozenset[str]]:
+    """Return strong remote identity plus all privacy-safe compatibility IDs."""
+
+    identity = project_identity(envelope)
+    strong_remote = (
+        identity[1]
+        if identity and identity[0] == "repo" and identity[1].startswith("sha256:")
+        else None
+    )
+    return strong_remote, project_identity_values(envelope)
+
+
+def project_selectors_match(
+    current: tuple[str | None, frozenset[str]],
+    candidate: tuple[str | None, frozenset[str]],
+) -> bool:
+    """Match projects while making explicit remote conflicts authoritative."""
+
+    current_remote, current_values = current
+    candidate_remote, candidate_values = candidate
+    if current_remote and candidate_remote:
+        return current_remote == candidate_remote
+    return bool(current_values.intersection(candidate_values))
+
+
 def story_matches_project(
     current_context: dict | None, environments: list[dict] | None
 ) -> bool:
     """Require at least one Story environment to match the current project."""
 
-    current = project_identity_values(current_context)
-    if not current:
+    current = project_selector(current_context)
+    if not current[1]:
         return False
-    return environment_matches_project_identities(current, environments)
+    return environment_matches_project_selector(current, environments)
+
+
+def environment_matches_project_selector(
+    selector: tuple[str | None, frozenset[str]] | None,
+    environments: list[dict] | None,
+) -> bool:
+    if selector is None or not selector[1]:
+        return False
+    candidates = [project_selector(item) for item in (environments or [])]
+    current_remote = selector[0]
+    candidate_remotes = {
+        remote for remote, _values in candidates if remote is not None
+    }
+    if current_remote and candidate_remotes:
+        return current_remote in candidate_remotes
+    return any(project_selectors_match(selector, item) for item in candidates)
 
 
 def environment_matches_project_identities(

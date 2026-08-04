@@ -52,8 +52,8 @@ def search(
     )
     if scope == "project" and context_module.project_identity(current_context) is None:
         raise ValueError("project scope 需要可识别的当前项目 context")
-    project_scope_identities = (
-        context_module.project_identity_values(current_context)
+    project_scope_selector = (
+        context_module.project_selector(current_context)
         if scope == "project" else None
     )
     normalized_query = adaptive.normalize_query(query)
@@ -192,11 +192,11 @@ def search(
     # ── Step 2: 向量检索 ──
     vector_started = performance.now()
     try:
-        if project_scope_identities is not None:
+        if project_scope_selector is not None:
             matches = store.search_by_vector_numpy(
                 query_vec,
                 top_k=max(top_k * 4, top_k),
-                project_identities=project_scope_identities,
+                project_selector=project_scope_selector,
             )
         else:
             matches = store.search_by_vector(
@@ -233,7 +233,7 @@ def search(
             normalized_query,
             top_k=candidate_limit,
             timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
-            project_identities=project_scope_identities,
+            project_selector=project_scope_selector,
         ),
         config.QUERY_FALLBACK_TIMEOUT_SECONDS,
     )
@@ -303,7 +303,7 @@ def search(
                 retrieval_mode=retrieval_mode,
                 identity=identity,
                 candidate_limit=candidate_limit,
-                project_identities=project_scope_identities,
+                project_selector=project_scope_selector,
             ),
             second_stage_timeout,
         )
@@ -462,7 +462,7 @@ def _run_second_stage(
     retrieval_mode: str,
     identity: str,
     candidate_limit: int,
-    project_identities: frozenset[str] | None,
+    project_selector: tuple[str | None, frozenset[str]] | None,
 ) -> dict:
     """Generate and retrieve transformed queries inside the caller deadline."""
 
@@ -541,9 +541,9 @@ def _run_second_stage(
                     store.search_by_vector_numpy(
                         vector,
                         top_k=candidate_limit,
-                        project_identities=project_identities,
+                        project_selector=project_selector,
                     )
-                    if project_identities is not None
+                    if project_selector is not None
                     else store.search_by_vector(vector, top_k=candidate_limit)
                 )
                 vector_matches = [
@@ -558,7 +558,7 @@ def _run_second_stage(
                 value,
                 top_k=candidate_limit,
                 timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
-                project_identities=project_identities,
+                project_selector=project_selector,
             ),
             config.QUERY_FALLBACK_TIMEOUT_SECONDS,
         )
@@ -721,8 +721,8 @@ def _run_lexical_fallback(
         normalized_query,
         top_k=max(top_k * 4, top_k, min(64, config.RERANK_TOP_N)),
         timeout_seconds=config.QUERY_FALLBACK_TIMEOUT_SECONDS,
-        project_identities=(
-            context_module.project_identity_values(current_context)
+        project_selector=(
+            context_module.project_selector(current_context)
             if scope == "project" else None
         ),
     )

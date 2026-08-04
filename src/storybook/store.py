@@ -3412,30 +3412,66 @@ def search_by_vector(query_embedding: list[float], top_k: int = 5) -> list[dict]
         db.close()
 
 
+def _project_filter_sql(
+    story_alias: str,
+    selector: tuple[str | None, frozenset[str]],
+) -> tuple[str, list[object]]:
+    """Build the project predicate with Story-level strong-remote precedence."""
+
+    strong_remote, identity_values = selector
+    values = tuple(sorted(identity_values))
+    placeholders = ", ".join("?" for _ in values)
+    clause = """AND (
+        (
+            ? IS NOT NULL
+            AND EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) strong_env
+                WHERE json_extract(strong_env.value, '$.workspace.repo_fingerprint') LIKE 'sha256:%'
+            )
+            AND EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) matching_env
+                WHERE json_extract(matching_env.value, '$.workspace.repo_fingerprint') = ?
+            )
+        ) OR (
+            (? IS NULL OR NOT EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) strong_env
+                WHERE json_extract(strong_env.value, '$.workspace.repo_fingerprint') LIKE 'sha256:%'
+            ))
+            AND EXISTS (
+                SELECT 1 FROM json_each({story_alias}.environment_summary_json) env
+                WHERE json_extract(env.value, '$.workspace.repo_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.path_fingerprint') IN ({values})
+                   OR json_extract(env.value, '$.workspace.id') IN ({values})
+            )
+        )
+    )""".format(story_alias=story_alias, values=placeholders)
+    return clause, [
+        strong_remote, strong_remote, strong_remote,
+        *values, *values, *values,
+    ]
+
+
 def search_by_vector_numpy(
     query_embedding: list[float],
     top_k: int = 5,
     *,
     project_identities: frozenset[str] | set[str] | tuple[str, ...] | None = None,
     project_identity: tuple[str, str] | None = None,
+    project_selector: tuple[str | None, frozenset[str]] | None = None,
 ) -> list[dict]:
     """Exact numpy search, optionally constrained before ranking to one project."""
     if project_identities is None and project_identity is not None:
         project_identities = frozenset((project_identity[1],))
+    if project_selector is None and project_identities is not None:
+        project_selector = None, frozenset(project_identities)
     db = get_db()
     try:
         project_clause = ""
         project_params: list[object] = []
-        if project_identities:
-            values = tuple(sorted(project_identities))
-            placeholders = ", ".join("?" for _ in values)
-            project_clause = """AND EXISTS (
-                SELECT 1 FROM json_each(stories.environment_summary_json) env
-                WHERE json_extract(env.value, '$.workspace.repo_fingerprint') IN ({values})
-                   OR json_extract(env.value, '$.workspace.path_fingerprint') IN ({values})
-                   OR json_extract(env.value, '$.workspace.id') IN ({values})
-            )""".format(values=placeholders)
-            project_params = [*values, *values, *values]
+        if project_selector and project_selector[1]:
+            project_clause, project_params = _project_filter_sql(
+                "stories", project_selector
+            )
         rows = db.execute(
             f"""SELECT id, title, abstract, content, keywords, embedding,
                       applicability_json, environment_summary_json
@@ -3458,8 +3494,8 @@ def search_by_vector_numpy(
             environments = context_module.merge_environments(
                 r["environment_summary_json"], []
             )
-            if project_identities and not context_module.environment_matches_project_identities(
-                project_identities, environments
+            if project_selector and not context_module.environment_matches_project_selector(
+                project_selector, environments
             ):
                 continue
             vec = np.frombuffer(r["embedding"], dtype=np.float32)
@@ -3494,6 +3530,7 @@ def search_by_lexical(
     timeout_seconds: float = 0.5,
     project_identities: frozenset[str] | set[str] | tuple[str, ...] | None = None,
     project_identity: tuple[str, str] | None = None,
+    project_selector: tuple[str | None, frozenset[str]] | None = None,
 ) -> list[dict]:
     """FTS5 + 参数化关键词子串的低时延降级检索。
 
@@ -3504,6 +3541,8 @@ def search_by_lexical(
 
     if project_identities is None and project_identity is not None:
         project_identities = frozenset((project_identity[1],))
+    if project_selector is None and project_identities is not None:
+        project_selector = None, frozenset(project_identities)
     terms = _lexical_terms(query)
     if not terms or top_k <= 0:
         return []
@@ -3519,16 +3558,10 @@ def search_by_lexical(
         candidates: dict[int, sqlite3.Row] = {}
         project_clause = ""
         project_params: list[object] = []
-        if project_identities:
-            values = tuple(sorted(project_identities))
-            placeholders = ", ".join("?" for _ in values)
-            project_clause = """AND EXISTS (
-                SELECT 1 FROM json_each(s.environment_summary_json) env
-                WHERE json_extract(env.value, '$.workspace.repo_fingerprint') IN ({values})
-                   OR json_extract(env.value, '$.workspace.path_fingerprint') IN ({values})
-                   OR json_extract(env.value, '$.workspace.id') IN ({values})
-            )""".format(values=placeholders)
-            project_params = [*values, *values, *values]
+        if project_selector and project_selector[1]:
+            project_clause, project_params = _project_filter_sql(
+                "s", project_selector
+            )
         fts_query = " OR ".join(f'"{term}"' for term in terms)
         try:
             rows = db.execute(
