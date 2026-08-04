@@ -14,7 +14,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import requests
 
-from . import config, embeddings, health, search, store
+from . import config, embeddings, health, model_config, search, store
 from .profiles import PlatformRoots, ProfileError
 from .setup_adapters import (
     AdapterContext,
@@ -459,9 +459,19 @@ class SetupManager:
         return errors
 
     def _ensure_models(
-        self, *, download: bool, progress: Progress | None
+        self, *, download: bool, progress: Progress | None,
+        provider_config: model_config.ModelConfig | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        required = (config.EMBED_MODEL,)
+        if provider_config is not None and provider_config.embedding.provider == "api":
+            return ([
+                {"name": provider_config.generation.model, "status": "remote"},
+                {"name": provider_config.embedding.model, "status": "remote"},
+            ], [])
+        required = tuple(dict.fromkeys(
+            (provider_config.generation.model, provider_config.embedding.model)
+            if provider_config is not None
+            else (config.EMBED_MODEL,)
+        ))
         try:
             installed = _ollama_tags()
         except Exception as exc:  # noqa: BLE001 -- 网络/daemon 统一降级
@@ -501,6 +511,84 @@ class SetupManager:
                 )
                 degraded.append(f"model download failed ({name}): {exc}")
         return results, degraded
+
+    def _probe_provider(self, value: model_config.ModelConfig) -> list[dict[str, Any]]:
+        """Verify generation and embedding using the declared wire protocol."""
+
+        generation = value.generation
+        embedding = value.embedding
+        secret = self.environ.get(generation.credential_env or "")
+        if generation.provider == "api" and not secret:
+            raise SetupError(
+                "SB_MODEL_CREDENTIALS_MISSING",
+                f"环境变量 {generation.credential_env} 未设置",
+                hint="设置该环境变量后重试；密钥不会写入配置",
+            )
+
+        headers = {"Authorization": f"Bearer {secret}"} if secret else {}
+
+        def request(kind: str, url: str, payload: dict) -> dict:
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=8)
+                response.raise_for_status()
+                body = response.json()
+                if not isinstance(body, dict):
+                    raise ValueError("response must be object")
+                return body
+            except requests.exceptions.Timeout as exc:
+                raise SetupError("SB_MODEL_TIMEOUT", f"{kind} provider 请求超时") from exc
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                code = "SB_MODEL_AUTH_FAILED" if status in {401, 403} else f"SB_MODEL_{kind.upper()}_FAILED"
+                raise SetupError(code, f"{kind} provider 返回 HTTP {status}") from exc
+            except requests.exceptions.RequestException as exc:
+                raise SetupError("SB_MODEL_NETWORK_FAILED", f"{kind} provider 不可达") from exc
+            except (ValueError, TypeError) as exc:
+                raise SetupError(f"SB_MODEL_{kind.upper()}_FAILED", f"{kind} provider 响应无效") from exc
+
+        if generation.provider == "api":
+            gen = request(
+                "generation", f"{generation.base_url}/v1/chat/completions",
+                {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 4},
+            )
+            choices = gen.get("choices")
+            message = choices[0].get("message") if isinstance(choices, list) and choices else None
+            if (
+                not isinstance(message, dict)
+                or not isinstance(message.get("content"), str)
+                or not message["content"].strip()
+            ):
+                raise SetupError("SB_MODEL_GENERATION_FAILED", "generation provider 未返回 choices")
+            embedded = request(
+                "embedding", f"{embedding.base_url}/v1/embeddings",
+                {"model": embedding.model, "input": "storybook setup probe"},
+            )
+            rows = embedded.get("data")
+            vector = rows[0].get("embedding") if isinstance(rows, list) and rows else None
+        else:
+            gen = request(
+                "generation", f"{generation.base_url}/api/chat",
+                {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "stream": False},
+            )
+            if not isinstance(gen.get("message"), dict):
+                raise SetupError("SB_MODEL_GENERATION_FAILED", "Ollama generation 响应无效")
+            embedded = request(
+                "embedding", f"{embedding.base_url}/api/embeddings",
+                {"model": embedding.model, "prompt": "storybook setup probe"},
+            )
+            vector = embedded.get("embedding")
+        if not isinstance(vector, list):
+            raise SetupError("SB_MODEL_EMBEDDING_FAILED", "embedding provider 未返回向量")
+        if len(vector) != config.EMBED_DIM:
+            raise SetupError(
+                "SB_MODEL_EMBED_DIM_MISMATCH",
+                f"embedding 维度为 {len(vector)}，索引要求 {config.EMBED_DIM}",
+                hint="选择兼容模型或重建明确维度的索引；禁止静默混用",
+            )
+        return [
+            {"name": "generation", "ok": True, "detail": f"provider={generation.provider}; model={generation.model}"},
+            {"name": "embedding-provider", "ok": True, "detail": f"provider={embedding.provider}; model={embedding.model}; dimension={len(vector)}"},
+        ]
 
     @staticmethod
     def _schema_smoke() -> tuple[bool, str]:
@@ -605,6 +693,7 @@ class SetupManager:
         requested_agents: Iterable[str] | None = None,
         download_models: bool = True,
         progress: Progress | None = None,
+        provider_config: model_config.ModelConfig | None = None,
     ) -> dict[str, Any]:
         plan = self.plan(requested_agents)
         selected = {
@@ -612,8 +701,16 @@ class SetupManager:
         }
         # 受管 state 决定升级与卸载恢复行为，必须在任何 Profile/DB 写入前校验。
         existing_state = self._load_state() or {}
+        if provider_config is not None and provider_config.generation.provider == "api":
+            # Validate remote credentials and both capabilities before any write.
+            provider_smoke = self._probe_provider(provider_config)
+        else:
+            provider_smoke = []
         try:
             config.refresh_profile(create=True)
+            if provider_config is not None:
+                model_config.save(config.MODEL_CONFIG_PATH, provider_config)
+                config.refresh_model_config(environ=dict(self.environ))
             store.init_db()
         except Exception as exc:  # noqa: BLE001
             raise SetupError(
@@ -688,9 +785,12 @@ class SetupManager:
             raise SetupError(code, str(exc), hint="配置与旧 setup state 已回滚；修复后重试") from exc
 
         models, degraded = self._ensure_models(
-            download=download_models, progress=progress
+            download=download_models, progress=progress, provider_config=provider_config
         )
+        if provider_config is not None and provider_config.generation.provider == "ollama" and not degraded:
+            provider_smoke = self._probe_provider(provider_config)
         smoke = self._smoke_tests(selected)
+        smoke = provider_smoke + smoke
         failed_smoke = [test["name"] for test in smoke if not test["ok"]]
         degraded.extend(f"smoke failed: {name}" for name in failed_smoke)
         status = "ready" if not degraded else "degraded"
@@ -705,6 +805,7 @@ class SetupManager:
             "adapters": adapter_results,
             "history_ingestion": self._history_ingestion_status(selected),
             "models": models,
+            "model_config": config.MODEL_CONFIG.public_dict(self.environ),
             "smoke_tests": smoke,
             "legacy_databases": list(plan.legacy_databases),
             "degraded_reasons": degraded,
@@ -740,7 +841,7 @@ class SetupManager:
             }
             sync_state = profile.sync_state
 
-        llm_ready = bool(config.LLM_API_KEY)
+        llm_ready = config.LLM_PROVIDER == "ollama" or bool(config.LLM_API_KEY)
         llm_payload = {
             "provider": config.LLM_PROVIDER,
             "name": config.LLM_MODEL,
@@ -749,10 +850,27 @@ class SetupManager:
         if not llm_ready:
             degraded_reasons.append("llm_credentials_missing")
 
-        ollama_ok, tags, _ = health._check_ollama_reachable()
-        if not ollama_ok:
+        if config.EMBED_PROVIDER == "api":
+            embedding_ready = bool(config.EMBED_API_KEY)
             model_payload = {
-                "provider": "hybrid",
+                "provider": "api",
+                "status": "ready" if llm_ready and embedding_ready else "degraded",
+                "llm": llm_payload,
+                "embedding": {
+                    "provider": "api", "name": config.EMBED_MODEL,
+                    "status": "ready" if embedding_ready else "credentials_missing",
+                },
+            }
+            if not embedding_ready:
+                degraded_reasons.append("embedding_credentials_missing")
+            ollama_ok, tags = True, {}
+        else:
+            ollama_ok, tags, _ = health._check_ollama_reachable()
+        if config.EMBED_PROVIDER == "api":
+            pass
+        elif not ollama_ok:
+            model_payload = {
+                "provider": "ollama" if config.LLM_PROVIDER == "ollama" else "hybrid",
                 "status": "degraded",
                 "llm": llm_payload,
                 "embedding": {
@@ -764,9 +882,15 @@ class SetupManager:
             degraded_reasons.append("ollama_unavailable")
         else:
             embedding_ready = health._model_pulled(tags, config.EMBED_MODEL)
+            generation_ready = (
+                health._model_pulled(tags, config.LLM_MODEL)
+                if config.LLM_PROVIDER == "ollama" else llm_ready
+            )
+            if config.LLM_PROVIDER == "ollama":
+                llm_payload["status"] = "ready" if generation_ready else "missing"
             model_payload = {
-                "provider": "hybrid",
-                "status": "ready" if llm_ready and embedding_ready else "degraded",
+                "provider": "ollama" if config.LLM_PROVIDER == "ollama" else "hybrid",
+                "status": "ready" if generation_ready and embedding_ready else "degraded",
                 "llm": llm_payload,
                 "embedding": {
                     "provider": "ollama",
@@ -776,6 +900,8 @@ class SetupManager:
             }
             if not embedding_ready:
                 degraded_reasons.append("model_missing:embedding")
+            if config.LLM_PROVIDER == "ollama" and not generation_ready:
+                degraded_reasons.append("model_missing:generation")
 
         try:
             state = self._load_state()

@@ -55,14 +55,26 @@ def embed(
     timeout_seconds = 30.0 if timeout_seconds is None else max(0.001, timeout_seconds)
     keep_alive = config.EMBED_KEEP_ALIVE if keep_alive is None else keep_alive
     try:
-        resp = requests.post(
-            f"{config.OLLAMA_HOST}/api/embeddings",
-            json={"model": model, "prompt": text, "keep_alive": keep_alive},
-            timeout=(min(1.0, timeout_seconds), timeout_seconds),
-        )
+        if config.EMBED_PROVIDER == "api":
+            resp = requests.post(
+                f"{config.EMBED_BASE_URL.rstrip('/')}/v1/embeddings",
+                headers={"Authorization": f"Bearer {config.EMBED_API_KEY}"},
+                json={"model": model, "input": text},
+                timeout=(min(1.0, timeout_seconds), timeout_seconds),
+            )
+        else:
+            resp = requests.post(
+                f"{config.EMBED_BASE_URL.rstrip('/')}/api/embeddings",
+                json={"model": model, "prompt": text, "keep_alive": keep_alive},
+                timeout=(min(1.0, timeout_seconds), timeout_seconds),
+            )
         resp.raise_for_status()
         data = resp.json()
-        vec = data.get("embedding")
+        if config.EMBED_PROVIDER == "api":
+            rows = data.get("data") if isinstance(data, dict) else None
+            vec = rows[0].get("embedding") if isinstance(rows, list) and rows else None
+        else:
+            vec = data.get("embedding")
         if not vec or len(vec) != config.EMBED_DIM:
             logger.warning("向量维度不匹配: got %d, expect %d", len(vec or []), config.EMBED_DIM)
             return None
@@ -75,8 +87,13 @@ def embed(
         inference_cache.set("embedding-v1", cache_payload, result)
         mark_model_used()
         return result
-    except Exception as e:
-        logger.error("Embedding 失败: %s", e)
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        logger.error(
+            "Embedding failed provider=%s category=%s",
+            config.EMBED_PROVIDER,
+            f"http_{status}" if status else type(exc).__name__,
+        )
         return None
 
 

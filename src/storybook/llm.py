@@ -46,7 +46,7 @@ def _chat(
     if isinstance(cached, (str, dict)):
         return cached
 
-    if not config.LLM_API_KEY:
+    if config.LLM_PROVIDER != "ollama" and not config.LLM_API_KEY:
         logger.error(
             "LLM request failed provider=%s category=credentials_missing",
             config.LLM_PROVIDER,
@@ -54,39 +54,80 @@ def _chat(
         return None
 
     max_tokens = 4096 if num_predict is None else max(32, int(num_predict))
-    payload = {
-        "model": config.LLM_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-        "thinking": {"type": "enabled" if config.LLM_THINK else "disabled"},
-    }
+    messages = []
     if system:
-        payload["system"] = system
-    if response_schema is not None:
-        payload["tools"] = [{
-            "name": "submit_structured_output",
-            "description": "Return the requested structured result.",
-            "input_schema": response_schema,
-        }]
-        payload["tool_choice"] = {
-            "type": "tool",
-            "name": "submit_structured_output",
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    if config.LLM_PROVIDER == "ollama":
+        payload = {
+            "model": config.LLM_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.3, "num_predict": max_tokens},
+        }
+        if response_schema is not None:
+            payload["format"] = response_schema
+        url = f"{config.LLM_BASE_URL.rstrip('/')}/api/chat"
+        headers = {}
+    elif config.LLM_PROVIDER == "api":
+        payload = {
+            "model": config.LLM_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+        }
+        if response_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "storybook_output", "schema": response_schema},
+            }
+        url = f"{config.LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
+    else:
+        payload = {
+            "model": config.LLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+            "thinking": {"type": "enabled" if config.LLM_THINK else "disabled"},
+        }
+        if system:
+            payload["system"] = system
+        if response_schema is not None:
+            payload["tools"] = [{
+                "name": "submit_structured_output",
+                "description": "Return the requested structured result.",
+                "input_schema": response_schema,
+            }]
+            payload["tool_choice"] = {
+                "type": "tool", "name": "submit_structured_output",
+            }
+        url = f"{config.LLM_BASE_URL.rstrip('/')}/v1/messages"
+        headers = {
+            "x-api-key": config.LLM_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
         }
 
     try:
-        resp = requests.post(
-            f"{config.LLM_BASE_URL.rstrip('/')}/v1/messages",
-            headers={
-                "x-api-key": config.LLM_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-            timeout=max(0.1, float(timeout_seconds)),
-        )
+        resp = requests.post(url, headers=headers, json=payload,
+                             timeout=max(0.1, float(timeout_seconds)))
         resp.raise_for_status()
         data = resp.json()
+        if config.LLM_PROVIDER in {"ollama", "api"}:
+            if config.LLM_PROVIDER == "ollama":
+                message = data.get("message", {}) if isinstance(data, dict) else {}
+            else:
+                choices = data.get("choices", []) if isinstance(data, dict) else []
+                message = choices[0].get("message", {}) if choices else {}
+            text = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("empty content")
+            result = _decode_json_object(text) if response_schema is not None else text.strip()
+            if response_schema is not None and not _matches_schema(result, response_schema):
+                raise ValueError("invalid structured output")
+            inference_cache.set("llm-v1", cache_payload, result)
+            return result
         blocks = data.get("content") if isinstance(data, dict) else None
         if not isinstance(blocks, list):
             raise ValueError("invalid content")

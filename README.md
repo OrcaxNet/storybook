@@ -80,6 +80,31 @@ storybook embedding-backfill --model qwen3-embedding:0.6b \
 - **Python 3.11+**（推荐用 [uv](https://github.com/astral-sh/uv) 建 venv）
 - **DeepSeek API 凭据**：优先 `ANTHROPIC_AUTH_TOKEN`，兼容 `DEEPSEEK_KEY`；默认读取 `~/.chrc/dpsk.sh`
 - **Ollama** 运行于 `http://localhost:11434`（可用 `OLLAMA_HOST` 覆盖），仅需拉取 embedding 模型 `qwen3-embedding:0.6b`，**1024 维**（可用 `STORYBOOK_EMBED_MODEL` 覆盖）；需与 `config.EMBED_DIM` 一致
+
+### 模型 Provider setup
+
+`book` 与 `storybook` 是等价命令。新安装会在 active Profile 内写入版本化的
+`model-config.json`，generation 与 embedding 可分别诊断；文件只保存 credential
+环境变量名，绝不保存密钥。
+
+```bash
+# 本地 Ollama：探测服务，按需拉取 generation/embedding 模型
+book setup --provider ollama --llm-model qwen3:8b \
+  --embedding-model qwen3-embedding:0.6b
+
+# OpenAI-compatible API：明确使用 /v1/chat/completions 与 /v1/embeddings
+export STORYBOOK_API_KEY='...'
+book setup --provider api --base-url https://gateway.example/v1-root \
+  --llm-model chat-model --embedding-model embedding-model \
+  --api-key-env STORYBOOK_API_KEY
+```
+
+外部 embedding 必须返回 1024 维，否则 setup 以
+`SB_MODEL_EMBED_DIM_MISMATCH` 失败。base URL 中的 userinfo、query 和 fragment
+会被拒绝，doctor/status/JSON 输出不会包含 credential 值或 Authorization header。
+未生成 Profile 配置的旧安装继续按“Profile 配置 > 旧环境变量 > 默认值”的优先级
+只读解析 `ANTHROPIC_*`、`DEEPSEEK_KEY`、`OLLAMA_HOST` 与
+`STORYBOOK_EMBED_MODEL`，无需迁移现有数据。
 - 依赖：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
 
 ```bash
