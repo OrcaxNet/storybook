@@ -61,12 +61,26 @@ if [ "${1:-}" = -c ] && [ "${3:-}" = storybook-sqlite-extension-check ]; then
   exit 0
 fi
 if [ "${1:-}" = -c ] && [ "$#" -gt 2 ]; then rm -f "$4"; mv "$3" "$4"; exit 0; fi
-if [ "${1:-}" = -c ]; then echo 3.11; exit 0; fi
+if [ "${1:-}" = -c ]; then
+  case ${2:-} in *sys.executable*)
+    printf '%s\n' "${FAKE_PYTHON_EXECUTABLE:-/usr/local/bin/python3}"
+    exit 0
+    ;;
+  esac
+fi
+if [ "${1:-}" = -c ]; then
+  printf '%s\n' "${FAKE_PYTHON_VERSION:-3.11}"
+  exit 0
+fi
 if [ "${1:-}" = -m ] && [ "${2:-}" = venv ] && [ "${3:-}" = --help ]; then
   [ "${FAKE_VENV_MISSING:-0}" = 1 ] && exit 1
   exit 0
 fi
 if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
+  if [ "${FAKE_VENV_FAIL:-0}" = 1 ]; then
+    printf '%s\n' "${FAKE_VENV_STDERR:-venv creation failed}"
+    exit 7
+  fi
   target=$3
   mkdir -p "$target/bin"
   cat >"$target/bin/pip" <<'PIP'
@@ -446,6 +460,64 @@ def test_package_install_failure_keeps_previous_release_running(tmp_path):
     assert failed.returncode == 1
     assert "SB_INSTALL_PACKAGE_FAILED" in failed.stderr
     assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "known-good"
+
+
+def test_homebrew_ensurepip_venv_failure_surfaces_real_error_and_repair_hint(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    prefix = tmp_path / "prefix"
+    env.update(
+        FAKE_VENV_FAIL="1",
+        FAKE_PYTHON_VERSION="3.14",
+        FAKE_PYTHON_EXECUTABLE="/opt/homebrew/opt/python@3.14/bin/python3.14",
+        FAKE_VENV_STDERR=(
+            "Command '['/Users/cryln/.local/lib/storybook/releases/"
+            "latest-e47f464520b9373e-venv2/bin/python3', '-m', 'ensurepip', "
+            "'--upgrade', '--default-pip']' returned non-zero exit status 1.\n"
+            '  File "~/.venv/ensurepip/_bootstrap.py", line 22, in main\n'
+            "PermissionError: [Errno 13] Permission denied"
+        ),
+    )
+
+    failed = _run(prefix, env)
+
+    assert failed.returncode == 1
+    assert "SB_INSTALL_VENV_FAILED" in failed.stderr
+    assert "PermissionError: [Errno 13] Permission denied" in failed.stderr
+    assert "ensurepip" in failed.stderr
+    assert "brew update && brew upgrade python@3.14" in failed.stderr
+    assert "brew reinstall python@3.14" in failed.stderr
+    releases = prefix / "lib" / "storybook" / "releases"
+    assert not releases.exists() or not any(releases.iterdir())
+    assert not (prefix / "lib" / "storybook" / "current").exists()
+    assert not (prefix / "bin" / "book").exists()
+    assert not (prefix / "bin" / "storybook").exists()
+
+
+def test_venv_failure_keeps_previous_release_running_and_leaves_no_residue(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    prefix = tmp_path / "prefix"
+    env["FAKE_INSTALL_TAG"] = "known-good"
+    assert _run(prefix, env, "--version", "1.2.3").returncode == 0
+
+    archive = Path(env["FAKE_ARCHIVE"])
+    archive.write_bytes(b"next release content")
+    Path(env["FAKE_CHECKSUM"]).write_text(
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  storybook.tar.gz\n",
+        encoding="ascii",
+    )
+    env["FAKE_VENV_FAIL"] = "1"
+    env["FAKE_VENV_STDERR"] = "venv creation blew up: disk full"
+
+    failed = _run(prefix, env, "--version", "1.2.4")
+
+    assert failed.returncode == 1
+    assert "SB_INSTALL_VENV_FAILED" in failed.stderr
+    assert "venv creation blew up: disk full" in failed.stderr
+    assert "brew update" not in failed.stderr
+    assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "known-good"
+    releases = prefix / "lib" / "storybook" / "releases"
+    targets = [entry for entry in releases.iterdir() if entry.is_dir()] if releases.exists() else []
+    assert len(targets) == 1
 
 
 def test_real_venv_entrypoints_survive_clean_install_upgrade_and_bad_release(

@@ -365,6 +365,14 @@ Storybook 的 sqlite-vec 索引要求 Python SQLite 支持 loadable extensions�
 `STORYBOOK_INSTALL_PYTHON=/opt/homebrew/opt/python@3.11/bin/python3.11 sh install.sh`
 重试。
 
+若安装器在创建隔离环境时报 `SB_INSTALL_VENV_FAILED`（venv 内部的 `ensurepip` 引导
+pip 失败，无法创建隔离环境），说明当前 Python 的 venv/ensurepip 受损。macOS 上最常见
+原因是 Homebrew `python@3.14` 曾以错误权限打包 ensurepip 的 pip wheel，修复方式是
+`brew update && brew upgrade python@3.14`（或 `brew reinstall python@3.14`）后重试；
+Debian/Ubuntu 用户先安装 `python3-venv`（`sudo apt install python3-venv`）再重试。
+安装器在失败时会原样输出 venv 的真实错误，并给出上述针对性修复指引；失败不会影响
+既有版本，也不会在 prefix 下留下残留 target。
+
 ```bash
 sh install.sh --version 0.2.0
 sh install.sh --prefix "$HOME/tools/storybook" --no-init

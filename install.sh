@@ -227,7 +227,40 @@ if [ ! -f "$TARGET/.storybook-ready" ]; then
     [ ! -e "$TARGET" ] || fail SB_INSTALL_TARGET_INCOMPLETE "release target exists without a ready marker; the previous installation is unchanged"
     mkdir "$TARGET" || fail SB_INSTALL_TARGET_FAILED "could not reserve the release target; the previous installation is unchanged"
     TARGET_CREATED=1
-    "$PYTHON" -m venv "$TARGET" || fail SB_INSTALL_VENV_FAILED "could not create the isolated environment"
+    VENV_LOG=$TEMP_DIR/venv-create.log
+    if ! "$PYTHON" -m venv "$TARGET" >"$VENV_LOG" 2>&1; then
+        # Surface the real venv error verbatim, then give targeted repair guidance.
+        if [ -s "$VENV_LOG" ]; then
+            printf '%s: venv creation failed with the following output:\n' "$PROGRAM" >&2
+            cat "$VENV_LOG" >&2
+        fi
+        if grep -qi 'ensurepip' "$VENV_LOG" 2>/dev/null; then
+            case $OS in
+                Darwin)
+                    PYTHON_EXEC=$("$PYTHON" -c 'import sys; print(sys.executable)' 2>/dev/null || printf '%s' "$PYTHON")
+                    case $PYTHON_EXEC in
+                        /opt/homebrew/*|/usr/local/*)
+                            fail SB_INSTALL_VENV_FAILED "could not create the isolated environment (ensurepip failed to bootstrap pip); run: brew update && brew upgrade python@$PYTHON_VERSION (or brew reinstall python@$PYTHON_VERSION), then retry"
+                            ;;
+                        *)
+                            fail SB_INSTALL_VENV_FAILED "could not create the isolated environment (ensurepip failed to bootstrap pip); repair or reinstall your Python installation and retry"
+                            ;;
+                    esac
+                    ;;
+                Linux)
+                    if command -v apt-get >/dev/null 2>&1 || [ -f /etc/debian_version ]; then
+                        fail SB_INSTALL_VENV_FAILED "could not create the isolated environment (ensurepip failed to bootstrap pip); install python3-venv and retry (e.g. sudo apt install python3-venv on Debian/Ubuntu)"
+                    else
+                        fail SB_INSTALL_VENV_FAILED "could not create the isolated environment (ensurepip failed to bootstrap pip); install your distribution's python3-venv package (or repair the Python installation) and retry"
+                    fi
+                    ;;
+                *)
+                    fail SB_INSTALL_VENV_FAILED "could not create the isolated environment (ensurepip failed to bootstrap pip); repair or reinstall your Python installation and retry"
+                    ;;
+            esac
+        fi
+        fail SB_INSTALL_VENV_FAILED "could not create the isolated environment"
+    fi
     [ -x "$TARGET/bin/pip" ] || fail SB_INSTALL_PIP_MISSING "venv did not provide pip; repair the Python installation"
     "$TARGET/bin/pip" install --disable-pip-version-check "$ARCHIVE" >/dev/null || fail SB_INSTALL_PACKAGE_FAILED "package installation failed; the previous installation is unchanged"
     if [ ! -x "$TARGET/bin/book" ] || [ ! -x "$TARGET/bin/storybook" ]; then
