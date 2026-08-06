@@ -62,21 +62,28 @@ if [ "${1:-}" = -c ] && [ "${3:-}" = storybook-sqlite-extension-check ]; then
 fi
 if [ "${1:-}" = -c ] && [ "$#" -gt 2 ]; then rm -f "$4"; mv "$3" "$4"; exit 0; fi
 if [ "${1:-}" = -c ]; then
-  case ${2:-} in *sys.executable*)
-    printf '%s\n' "${FAKE_PYTHON_EXECUTABLE:-/usr/local/bin/python3}"
-    exit 0
-    ;;
+  case ${2:-} in
+    *version.split*)
+      printf '%s\n' "${FAKE_PYTHON_FULL_VERSION:-3.11.0}"
+      exit 0
+      ;;
+    *sys.executable*)
+      printf '%s\n' "${FAKE_PYTHON_EXECUTABLE:-/usr/local/bin/python3}"
+      exit 0
+      ;;
+    *sys.version_info*)
+      printf '%s\n' "${FAKE_PYTHON_VERSION:-3.11}"
+      exit 0
+      ;;
+    *) echo 3.11; exit 0 ;;
   esac
-fi
-if [ "${1:-}" = -c ]; then
-  printf '%s\n' "${FAKE_PYTHON_VERSION:-3.11}"
-  exit 0
 fi
 if [ "${1:-}" = -m ] && [ "${2:-}" = venv ] && [ "${3:-}" = --help ]; then
   [ "${FAKE_VENV_MISSING:-0}" = 1 ] && exit 1
   exit 0
 fi
 if [ "${1:-}" = -m ] && [ "${2:-}" = venv ]; then
+  if [ "${FAKE_VENV_LOG:-}" ]; then printf '%s\n' "$0" > "$FAKE_VENV_LOG"; fi
   if [ "${FAKE_VENV_FAIL:-0}" = 1 ]; then
     printf '%s\n' "${FAKE_VENV_STDERR:-venv creation failed}"
     exit 7
@@ -116,6 +123,7 @@ case ${1:-} in -s) printf '%s\n' "${FAKE_OS:-Darwin}";; -m) printf '%s\n' "${FAK
         "STORYBOOK_INSTALL_ARCHIVE_URL": "https://mirror.invalid/storybook.tar.gz",
         "STORYBOOK_INSTALL_CHECKSUM_URL": "https://mirror.invalid/storybook.tar.gz.sha256",
         "STORYBOOK_INSTALL_PYTHON": "python3",
+        "FAKE_PYTHON_EXECUTABLE": str(tools / "python3"),
         "FAKE_OS": "Darwin",
         "FAKE_ARCH": "arm64",
     }
@@ -462,13 +470,11 @@ def test_package_install_failure_keeps_previous_release_running(tmp_path):
     assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "known-good"
 
 
-def test_homebrew_ensurepip_venv_failure_surfaces_real_error_and_repair_hint(tmp_path):
+def test_venv_ensurepip_failure_surfaces_real_error_and_stable_python_guidance(tmp_path):
     _, env = _fake_tools(tmp_path)
     prefix = tmp_path / "prefix"
     env.update(
         FAKE_VENV_FAIL="1",
-        FAKE_PYTHON_VERSION="3.14",
-        FAKE_PYTHON_EXECUTABLE="/opt/homebrew/opt/python@3.14/bin/python3.14",
         FAKE_VENV_STDERR=(
             "Command '['/Users/cryln/.local/lib/storybook/releases/"
             "latest-e47f464520b9373e-venv2/bin/python3', '-m', 'ensurepip', "
@@ -484,13 +490,47 @@ def test_homebrew_ensurepip_venv_failure_surfaces_real_error_and_repair_hint(tmp
     assert "SB_INSTALL_VENV_FAILED" in failed.stderr
     assert "PermissionError: [Errno 13] Permission denied" in failed.stderr
     assert "ensurepip" in failed.stderr
-    assert "brew update && brew upgrade python@3.14" in failed.stderr
-    assert "brew reinstall python@3.14" in failed.stderr
+    assert "uv python install 3.12" in failed.stderr
+    assert "--resolve-links" in failed.stderr
+    assert "brew install python@3.12" in failed.stderr
     releases = prefix / "lib" / "storybook" / "releases"
     assert not releases.exists() or not any(releases.iterdir())
     assert not (prefix / "lib" / "storybook" / "current").exists()
     assert not (prefix / "bin" / "book").exists()
     assert not (prefix / "bin" / "storybook").exists()
+
+
+def test_venv_creation_resolves_symlinked_python_before_creating_venv(tmp_path):
+    """uv-managed style: $PYTHON is a symlink; venv must use the resolved path."""
+    tools, env = _fake_tools(tmp_path)
+    python_link = tools / "python3-link"
+    python_link.symlink_to("python3")
+    env["STORYBOOK_INSTALL_PYTHON"] = "python3-link"
+    env["FAKE_PYTHON_EXECUTABLE"] = str(tools / "python3")
+    env["FAKE_VENV_LOG"] = str(tmp_path / "venv-argv0.txt")
+    prefix = tmp_path / "prefix"
+
+    completed = _run(prefix, env)
+
+    assert completed.returncode == 0, completed.stderr
+    venv_argv0 = Path(env["FAKE_VENV_LOG"]).read_text(encoding="utf-8").strip()
+    assert venv_argv0 == str(tools / "python3")
+    assert venv_argv0 != "python3-link"
+    assert (prefix / "lib" / "storybook" / "current").is_symlink()
+    assert (prefix / "bin" / "book").is_symlink()
+
+
+def test_prerelease_python_warns_and_steers_to_stable(tmp_path):
+    _, env = _fake_tools(tmp_path)
+    env["FAKE_PYTHON_FULL_VERSION"] = "3.14.0a7"
+    prefix = tmp_path / "prefix"
+
+    completed = _run(prefix, env)
+
+    assert completed.returncode == 0, completed.stderr
+    assert "3.14.0a7" in completed.stderr
+    assert "prerelease" in completed.stderr
+    assert "uv python install 3.12" in completed.stderr
 
 
 def test_venv_failure_keeps_previous_release_running_and_leaves_no_residue(tmp_path):
@@ -513,7 +553,8 @@ def test_venv_failure_keeps_previous_release_running_and_leaves_no_residue(tmp_p
     assert failed.returncode == 1
     assert "SB_INSTALL_VENV_FAILED" in failed.stderr
     assert "venv creation blew up: disk full" in failed.stderr
-    assert "brew update" not in failed.stderr
+    assert "uv python install" not in failed.stderr
+    assert "brew install" not in failed.stderr
     assert subprocess.check_output([prefix / "bin" / "book"], text=True).strip() == "known-good"
     releases = prefix / "lib" / "storybook" / "releases"
     targets = [entry for entry in releases.iterdir() if entry.is_dir()] if releases.exists() else []

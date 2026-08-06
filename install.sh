@@ -89,6 +89,7 @@ command -v "$PYTHON" >/dev/null 2>&1 || fail SB_INSTALL_PYTHON_MISSING "Python 3
 PYTHON_VERSION=$(
     "$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2]); raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null
 ) || fail SB_INSTALL_PYTHON_TOO_OLD "Python 3.11+ is required (found ${PYTHON_VERSION:-unknown})"
+PYTHON_FULL_VERSION=$("$PYTHON" -c 'import sys; print(sys.version.split()[0])' 2>/dev/null || true)
 "$PYTHON" -m venv --help >/dev/null 2>&1 || fail SB_INSTALL_VENV_MISSING "Python venv is unavailable; install python3-venv and retry"
 if ! "$PYTHON" -c '
 import sqlite3
@@ -171,6 +172,14 @@ printf '  Version   %s\n' "$VERSION"
 printf '  Prefix    %s\n' "$PREFIX"
 printf '  Source    %s\n' "$ARCHIVE_URL"
 
+# Prerelease Python (alpha/beta/rc) may break venv/ensurepip and lack wheels
+# for sqlite-vec/numpy; warn early and steer toward a stable release.
+case $PYTHON_FULL_VERSION in
+    *a*|*b*|*rc*)
+        printf '%s: warning: Python %s is a prerelease build; sqlite-vec/numpy wheels may be unavailable and venv/ensurepip can misbehave. Prefer a stable Python 3.11/3.12/3.13 (e.g. uv python install 3.12, or on macOS brew install python@3.12) and retry.\n' "$PROGRAM" "$PYTHON_FULL_VERSION" >&2
+        ;;
+esac
+
 if [ "$DRY_RUN" -eq 1 ]; then
     printf 'Dry-run complete: no writes performed.\n'
     exit 0
@@ -227,8 +236,12 @@ if [ ! -f "$TARGET/.storybook-ready" ]; then
     [ ! -e "$TARGET" ] || fail SB_INSTALL_TARGET_INCOMPLETE "release target exists without a ready marker; the previous installation is unchanged"
     mkdir "$TARGET" || fail SB_INSTALL_TARGET_FAILED "could not reserve the release target; the previous installation is unchanged"
     TARGET_CREATED=1
+    # Resolve symlinks so `python -m venv` writes a correct pyvenv.cfg home.
+    # uv-managed Python is often invoked via ~/.local/bin/python3 symlinks whose
+    # directory holds no stdlib, which breaks ensurepip (astral-sh/uv#16411).
+    PYTHON_REALPATH=$("$PYTHON" -c 'import os, sys; print(os.path.realpath(sys.executable))' 2>/dev/null || printf '%s' "$PYTHON")
     VENV_LOG=$TEMP_DIR/venv-create.log
-    if ! "$PYTHON" -m venv "$TARGET" >"$VENV_LOG" 2>&1; then
+    if ! "$PYTHON_REALPATH" -m venv "$TARGET" >"$VENV_LOG" 2>&1; then
         # Surface the real venv error verbatim, then give targeted repair guidance.
         if [ -s "$VENV_LOG" ]; then
             printf '%s: venv creation failed with the following output:\n' "$PROGRAM" >&2
@@ -237,15 +250,7 @@ if [ ! -f "$TARGET/.storybook-ready" ]; then
         if grep -qi 'ensurepip' "$VENV_LOG" 2>/dev/null; then
             case $OS in
                 Darwin)
-                    PYTHON_EXEC=$("$PYTHON" -c 'import sys; print(sys.executable)' 2>/dev/null || printf '%s' "$PYTHON")
-                    case $PYTHON_EXEC in
-                        /opt/homebrew/*|/usr/local/*)
-                            fail SB_INSTALL_VENV_FAILED "could not create the isolated environment (ensurepip failed to bootstrap pip); run: brew update && brew upgrade python@$PYTHON_VERSION (or brew reinstall python@$PYTHON_VERSION), then retry"
-                            ;;
-                        *)
-                            fail SB_INSTALL_VENV_FAILED "could not create the isolated environment (ensurepip failed to bootstrap pip); repair or reinstall your Python installation and retry"
-                            ;;
-                    esac
+                    fail SB_INSTALL_VENV_FAILED 'could not create the isolated environment (ensurepip failed to bootstrap pip); install a stable Python 3.11/3.12/3.13 and retry. With uv: uv python install 3.12, then STORYBOOK_INSTALL_PYTHON="$(uv python find 3.12 --resolve-links)" sh install.sh. On macOS Homebrew: brew install python@3.12, then STORYBOOK_INSTALL_PYTHON=/opt/homebrew/opt/python@3.12/bin/python3.12 sh install.sh'
                     ;;
                 Linux)
                     if command -v apt-get >/dev/null 2>&1 || [ -f /etc/debian_version ]; then
