@@ -621,7 +621,7 @@ def test_path_missing_onboarding_exports_stable_launcher_to_book_init(
     output = bytearray()
     deadline = time.monotonic() + 30
     try:
-        while b"Run onboarding now?" not in output:
+        while b"Run 'book init' onboarding now?" not in output:
             if time.monotonic() > deadline or process.poll() is not None:
                 pytest.fail(output.decode(errors="replace"))
             ready, _, _ = select.select([master], [], [], 0.1)
