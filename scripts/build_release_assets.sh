@@ -55,6 +55,10 @@ PY
     "$TEMP_DIR/storybook.tar.gz" >/dev/null
 "$TEMP_DIR/verify/bin/book" --help >/dev/null
 "$TEMP_DIR/verify/bin/storybook" --help >/dev/null
+HOME="$TEMP_DIR/home" XDG_CONFIG_HOME="$TEMP_DIR/home/config" \
+    XDG_DATA_HOME="$TEMP_DIR/home/data" XDG_CACHE_HOME="$TEMP_DIR/home/cache" \
+    XDG_STATE_HOME="$TEMP_DIR/home/state" \
+    "$TEMP_DIR/verify/bin/book" admin init-db >/dev/null
 
 mv "$TEMP_DIR/storybook.tar.gz" "$OUTPUT_DIR/storybook.tar.gz"
 mv "$TEMP_DIR/storybook.tar.gz.sha256" "$OUTPUT_DIR/storybook.tar.gz.sha256"

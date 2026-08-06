@@ -136,13 +136,16 @@ def _cutover_guard(
     *,
     busy_code: str,
     label: str,
+    exclusive: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     """Hold a stable snapshot and exclude commits until fencing is committed.
 
     ``BEGIN IMMEDIATE`` changes no user data but takes SQLite's single-writer
-    slot.  Callers may stage persistent fencing triggers in this transaction,
+    slot; an activation target may request ``BEGIN EXCLUSIVE`` so a newly
+    exposed writer cannot retain a read/schema lock ahead of the unfence
+    commit. Callers may stage persistent fencing triggers in this transaction,
     commit that database preparation, and change the registry only after every
-    generation is ready.  A genuinely read-only file falls back to a read
+    generation is ready. A genuinely read-only file falls back to a read
     transaction; its OS permissions already prevent a new writer from opening
     it.
     """
@@ -163,7 +166,7 @@ def _cutover_guard(
                 )
                 db.row_factory = sqlite3.Row
                 db.execute("PRAGMA busy_timeout=0")
-                db.execute("BEGIN IMMEDIATE")
+                db.execute("BEGIN EXCLUSIVE" if exclusive else "BEGIN IMMEDIATE")
             except (OSError, sqlite3.OperationalError) as exc:
                 if db is not None:
                     db.close()
@@ -904,6 +907,10 @@ class MigrationManager:
                     resolved_target,
                     busy_code="SB_MIGRATION_TARGET_BUSY",
                     label="待激活目标世代",
+                    # Prevent a newly exposed target writer from retaining a
+                    # read/schema lock that can starve the durable unfence
+                    # commit on rollback-journal SQLite builds.
+                    exclusive=True,
                 )
             )
             target_was_fenced = _generation_is_fenced(target_guard)

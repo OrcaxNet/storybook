@@ -145,6 +145,12 @@ book search "what should I remember about this task?"
 `~/.local`，不会修改 shell rc；PATH 缺失时只打印可复制的修复命令。指定版本升级会下载
 官方 release checksum，先在临时 venv 验证并安装，最后原子切换；失败时旧版本仍可运行：
 
+Storybook 的 sqlite-vec 索引要求 Python SQLite 支持 loadable extensions；安装器会在任何
+写入前检查该能力。macOS arm64 若使用了不具备该能力的 Python，可执行
+`brew install python@3.11`，再以
+`STORYBOOK_INSTALL_PYTHON=/opt/homebrew/opt/python@3.11/bin/python3.11 sh install.sh`
+重试。
+
 ```bash
 sh install.sh --version 0.2.0
 sh install.sh --prefix "$HOME/tools/storybook" --no-init
