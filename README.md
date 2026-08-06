@@ -365,6 +365,30 @@ Storybook 的 sqlite-vec 索引要求 Python SQLite 支持 loadable extensions�
 `STORYBOOK_INSTALL_PYTHON=/opt/homebrew/opt/python@3.11/bin/python3.11 sh install.sh`
 重试。
 
+若安装器在创建隔离环境时报 `SB_INSTALL_VENV_FAILED`（venv 内部的 `ensurepip` 引导
+pip 失败，无法创建隔离环境），说明当前 Python 的 venv/ensurepip 受损。已知的常见触发
+场景：
+
+- **符号链接调用 uv 托管的 Python**：通过 `~/.local/bin/python3` 这类符号链接执行
+  uv 托管的 Python 时，venv 会把 `pyvenv.cfg` 的 `home` 指向符号链接所在目录（该
+  目录没有标准库），导致 ensurepip 引导失败（见 astral-sh/uv#16411）。安装器会在
+  创建 venv 前把 `$PYTHON` 解析为真实路径再执行，已覆盖该场景；
+- **alpha/beta/rc 预发布版本**：预发布 Python 的 venv/ensurepip 可能损坏，且
+  sqlite-vec/numpy 等依赖不保证提供 wheel；安装器会在检测到预发布版本时输出警告。
+
+修复方式是改用稳定版 Python 后重试：
+
+- uv 托管：`uv python install 3.12`，再以
+  `STORYBOOK_INSTALL_PYTHON="$(uv python find 3.12 --resolve-links)" sh install.sh`
+  重试；
+- macOS Homebrew：`brew install python@3.12`，再以
+  `STORYBOOK_INSTALL_PYTHON=/opt/homebrew/opt/python@3.12/bin/python3.12 sh install.sh`
+  重试；
+- Debian/Ubuntu：`sudo apt install python3-venv` 后重试。
+
+安装器在失败时会原样输出 venv 的真实错误，并给出上述针对性修复指引；失败不会影响
+既有版本，也不会在 prefix 下留下残留 target。
+
 ```bash
 sh install.sh --version 0.2.0
 sh install.sh --prefix "$HOME/tools/storybook" --no-init
