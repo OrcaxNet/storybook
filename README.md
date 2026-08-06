@@ -1,18 +1,112 @@
 # 📖 Storybook
 
-> 离线 Coding 记忆系统 —— 把每一次 AI 编程会话在"梦境"里整理成一条 Story，再连成一张可被联想唤醒的记忆网。
+> **Local-first Agentic Memory Graph RAG** —— 把 Agent 的每一次会话整理成可复用的 Story，连成一张可被联想唤醒的记忆网。
 >
-> A local-first coding memory system that consolidates AI-coding sessions into structured *Stories* via a "dream cycle" and links them into a weighted association graph. Generative work uses DeepSeek; embeddings use a unified API abstraction with local Ollama as the recommended preset.
+> Turn your AI coding agent's scattered session history into an evolvable, queryable, personal memory graph — a "dream" that keeps what you learned across tools, projects, and devices.
+
+---
+
+## English Introduction
+
+### What it is
+
+**Storybook** is a **local-first, agentic memory-graph RAG system** for AI coding agents. It is *not* another knowledge-base Q&A tool. Instead of answering "what do you know?", it answers "what have you **done** — and what should you remember next time?".
+
+Storybook ingests the raw session history your coding agents produce — **Claude Code, Cursor, Codex CLI, Gemini CLI, Cline, JSON files, or a built-in simulator** — and runs each episode through a **dream cycle**: it denoises the transcript and consolidates it into one or more self-contained, independently reusable memory units called **Stories**. A Story keeps the *problem, actions, outcome, applicable environment, and source evidence* together, never truncated by a fixed character budget. Stories are then linked into a weighted, typed **Memory Graph** with `semantic`, `temporal`, `causal`, `same_environment`, `parent_child`, `co_recall`, and `supersedes` edges — each edge carrying provenance, version, and reinforcement history.
+
+At recall time, Storybook runs a **hybrid, Graph-RAG retrieval pipeline**:
+
+1. **Fast path** — vector search + FTS/BM25 lexical ranking fused with weighted RRF, environment-aware soft weighting, bounded graph diffusion, and an optional local bounded reranker. **The fast path never blocks on a generative LLM.**
+2. **Auto path** — only under explainable gates (zero/low confidence, ambiguity, compound, cross-language, or environment-ambiguous queries) does it spend a separate, bounded budget on **Query Transformation**: rewrite, multi-query, or HyDE.
+3. **Deep path** — explicitly opt-in, high-budget recall with all transformations and higher graph budgets.
+
+Every result returns its source paths and score components; co-recall feedback continuously reinforces (and half-life decays) the graph edges. All storage, profiles, and raw evidence stay on your machine by default: embeddings default to **local Ollama**, and remote embedding/generation APIs are only used when you choose them, with clear disclosure that text leaves your machine.
+
+### The problem it solves
+
+AI agents forget between sessions. Every new session restarts with no memory of the environment quirks, debugging paths, design decisions, and hard-won lessons from previous work. Storybook gives agents **cross-session experience reuse**: through the **MCP server** (`recall` / `get_story` / `stats` / `prime_context`) and a **`SessionStart` hook** (`book prime`), relevant past experience is proactively recalled at the right moment — and stays silent when it is not relevant, so it never pollutes the agent's context window.
+
+### Core concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Session / Episode** | One working episode of an agent plus its raw evidence (source session log). |
+| **Story (Memory Chunk)** | A single, independently reusable memory unit split from an episode: problem, actions, outcome, environment, applicability, and source evidence. Length is set by information completeness, never a hard character truncation. |
+| **Memory Graph** | Typed, weighted relationships between Stories — semantic, temporal, causal, parent-child, same-environment, co-recall, alternative/evolution — with explainable edge weights and versions. |
+| **User Profile** | Memory belongs to the *user*, not the project. Project / agent / device / runtime are retrieval context and applicability signals. Local by default; optional cross-device sync in the future. |
+
+### Memory pipeline
+
+1. **Memory Formation** — collect agent sessions, denoise, split into independently reusable Stories; keep environment + provenance; support merge / split / evolution.
+2. **Embedding & Indexing** — embed Story `title + abstract + applicability`; maintain lexical, metadata, and graph indexes alongside; raw evidence expands on demand.
+3. **Graph RAG** — seed from direct semantic hits, diffuse along constrained multi-type memory edges with path / weight / time / environment / feedback signals.
+4. **Query Understanding** — low-latency direct query by default; only complex / ambiguous / low-confidence queries enter a separate budget for Query Transformation, multi-query, or HyDE — and only after ablation evidence proves the benefit.
+5. **Hybrid Search & Rerank** — fuse vector, FTS/BM25, graph diffusion, environment / time / feedback signals via RRF / weighted fusion and an optional local reranker; return sources, applicability, environment differences, and degradation status.
+6. **Agentic Recall** — proactive recall through MCP, hooks, and priming before or during agent execution; silent when irrelevant, fast degradation on failure.
+7. **Memory Lifecycle** — reinforcement, decay, merge, split, supersede, and audit for duplicated, stale, conflicting, and frequently co-recalled memories; every change is traceable.
+
+### Design principles
+
+- **Memory is not an ordinary knowledge document** — episodes, environment, actions, and results are preserved.
+- **Mature RAG techniques are introduced per-problem, not buzzword-stacked** — every strategy needs ablation evidence for quality, latency, and cost.
+- **Query experience first** — the fast path is never blocked by a generative LLM; deep recall uses a separate mode and budget.
+- **Local-first, private by default, sync optional** — absolute paths, hostnames, and raw external session IDs are never cross-device primary keys.
+- **Quality and experience are measured together** — recall@k, MRR, environment fit, false-empty, p50/p95, time-to-first-value, and injected noise.
+
+### Quick start
+
+```bash
+# 1. Download and review the installer (macOS / Linux, Python 3.11+, no sudo)
+curl -fsSLO https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh
+less install.sh
+sh install.sh
+
+# 2. Pick Profile / model provider / agent adapter
+book init
+
+# 3. Run the dream cycle, then search your memory
+book run --once
+book search "what should I remember about this task?"
+book status
+```
+
+> The detailed documentation below is primarily in Chinese; headings are bilingual (`中文 / English`), and every diagram is annotated bilingually so English readers can follow the architecture and flows.
+
+---
+
+## 目录 / Table of Contents
+
+- [English Introduction](#english-introduction)
+- [这是什么 / What it is](#这是什么--what-it-is)
+- [特性 / Features](#特性--features)
+- [整体架构设计 / Architecture](#整体架构设计--architecture)
+- [核心流程图 / Core Flows](#核心流程图--core-flows)
+- [环境要求 / Requirements](#环境要求--requirements)
+- [安装 / Installation](#安装--installation)
+- [用户级 Profile 与共享存储 / Profiles](#用户级-profile-与共享存储--profiles)
+- [测试 / Tests](#测试--tests)
+- [检索质量评测 / Evaluation](#检索质量评测--evaluation)
+- [查询性能基线与本地诊断 / Performance](#查询性能基线与本地诊断--performance)
+- [CLI 命令总览 / CLI Reference](#cli-命令总览--cli-reference)
+- [使用 / Usage](#使用--usage)
+- [做梦周期自动化 / Automation](#做梦周期自动化--automation)
+- [MCP 接入 / MCP](#mcp-接入--mcp)
+- [会话启动注入 / Session-start Injection](#会话启动注入--session-start-injection)
+- [配置 / Configuration](#配置--configuration)
+- [项目结构 / Project Structure](#项目结构--project-structure)
+- [说明 / Notes](#说明--notes)
+- [License](#license)
+---
 
 ## 这是什么 / What it is
 
-Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JSON 文件或内置模拟器），对每条会话跑一遍 **做梦周期（dream cycle）**：按“独立可复用结论 + 环境适用性”形成一个或多个 Story v2。每条 Story 保存 `title + abstract + structured detail + sources`；detail 与证据不硬截断，只有用于检索/展示的 abstract 有预算，并与已有记忆按相似度**合并 / 更新 / 新建**。
+Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、Codex CLI、Gemini CLI、Cline、JSON 文件或内置模拟器），对每条会话跑一遍 **做梦周期（dream cycle）**：按“独立可复用结论 + 环境适用性”形成一个或多个 Story v2。每条 Story 保存 `title + abstract + structured detail + sources`；detail 与证据不硬截断，只有用于检索/展示的 abstract 有预算，并与已有记忆按相似度**合并 / 更新 / 新建**。
 
 检索时，Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。Auto 仅在 zero/low-confidence、复合、跨语言或强环境歧义时进入独立预算的 Query Transformation/HyDE 第二阶段；Deep 必须由调用方显式选择。每条结果返回来源路径与分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
 
 系统采用**混合 provider**：生成式 LLM 通过 DeepSeek Anthropic-compatible Messages API；embedding 顶层统一为 `type=api`，默认使用本地 Ollama 推荐 preset，也可改用 OpenAI-compatible API。Fast 查询不调用生成式 LLM。选择远程 embedding API 时，待向量化的 Story/query 文本会离开本机。
 
-## ✨ 特性
+## 特性 / Features
 
 - 🧠 **语义边界记忆整理**：长而不可拆的经历保持完整；短会话中的多个独立结论拆成多条 Story，并共享来源 Session
 - 🔗 **可解释 Memory Graph**：`semantic` / `temporal` / `causal` / `same_environment` / `parent_child` / `co_recall` / `supersedes` 多类型边，有明确方向、provenance、版本与软删除规则
@@ -20,14 +114,89 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、JS
 - 🔍 **自适应 Hybrid Search**：Fast 无生成式调用，融合 vector + FTS/关键词 + environment + Graph；Auto 按可解释门控启用 rewrite/multi-query/HyDE；Deep 使用显式高预算；任一组件失败均保留可用 fallback
 - 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
 - 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/lexical/fusion/transform/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 与离线策略消融同时守护质量/时延
-- 🔌 **多数据源**：Claude Code 会话（主）、Cursor、JSON 文件/目录、内置模拟器
+- 🔌 **多数据源**：Claude Code 会话（主）、Cursor、Codex、Gemini CLI、Cline、JSON 文件/目录、内置模拟器
 - 🏠 **本地优先**：Profile、原始证据与数据库留在本机；embedding 默认走本地 Ollama，选择远程 API 时会明确披露文本离机；云端调用均可快速降级
 - 🤖 **MCP 召回**：通过 MCP server 把记忆检索暴露给 Claude Code 等 agent，新任务可主动 recall 过往经历，实现跨 session 经验复用
-- 🌅 **晨间简报**：会话启动时基于 cwd / 首条提问**主动召回**相关记忆并注入上下文（`SessionStart` hook 或 `prime_context` MCP 工具），实现"下意识回忆"--更贴近初衷；token 预算内、相关度不足时**静默不注入**
+- 🌅 **晨间简报**：会话启动时基于 cwd / 首条提问**主动召回**相关记忆并注入上下文（`SessionStart` hook 或 `prime_context` MCP 工具），实现"下意识回忆"——更贴近初衷；token 预算内、相关度不足时**静默不注入**
 
-## 🏗 架构
+## 整体架构设计 / Architecture
 
-模块流（均位于 `src/storybook/`）：
+### 系统架构图 / System architecture
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["入口层 Entry Points"]
+        CLI["CLI book 命令"]
+        MCP["MCP Server book mcp"]
+        HOOK["SessionStart Hook book prime"]
+        SCHED["Scheduler 定时/监听<br/>launchd · daemon · watch"]
+    end
+
+    subgraph CORE["核心管线 Core Pipeline"]
+        COLL["Collector 采集 + History Adapters<br/>Claude · Cursor · Codex · Gemini · Cline · JSON"]
+        PROC["Processor 做梦周期<br/>create / merge / update / split"]
+        SEARCH["Search 混合检索 + Graph RAG<br/>Fast / Auto / Deep"]
+        PRIME["Prime 会话启动主动注入"]
+        FB["Feedback 共同召回反馈队列"]
+    end
+
+    subgraph MEM["记忆层 Memory"]
+        STORE[("SQLite + sqlite-vec<br/>sessions · stories · edges<br/>story_vectors · revisions · events")]
+        GRAPH["Memory Graph 有界扩散"]
+    end
+
+    subgraph AI["AI 服务 Providers"]
+        LLM["LLM 生成<br/>DeepSeek Anthropic-compatible"]
+        EMB["Embedding 向量<br/>Ollama 本地 · OpenAI-compatible"]
+    end
+
+    CLI --> COLL
+    CLI --> PROC
+    CLI --> SEARCH
+    MCP --> SEARCH
+    MCP --> STORE
+    HOOK --> PRIME
+    SCHED --> COLL
+    SCHED --> PROC
+
+    COLL --> STORE
+    PROC --> STORE
+    PROC --> GRAPH
+    PROC --> LLM
+    PROC --> EMB
+    SEARCH --> STORE
+    SEARCH --> GRAPH
+    SEARCH --> EMB
+    PRIME --> SEARCH
+    FB --> STORE
+    GRAPH --> STORE
+```
+
+### 组件说明 / Components
+
+| 组件 | 模块 | 职责 |
+|------|------|------|
+| **CLI** | `cli.py` | `book` canonical 命令入口，串起 init / run / search / status / mcp / admin |
+| **采集** | `collector.py` + `history_adapters/` | 从 Claude Code / Cursor / Codex / Gemini / Cline / JSON / 模拟器采集会话；增量 checkpoint、损坏隔离 |
+| **做梦加工** | `processor.py` | dream cycle：LLM 形成 Story v2 → embedding → 检索比对 → create / merge / update / split |
+| **存储** | `store.py` | SQLite + sqlite-vec：sessions / stories / edges / story_vectors / revisions / events / tombstones |
+| **记忆图** | `graph.py` | 多类型边、有界扩散、环/hub/重复抑制、supersedes 替换 |
+| **检索** | `search.py` | Fast（vector + lexical + graph + rerank）/ Auto（门控变换）/ Deep（显式高预算），降级与诊断 |
+| **自适应** | `adaptive.py` | 模式解析、查询规划、门控、变换融合、本地 reranker 与熔断 |
+| **生成 LLM** | `llm.py` | DeepSeek Anthropic-compatible Messages API，强制命名 tool call + 本地类型校验 |
+| **向量** | `embeddings.py` | 统一 embedding API（Ollama / OpenAI-compatible），维度校验与模型状态 |
+| **反馈** | `feedback.py` | `access_count` / `co_recall` 边权异步队列，单事务写回 |
+| **启动注入** | `prime.py` | 会话启动主动召回并生成 ≤2k token 简报，静默降级 |
+| **MCP** | `mcp_server.py` | `recall` / `get_story` / `stats` / `prime_context` 四个工具，复用 `search` / `store` |
+| **Profile** | `profiles.py` | 用户级 registry、平台目录、local/isolated Profile、数据库世代指针 |
+| **上下文** | `context.py` | ContextEnvelope 采集、隐私归一、环境适配评分、项目身份解析 |
+| **自动化** | `dreamd.py` | 文件锁互斥、反应式监听、定时守护、`dream.log` 幂等日志 |
+| **健康检查** | `health.py` | `book doctor`：Ollama / 模型 / 维度 / sqlite-vec / 向量双写一致性 |
+| **安装/卸载** | `setup_manager.py` + `setup_adapters/` | 一键 setup / 安全卸载，受管节点与回滚 |
+| **迁移** | `migration.py` | v1 → v2 安全迁移与回滚，registry CAS 原子切换 |
+| **评测/基准** | `eval/`、`perf_benchmark.py`、`graph_eval.py` | 检索质量评测、固定 10k Story 性能基准、图评测 |
+
+### 模块数据流 / Module data flow
 
 ```
 collector → store → processor (用 llm + embeddings) → search
@@ -35,9 +204,28 @@ collector → store → processor (用 llm + embeddings) → search
                   cli.py 串起命令；config.py 集中所有路径/模型/阈值
 ```
 
-### 做梦周期（`processor.process_session`）
+---
 
-对每条 pending 会话：LLM 按独立结论形成 Story v2 → 默认对 `title + abstract + applicability` 做 embedding → 每个候选分别检索 top-K 已有 Story → 按最佳相似度分支：
+## 核心流程图 / Core Flows
+
+### 记忆形成：做梦周期 / Memory formation: the dream cycle
+
+对每条 pending 会话：LLM 提取关键词并形成 Story v2 → 对 `title + abstract + applicability` 做 embedding → 向量检索 top-K 已有 Story → 按最佳相似度分支：
+
+```mermaid
+flowchart TD
+    A["采集 pending Sessions"] --> B["LLM 提取关键词 + 形成 Story v2"]
+    B --> C["Embedding<br/>title + abstract + applicability"]
+    C --> D["向量检索 top-K 已有 Story"]
+    D --> E{"最佳相似度 best sim"}
+    E -- "&lt; 0.85" --> F["新建 create<br/>保存无损 detail/source<br/>与弱匹配建边 weight = sim"]
+    E -- "0.85 ≤ sim &lt; 0.92" --> G["合并 merge<br/>合并结构化证据<br/>仅按独立复用边界分裂"]
+    E -- "≥ 0.92" --> H["更新 update<br/>仅合并关键词 + 重新 embedding<br/>强化边权重 +0.1（上限 1.0）"]
+    F --> I["维护 Memory Graph 边<br/>provenance / version 可审计"]
+    G --> I
+    H --> I
+    I --> J["Session → processed"]
+```
 
 | 分支 | 触发条件 | 动作 |
 |------|----------|------|
@@ -45,37 +233,61 @@ collector → store → processor (用 llm + embeddings) → search
 | **merge** | 0.85 ≤ sim < 0.92 | 合并新旧结构化证据；只有存在多个独立结论/适用条件才分裂，不以字符数触发。父行和 revision 链保留用于溯源 |
 | **update** | sim ≥ 0.92 | 仅合并关键词、重新 embedding、强化已有边权重（+0.1，上限 1.0） |
 
-### 检索（`search.search`）
+### 检索：Fast / Auto / Deep
 
-Fast：query normalization → vector + FTS/关键词 → 加权 RRF → 环境软加权 → 有界 Graph RAG → 本地 top-N rerank。Fast 不调用生成式 LLM；`graph_enabled=false` 可关闭图扩散。`--scope project` 使用 ContextEnvelope 中隐私安全的 repo/workspace 身份做硬过滤，只返回当前项目来源记忆；`profile` 保持用户级全库召回。
+```mermaid
+flowchart TD
+    Q["Query + 可选 ContextEnvelope"] --> N["归一化 normalize"]
+    N --> F["Fast 快路径<br/>不调用生成式 LLM"]
+    F --> V["向量检索 Vector top-K<br/>story_vectors / cosine"]
+    F --> L["词法 FTS5 / BM25"]
+    V --> FUS["加权 RRF 融合"]
+    L --> FUS
+    FUS --> ENV["环境软加权 Environment"]
+    ENV --> G["有界 Graph RAG 扩散<br/>hop/path/fan-out/time/token"]
+    G --> RR["本地有界 reranker<br/>独立超时 + 熔断"]
+    RR --> OUT["排序结果 + score_components<br/>source_paths + degraded_reasons"]
+    V -. "超时/失败" .-> FBL["FTS/关键词 fallback ≤500ms"]
+    FBL --> OUT
+
+    F --> AUTO{"Auto 门控<br/>zero/low-confidence · ambiguous<br/>compound · cross-language · env-ambiguity"}
+    AUTO -- "触发 Auto" --> T["Query Transformation<br/>rewrite / multi-query / HyDE<br/>独立 deadline ≤2s"]
+    T --> MERGE["融合变换结果"]
+    MERGE --> OUT
+    AUTO -- "Deep 显式选择" --> D["Deep 高预算<br/>三种变换 + 更高图预算 + 5s 总预算"]
+    D --> OUT
+```
+
+Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。**Fast 不调用生成式 LLM**；`graph_enabled=false` 可关闭图扩散。`--scope project` 使用 ContextEnvelope 中隐私安全的 repo/workspace 身份做硬过滤，只返回当前项目来源记忆；`profile` 保持用户级全库召回。
 
 Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambiguous_ranking`、`long_compound_query`、`cross_language`、`environment_ambiguity` 等稳定原因决定是否调用一次 DeepSeek LLM，生成 rewrite、multi-query 或 HyDE 辅助表示。第二阶段有独立 deadline，超时后原 Fast 结果立即作为 fallback 返回。Deep 显式启用三种 transformation、更高 Graph 预算及 5s 总预算。
 
-本地 reranker 只处理有界 top-N，具有独立超时、连续失败熔断与冷却恢复；故障时返回 fusion/graph 排名并标明 `reranker_timeout` / `reranker_unavailable` / `reranker_circuit_open`，不会伪装成“无记忆”。
+本地 reranker 只处理有界 top-N，具有独立超时、连续失败熔断与冷却恢复；故障时返回 fusion/graph 排名并标明 `reranker_timeout` / `reranker_unavailable` / `reranker_circuit_open`，不会伪装成"无记忆"。
 
 查询响应保留兼容字段 `mode=cache|vector|lexical_fallback`，并新增 `retrieval_mode=fast|auto|deep`、`transform_used`、`query_plan`、`transform_trace`、`rerank_trace`、`degraded_reasons`。每条 match 返回 `source_paths` 与 `score_components`（vector/lexical/RRF/graph/environment/rerank）。同一份阶段数据会写入本地 `logs/query_performance.jsonl`，但落盘接口只接受固定白名单字段：不保存原始 query、Story 内容、绝对路径、hostname 或仓库 URL。文件权限为 `0600`，超过大小上限后只保留最近记录。
 
-### 关联图
+### 记忆生命周期 / Memory lifecycle
 
-`edges` 以 `UNIQUE(source_id, target_id, edge_type)` 允许同一 Story 对保存多种关系。`temporal`（旧→新）、`causal`（因→果）、`parent_child`（父→子）、`supersedes`（新→旧）是有向边；其余无向。边包含 `provenance_json/version/observations/updated_at/deleted_at`，删除为可审计软删除。Graph RAG 默认从旧 Story 反向跟随 `supersedes` 到新 Story 并抑制旧版；对环、hub、重复路径和噪声共现链做显式抑制。
-
-### 存储层（`store.py`）
-
-每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。新 Profile、Session、Story、edge 使用可按时间排序的 UUIDv7 全局 ID。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录无损本地快照，`memory_events` 以 `event_id/entity_id/base_version/version/device_id/operation/created_at` 记录 create/update/merge/split/delete 的可移植审计链。事件明文 payload 只含固定元数据、关系 UUID 与修订 SHA-256，不复制正文、原始外部 session ID、路径或证据文本，并预留加密 payload 字段。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
-
-`book memory forget` 用持久化浮点热度按半衰期衰减，再将频率无关的整数投影写入 `access_count`，并以最近访问/更新时间、访问计数和最大关联边权共同筛选低价值 Story；归档默认仅预览，`--apply` 后只归档并移出向量/词法/图检索，重复初始化或索引修复也不会重新发布归档向量；高频或强关联记忆受保护，原 Story、embedding 审计数据与 provenance 仍保留。生成式 LLM 与 embedding 的成功结果按 provider/model/schema/输入哈希持久缓存于 Profile 私有 cache；批处理并行执行无数据库写入的 LLM/embedding 准备阶段，再顺序执行 SQLite 合并与写入。
-
-删除 Story 时不物理删行：同一事务清除 serving 向量、追加 delete event 并写入不可变 `memory_tombstones`。查询默认排除 tombstone；本地事件重放采用 delete-wins，即使旧 create/update 事件晚到也不会复活对象。v0.2 的 `book status` 里的 sync 字段是纯本地状态查询，不登录、不联网，也没有上传/下载入口。
-
-从 v0.1 升级时，无法审计模型、输入表示与 hash 的旧向量会保留为 `story-v1-unversioned/legacy` 服务窗口，Story 标记为 `stale` 且不冒充 v2 元数据；必须完成可续跑的 shadow backfill 后，才会原子切换为 v2 active 状态。重复初始化不会覆盖 `stale`、`failed` 或 `archived` 等真实状态。
-
-```bash
-# 每次最多重建 100 条；重复运行自动跳过 content_hash 未变化的 ready 项
-book admin index --model qwen3-embedding:0.6b \
-  --version story-v2-default-v2 --batch-size 100
+```mermaid
+flowchart LR
+    A["采集 Session"] --> B["做梦加工 Dream Cycle"]
+    B --> C["Story v2 入库 + 建边"]
+    C --> D["检索召回 Recall"]
+    D --> E["共同召回反馈 Feedback"]
+    E --> F{"强度变化"}
+    F -- "高频共现/被召回" --> G["强化 edges +0.1<br/>cap 1.0"]
+    F -- "长期未访问" --> H["半衰期衰减<br/>access_count 投影"]
+    F -- "重复/过时/冲突" --> I["合并 / 分裂 / supersedes 替换"]
+    G --> C
+    H --> C
+    I --> C
 ```
 
-## 🔧 环境要求
+删除 Story 时不物理删行：同一事务清除 serving 向量、追加 delete event 并写入不可变 `memory_tombstones`。查询默认排除 tombstone；本地事件重放采用 delete-wins，即使旧 create/update 事件晚到也不会复活对象。
+
+---
+
+## 环境要求 / Requirements
 
 - **Python 3.11+**（推荐用 [uv](https://github.com/astral-sh/uv) 建 venv）
 - **DeepSeek API 凭据**：优先 `ANTHROPIC_AUTH_TOKEN`，兼容 `DEEPSEEK_KEY`；默认读取 `~/.chrc/dpsk.sh`
@@ -119,7 +331,9 @@ setup。不同 provider/base URL 即使模型同名，也不会共享 inference/
 ollama pull qwen3-embedding:0.6b
 ```
 
-## 📦 安装：从下载到首次 recall
+## 安装 / Installation
+
+> 从下载到首次 recall 的完整路径。
 
 ```bash
 # 1. 下载并审阅安装器（macOS/Linux、Python 3.11+，不使用 sudo）
@@ -211,7 +425,7 @@ book admin uninstall --yes --purge-data --confirm-purge  # 非交互双重显式
 
 Serving index 的身份包含 endpoint、adapter、model、version、dimension 和非敏感的 credential-env 引用。修改任一项会进入 `serving_index_mismatch`；默认查询继续使用旧 index 对应的 API 与凭据引用，直到 `embedding-backfill` 完成 shadow generation 并原子切换，避免将不同向量空间混入同一索引。旧版 schema 只支持 Ollama，因此升级时会按既有 `OLLAMA_HOST`/默认地址映射 active identity，不改写 Story 或向量索引；custom API identity 不会被猜测。
 
-## 👤 用户级 Profile 与共享存储
+## 用户级 Profile 与共享存储 / Profiles
 
 首次运行会创建随机 UUID 的 `local` Profile。Claude Code 采集、Cursor 采集、CLI、hook 与 MCP（包括 Codex 等 MCP-aware agent）都经同一份 registry 解析当前数据库，因此切换项目 cwd、移动或重命名 Storybook 仓库不会改变记忆归属。
 
@@ -264,7 +478,9 @@ book admin migration delete-backup <migration_id> --yes      # 用户显式永�
 一个新的空 Profile。原始记忆行不会删除或覆盖；成功切换只在可写旧库中增加世代拒写
 触发器，失败切换会回滚该 DDL。受管 v1 只读备份至少保留 30 天，且不会自动提前删除。
 
-## 🧪 测试
+---
+
+## 测试 / Tests
 
 测试套件覆盖 `store` / `processor` / `search` 三个核心模块的关键路径与边界，
 **完全不依赖真实 DeepSeek/Ollama**——所有 LLM / embedding 调用均被 mock 桩替换，本地一键可重复运行。
@@ -300,7 +516,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 - **dreamd（做梦周期自动化）**：`fcntl.flock` 并发锁互斥与释放、`run_dream_cycle_once` 采集+加工/跳过/空、监听循环首帧追补与变化触发、定时守护、信号退出、`logs/dream.log` 幂等写入。全 mock，不依赖 Ollama。
 - **MCP server**：`tests/test_mcp_server.py` 覆盖四个工具（`recall`/`get_story`/`stats`/`prime_context`）的核心逻辑与 FastMCP 装配/端到端调用。
 
-## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
+## 检索质量评测 / Evaluation
 
 PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段。`book admin eval` 建立可重复的检索质量基线，
 作为调参与算法改进的度量依据。评测需要已配置的 embedding API 可用，并在隔离临时库中运行，不污染用户 Profile 数据库。仓库现有固定评测证据使用本地 Ollama `qwen3-embedding:0.6b`；不同 endpoint、adapter、模型、维度或版本的指标不可直接等同。
@@ -316,7 +532,7 @@ python scripts/generate_eval_transforms.py --variant ambiguous --timeout 30 \
 book admin eval strategy --transform-cache data/eval_reports/query-only-transforms.json
 ```
 
-五轮评测：
+六轮评测：
 
 1. **retrieval** — 用 `data/retrieval_benchmark.json`（24 topic × 3 查询变体 = 72 对，含精确术语 / 同义改写 / 跨语言 EN↔ZH + 负例），
    真实 embedding 索引人工标注 story 语料，度量 recall@1/3/5、precision@k、MRR、负例特异性，并判定是否达 recall@3≥70%。
@@ -345,7 +561,7 @@ python -m storybook.graph_eval --stories 10000 --repeats 200 \
 合并正确率 85.7%（`dup-docker-dns` sim 0.83 落在 0.85 阈值下方被误判为 create，阈值敏感性显示 0.82 可达 100%）；
 分裂结构正确率 100%。`tests/test_eval.py` 用确定性 mock 覆盖评测逻辑本身，无需 Ollama。
 
-## 📈 查询性能基线与本地诊断
+## 查询性能基线与本地诊断 / Performance
 
 日常查询会自动记录无内容诊断。查看最近 100 次查询：
 
@@ -383,7 +599,7 @@ book admin benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 - `results` / `no_match`：正常向量或缓存路径；`no_match` 才表示已完成正常检索但没有相关记忆。
 - `degraded_results` / `degraded_empty` / `degraded_unavailable`：降级命中、降级空结果、降级自身不可用；这些状态不应被解释为已确认“没有相关记忆”。
 
-## 🛠 CLI 命令总览（FLO-180 信息架构）
+## CLI 命令总览 / CLI Reference
 
 `book` 是 canonical 入口（`storybook` 是同名兼容 alias，二者安装时都会生成）。
 高频任务放在顶层，低频能力归入分组；主要任务不超过两层：
@@ -424,7 +640,9 @@ book admin benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 旧 `storybook init` 在兼容期只做数据库初始化（不进入交互向导），低层 canonical 入口为
 `book admin init-db`。计划在下一个 minor release 移除上述全部兼容 alias。
 
-## 🚀 使用
+---
+
+## 使用 / Usage
 
 ```bash
 book init                            # 初始化向导：Profile/模型/Agent/schedule/smoke（其它命令也会自动初始化）
@@ -493,7 +711,7 @@ book search "如何调试数据库连接"          # 搜一下
 book status                             # 看看沉淀了多少 Story / 状态
 ```
 
-## 🌙 做梦周期自动化
+## 做梦周期自动化 / Automation
 
 「做梦」无需手动触发。三种自动化入口（均复用同一把文件锁，互不重叠；运行日志落当前 Profile 日志目录的 `dream.log`）：
 
@@ -543,7 +761,7 @@ journalctl --user -u storybook-dream.service -f
 
 所有做梦周期入口（`book run` / `--watch` / `--once` / `--daemon`，及兼容期 `process` / `dream`）共用当前 Profile 数据库目录下的 `dream.lock` 文件锁（`fcntl.flock` 非阻塞）。不同 Profile 互不阻塞；同一 Profile 已有周期在跑时，新触发立即跳过、不重复执行。进程崩溃时 OS 自动释放锁，无 stale-pid 问题。
 
-## 🔌 MCP 接入（供 agent 运行时召回）
+## MCP 接入 / MCP
 
 > 项目北极星是 **agent 跨 session 经验复用**。仅靠人工 `book search` 无法让 agent 在运行时自动召回；MCP server 把检索暴露为工具后，Claude Code 等 MCP-aware agent 可在新任务中主动查询记忆库。
 
@@ -594,19 +812,19 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/book mcp
 | `recall` | `query`（必填）, `top_k?`（默认 3）, `context?`, `scope?`（`profile\|strict`）, `graph_enabled?` | 返回直接/图扩散命中；图命中含 `seed_story_id/graph_path/score_components`，顶层 `truncated` 表示图预算安全截断 |
 | `get_story` | `story_id`（必填） | 查看完整 `detail/sources/revisions` 与兼容 `title/content/version`，不返回原始 embedding 向量 |
 | `stats` | - | 记忆库概况（会话/Story/关联边数量） |
-| `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / embedding API 不可用），**不报错、静默不注入**。详见下文「🌅 会话启动注入」 |
+| `prime_context` | `cwd?`, `first_prompt?`, `top_k?`（默认 5） | 会话启动主动注入（晨间简报）：基于 cwd + 首条提问召回并生成 ≤2k token 的精简摘要，返回 `{cwd,query,count,injected,briefing,matches,truncated,note}`。`injected=false` 时 `briefing` 为空（无相关记忆 / 相关度不足 / embedding API 不可用），**不报错、静默不注入**。详见下文「会话启动注入」 |
 
 ### 说明
 
 - server、CLI、Claude/Cursor collector 和 Codex 等 MCP 客户端都经 Profile registry 共享同一数据目录（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
 - `recall` 复用 CLI `search` 的全部语义；命中记忆的 `access_count` 自增、共同召回边权提权会进入后台反馈队列，不阻塞查询响应。
 - `recall` 优先使用配置的 embedding API 生成查询向量；API 不可用或超时时返回显式 degraded 状态和 FTS/关键词可用结果，不抛出伪装成“无匹配”的环境错误。`get_story` / `stats` 不依赖 embedding API。
-- `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**--embedding API 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
+- `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**——embedding API 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
 - server 启动时自动 `init_db`：全新环境下 `recall` 返回空、`stats` 返回 0、`get_story` 报不存在、`prime_context` 返回 `injected=false`。
 
-## 🌅 会话启动注入（晨间简报 / 上下文预热）
+## 会话启动注入 / Session-start Injection
 
-> 仅暴露 `recall` 等 MCP 工具仍需 agent **主动**调用。更进一步：新会话开始时，基于 cwd / 首条提问**主动 surface** 最相关 story 注入上下文，实现"下意识回忆"--更贴近项目初衷（人脑处理事项时自动想起相关经历）。
+> 仅暴露 `recall` 等 MCP 工具仍需 agent **主动**调用。更进一步：新会话开始时，基于 cwd / 首条提问**主动 surface** 最相关 story 注入上下文，实现"下意识回忆"——更贴近项目初衷（人脑处理事项时自动想起相关经历）。
 
 `prime_context` 与 `book prime` 共享 `src/storybook/prime.py` 的召回 + 预算控制逻辑，**复用 `search.search`**，不重复实现检索。两条触发路径：
 
@@ -662,7 +880,7 @@ book prime --cwd "$PWD" --prompt "你的首条提问" --format json
 
 ### 方式二：MCP `prime_context` 工具（agent 主动调用）
 
-已启用 MCP server（见上文「🔌 MCP 接入」）后，agent 可在读到用户首条提问后调用 `prime_context`，传入自身 cwd 与首条提问，拿回 `briefing` 呈现给用户。适合"提问已到、但想强化主动回忆"的场景，或非 Claude Code 的 MCP-aware agent。
+已启用 MCP server（见上文「MCP 接入」）后，agent 可在读到用户首条提问后调用 `prime_context`，传入自身 cwd 与首条提问，拿回 `briefing` 呈现给用户。适合"提问已到、但想强化主动回忆"的场景，或非 Claude Code 的 MCP-aware agent。
 
 ```python
 prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_k=5)
@@ -682,8 +900,9 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 （来自本地 Storybook 记忆库；调用 recall / get_story 可查看详情。不相关可忽略。）
 ```
 
+---
 
-## ⚙️ 配置
+## 配置 / Configuration
 
 所有路径、模型名、阈值都集中在 `src/storybook/config.py`。环境变量样例见 `.env.example`。生成式 LLM 配置按“进程环境变量 > `STORYBOOK_LLM_ENV_FILE` > 项目 `.env` > 默认值”解析；文件只读取简单 `export KEY=value`/`KEY=value` 文本，绝不 `source` 或执行。未指定文件时默认发现 `~/.chrc/dpsk.sh`，不存在则静默跳过，适用于 launchd 等无 shell 环境。
 
@@ -744,7 +963,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 
 记忆形成 LLM 使用 temp 0.3、调用方既有 `max_tokens` 上限与 120s 超时；`extract_keywords`、Story v2 formation、`summarize_session`、`merge_stories`、`judge_split`、`split_story` 与 query transformation 均通过 DeepSeek Anthropic-compatible 的强制命名 tool call + `input_schema` 返回结构化对象，并在本地再次校验类型。旧网关的 JSON 文本仍可兼容解析；401/402/429/5xx、超时、schema 不匹配或空内容均保持原有业务 fallback。
 
-## 📁 项目结构
+## 项目结构 / Project Structure
 
 ```
 storybook/
@@ -753,36 +972,51 @@ storybook/
 │   ├── config.py       # 路径 / 模型 / 阈值常量
 │   ├── context.py      # ContextEnvelope 采集、隐私归一与环境适配评分
 │   ├── profiles.py     # 用户级 registry、平台目录、local/isolated Profile
-│   ├── collector.py    # 会话采集（Claude Code / Cursor / JSON / 模拟）
+│   ├── collector.py    # 会话采集（Claude Code / Cursor / Codex / JSON / 模拟）
+│   ├── history_adapters/  # 各 Agent 历史格式适配器（Claude/Cursor/Codex/Gemini/Cline）
 │   ├── store.py        # SQLite + sqlite-vec 存储层
 │   ├── processor.py    # 做梦周期（dream cycle）
 │   ├── llm.py          # DeepSeek Anthropic-compatible Messages API
 │   ├── embeddings.py   # 统一 embedding API 与 Ollama/OpenAI-compatible adapter
 │   ├── search.py       # 版本化缓存 + 向量/词法降级 + 关联激活
+│   ├── adaptive.py     # Fast/Auto/Deep 模式、门控、变换融合、本地 reranker
+│   ├── graph.py        # Memory Graph 有界扩散
 │   ├── query_cache.py  # index_version 隔离的向量/结果 LRU+TTL 缓存
+│   ├── inference_cache.py # Profile 私有 LLM/embedding 输入哈希缓存
 │   ├── feedback.py     # access_count/边权异步反馈队列
 │   ├── performance.py  # 隐私安全的查询诊断 JSONL + 最近窗口汇总
 │   ├── perf_benchmark.py # 固定数据集 warm/cold 性能与质量基准
+│   ├── graph_eval.py   # Memory Graph 离线评测
+│   ├── story_v2.py     # Story v2 形成/合并/分裂
+│   ├── memory_events.py # create/update/merge/split/delete 审计事件
+│   ├── identifiers.py  # UUIDv7 全局 ID
+│   ├── model_config.py # 混合 provider model-config
+│   ├── setup_manager.py / setup_adapters/  # 一键 setup/卸载与 Agent 接入
+│   ├── migration.py    # v1 → v2 安全迁移与回滚
 │   ├── dreamd.py       # 做梦周期自动化（锁 / 监听 / 定时守护 / 日志）
 │   ├── prime.py        # 会话启动主动注入（晨间简报，复用 search）
+│   ├── health.py       # book doctor 环境/一致性自检
+│   ├── eval/           # 检索/加工/分裂/消融评测 runner 与 metrics
 │   └── mcp_server.py   # MCP server（recall / get_story / stats / prime_context）
 ├── data/               # benchmark/报告等仓库资源（不再存运行时主数据库）
 ├── scripts/            # launchd plist 模板 + install_launchd.sh + systemd 单元模板
 ├── docs/TECH_DESIGN.md # 原始设计文档
+├── docs/AGENT_HISTORY_ADAPTERS.md  # Agent 历史格式支持矩阵
 ├── tests/              # pytest 测试套件（store/processor/search/dreamd + 集成，全 mock provider）
 ├── test_logs/          # 示例 JSON 数据
 ├── hermes_sessions.json
+├── install.sh          # 一键安装器
 ├── .env.example
 └── pyproject.toml
 ```
 
-## 📝 说明
+## 说明 / Notes
 
 - **隐私边界**：Profile、数据库与原始证据留在本机；本地 Ollama preset 不发送文本离机，远程 embedding/generation API 会接收各自请求文本并在 setup/status 中披露；Fast 查询不调用生成式 LLM。
-- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖真实 provider（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
-- **MCP server**：`book mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「🔌 MCP 接入」）。
-- **晨间简报**：`book prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / embedding API 不可用时静默不注入（见上文「🌅 会话启动注入」）。
-- `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「🧪 测试」与「🌙 做梦周期自动化」）。
+- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖真实 provider（见上文「测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
+- **MCP server**：`book mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「MCP 接入」）。
+- **晨间简报**：`book prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / embedding API 不可用时静默不注入（见上文「会话启动注入」）。
+- `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「测试」与「做梦周期自动化」）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 
 ## License
