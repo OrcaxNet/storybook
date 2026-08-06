@@ -3,9 +3,9 @@
 
 三类自动化入口（均复用 :func:`run_dream_cycle_once`，受同一把文件锁保护，互不重叠）：
 
-- ``storybook process --watch``  : 反应式监听。轮询启用来源，发现新会话即触发加工（长驻）。
-- ``storybook dream --once``     : 单次完整做梦周期（采集 + 加工）后退出；launchd 定时任务用此入口。
-- ``storybook dream``            : 定时守护进程（非 macOS 兜底）。每 ``DREAM_INTERVAL`` 秒跑一次周期。
+- ``book run --watch``           : 反应式监听。轮询启用来源，发现新会话即触发加工（长驻）。
+- ``book run --once``            : 单次完整做梦周期（采集 + 加工）后退出；launchd 定时任务用此入口。
+- ``book run --daemon``          : 定时守护进程（非 macOS 兜底）。每 ``DREAM_INTERVAL`` 秒跑一次周期。
 
 并发保护用 ``fcntl.flock``（非阻塞）锁住 ``dream.lock``；锁与数据库同目录，故测试中随
 ``config.DB_PATH`` 重定向而隔离。无 ``fcntl`` 的平台（如 Windows）回退到 pid 文件 + 存活探测。

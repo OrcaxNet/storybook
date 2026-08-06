@@ -383,7 +383,7 @@ class ProfileRegistry:
     def peek_active_profile(self) -> Profile | None:
         """只读返回当前 Profile；registry 不存在时不创建任何文件。
 
-        ``storybook setup --dry-run`` 必须做到零写入，因此配置模块导入阶段不能
+        ``book init --dry-run`` 必须做到零写入，因此配置模块导入阶段不能
         隐式调用 :meth:`ensure`。普通命令仍通过 :meth:`active_profile` 保持原有的
         首次使用自动初始化行为。
         """

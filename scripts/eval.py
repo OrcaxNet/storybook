@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """独立评测入口：``python scripts/eval.py [all|retrieval|processing|split|ablation|strategy]``
 
-等价于 ``storybook eval``，便于在未做 editable 安装时直接运行
+等价于 ``book admin eval``，便于在未做 editable 安装时直接运行
 （自动把 src/ 加入 sys.path）。需要配置的 embedding API 可用。
 """
 from __future__ import annotations

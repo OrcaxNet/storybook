@@ -142,4 +142,4 @@ def test_doctor_rejects_api_dimension_that_differs_from_serving_index(
     output = capsys.readouterr().out
     assert "reason=serving_index_mismatch" in output
     assert "dimension active=4 api=2" in output
-    assert "embedding-backfill" in output
+    assert "book admin index" in output

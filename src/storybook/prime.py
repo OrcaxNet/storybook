@@ -6,7 +6,7 @@
 
 两条触发路径共享本模块的召回 + 预算控制逻辑（都不重复实现检索，复用 ``search.search``）：
 
-  - Claude Code ``SessionStart`` hook -> ``storybook prime`` CLI（hook 友好的纯文本输出，
+  - Claude Code ``SessionStart`` hook -> ``book prime`` CLI（hook 友好的纯文本输出，
     写到 stdout 即被注入为额外上下文；无输出即不注入）。
   - MCP server ``prime_context(cwd, first_prompt?)`` 工具 -> agent 在读到用户首条提问后
     主动调用，拿回结构化简报自行呈现。
@@ -291,8 +291,8 @@ def prime_context(
         )
     except Exception as e:  # noqa: BLE001  -- schema 未初始化 / DB 锁等：晨间简报须非侵入
         base["note"] = (
-            f"召回异常：{e}。可能数据库未初始化，请运行 `storybook init`；"
-            f"或运行 `storybook doctor` 排查。"
+            f"召回异常：{e}。可能数据库未初始化，请运行 `book init`；"
+            f"或运行 `book doctor` 排查。"
         )
         return base
 
@@ -300,7 +300,7 @@ def prime_context(
         # embedding 不可用等环境问题：晨间简报须非侵入，静默不注入并记 note 供排查
         base["note"] = (
             f"召回失败：{result['error']}。请确认 embedding API 与模型"
-            f"（{config.EMBED_MODEL}）可用，可运行 `storybook doctor` 排查。"
+            f"（{config.EMBED_MODEL}）可用，可运行 `book doctor` 排查。"
         )
         return base
 
@@ -308,7 +308,7 @@ def prime_context(
         reason = result.get("degraded_reason") or "embedding_unavailable"
         base["note"] = (
             f"召回已降级（{reason}），关键词 fallback 未命中；"
-            f"这不等同于确认无相关记忆。可运行 `storybook doctor` 排查。"
+            f"这不等同于确认无相关记忆。可运行 `book doctor` 排查。"
         )
         return base
 

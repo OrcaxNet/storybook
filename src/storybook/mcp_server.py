@@ -12,7 +12,7 @@
                                   ≤2k token 的精简摘要，相关度不足时静默不注入
 
 启动方式（二选一，均为独立进程，不依赖 CLI 运行态）：
-  storybook mcp                   # 经 CLI 入口
+  book mcp                        # 经 CLI 入口
   python -m storybook.mcp_server  # 直接跑模块（editable 安装后即可）
 
 MCP SDK 保持延迟导入，便于核心逻辑隔离测试；v0.2 起已是基础安装依赖。
@@ -36,7 +36,7 @@ def _ensure_db() -> None:
     """启动时确保 schema 存在（best-effort）。
 
     失败仅记录日志，不阻断启动：工具调用时会按各自路径报错并给出可操作提示。
-    这样在全新环境（尚未 ``storybook init``）下 server 仍可启动，
+    这样在全新环境（尚未 ``book init``）下 server 仍可启动，
     ``recall`` 返回空、``stats`` 返回 0、``get_story`` 报不存在。
     """
     try:
@@ -215,7 +215,7 @@ def get_story_detail(story_id: int) -> dict:
 def get_stats_overview() -> dict:
     """记忆库概况。复用 ``store.get_stats``。
 
-    全 0 通常表示记忆库为空（先 ``storybook import-data`` + ``storybook process``
+    全 0 通常表示记忆库为空（先 ``book run``
     沉淀记忆）。schema 未初始化时返回 0 值 + ``note``，不抛错。
     """
     try:
@@ -229,7 +229,7 @@ def get_stats_overview() -> dict:
             "edges": 0,
             "root_stories": 0,
             "child_stories": 0,
-            "note": f"读取统计失败：{e}。可能数据库未初始化，请运行 `storybook init`。",
+            "note": f"读取统计失败：{e}。可能数据库未初始化，请运行 `book init`。",
         }
 
 
@@ -280,7 +280,7 @@ def create_server():
         在开始一项新任务前调用，复用过往相似经历。返回 count 表示命中数；
         count=0 表示无相关记忆，应直接继续而非反复重试。related 仅含摘要，
         需要某条关联的全文请用 get_story。embedding 不可用或超时时返回
-        degraded 状态与词法 fallback；可用 `storybook doctor` 排查环境。
+        degraded 状态与词法 fallback；可用 `book doctor` 排查环境。
 
         Args:
             query: 自然语言查询，描述当前任务或问题。
@@ -320,7 +320,7 @@ def create_server():
         """查看记忆库概况（会话/Story/关联边数量）。
 
         全 0 通常意味着记忆库为空，需先导入并加工会话
-        （`storybook import-data` + `storybook process`）。
+        （`book run`）。
         """
         return get_stats_overview()
 

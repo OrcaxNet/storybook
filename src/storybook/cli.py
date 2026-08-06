@@ -1,37 +1,27 @@
 """
-CLI 入口 — storybook 命令
+CLI 入口 — canonical ``book`` 命令（兼容 alias：``storybook``）
 
-用法:
-  storybook init                    初始化数据库
-  storybook setup                   一键检测环境、接入 Agent 并运行 smoke test
-  storybook uninstall               恢复 setup 写入的配置（默认保留记忆）
-  storybook profile show|list       查看用户级 Profile
-  storybook profile create|switch   创建隔离 Profile / 切换当前 Profile
-  storybook sync status             查看本地同步状态（v0.2 为 local-only）
-  storybook migration discover      发现旧项目级 v1 数据库
-  storybook migration run PATH      安全迁移到用户级 Story v2
-  storybook migration rollback ID   原子回滚到保留的 v1 数据库副本
-  storybook doctor [--fix]          环境与健康自检（--fix 修复向量双写不一致）
-  storybook import <path>           导入会话日志(JSON)
-  storybook import                  从 Claude Code 采集（默认数据源）
-  storybook import --claude         从 Claude Code 采集（同上，显式写法）
-  storybook import --cursor         从 Cursor 自动采集（备用，未用 Cursor 可忽略）
-  storybook import --sample [N]     生成N条模拟数据(默认100)
-  storybook process                 处理所有pending会话(做梦)
-  storybook process --session ID    处理指定会话
-  storybook process --watch         监听全部已启用来源，有新会话自动加工（长驻）
-  storybook dream --once            跑一次完整做梦周期（采集+加工）后退出；launchd 入口
-  storybook dream                   定时守护进程（非 macOS 兜底，每 DREAM_INTERVAL 秒一轮）
-  storybook search <query>          搜索记忆
-  storybook search <query> --json   输出结构化搜索结果
-  storybook status --performance    最近查询性能摘要
-  storybook benchmark               10k Story warm/cold 查询基准
-  storybook embedding-backfill      增量构建并切换 embedding 版本
-  storybook stats                   查看统计
-  storybook list                    列出所有story
-  storybook show <story_id>         查看story详情
-  storybook prime [--cwd PATH]      会话启动主动注入（晨间简报），供 SessionStart hook 调用
-  storybook mcp                     启动 MCP server（stdio，供 Claude Code 等 agent 召回）
+Canonical 信息架构（FLO-180）:
+
+  高频任务:
+    book init                   交互式初始化向导（Profile → 模型 → Agent → schedule → smoke）
+    book doctor [--fix]         环境与健康自检（--fix 修复向量双写不一致）
+    book run [模式]             采集并形成记忆（默认 / --once / --watch / --daemon / --session）
+    book search <query>         搜索记忆
+    book status [--performance] 本地运行状态与可选查询性能摘要
+    book mcp                    启动 MCP server（stdio，供 Claude Code 等 agent 召回）
+
+  分组:
+    book memory list|show|forget    记忆管理
+    book source list|enable|disable|reset   本机 Agent 历史来源管理
+    book profile list|show|create|switch    用户级 Profile
+    book admin init-db|migration|index|benchmark|eval|uninstall   低频维护
+
+  兼容 alias（默认从 help 隐藏，保留一个 minor release 后移除）:
+    ``storybook``（executable 别名）、``setup``、``process``、``dream``、
+    ``import-data``、``sources``、顶层 ``list/show/forget/stats``；
+    以及内部/hook 入口 ``sync``、``prime``。
+    兼容提示只写 stderr，绝不污染 JSON / MCP stdout 协议。
 """
 import json
 import logging
@@ -72,11 +62,57 @@ def setup_logging(verbose: bool = False):
     )
 
 
+def _legacy_alias_hint(canonical: str) -> None:
+    """隐藏兼容 alias 的 stderr 提示；绝不写入 stdout（JSON/MCP 协议纯净）。"""
+    click.echo(
+        "提示: 本命令为兼容 alias，将在一个 minor release 后移除；"
+        f"请使用 `book {canonical}`。",
+        err=True,
+    )
+
+
+def _legacy_executable_hint(ctx: click.Context) -> None:
+    """经 ``storybook`` executable 调用时输出 stderr 提示；stdout 不受影响。"""
+    if ctx.find_root().info_name == "storybook":
+        click.echo(
+            "提示: `storybook` 为兼容入口，将在一个 minor release 后移除；"
+            "请使用 `book`。",
+            err=True,
+        )
+
+
 @click.group()
 @click.option("--verbose", "-v", is_flag=True, help="详细日志")
-def cli(verbose):
-    """🧠 Storybook - 离线 Coding 记忆系统"""
+@click.pass_context
+def cli(ctx, verbose):
+    """🧠 Storybook - 离线 Coding 记忆系统
+
+    \b
+    高频任务:  init / doctor / run / search / status / mcp
+    分组:       memory / source / profile / admin
+    """
     setup_logging(verbose)
+    _legacy_executable_hint(ctx)
+
+
+@cli.group(name="memory")
+def memory_group():
+    """🧠 记忆管理（list / show / forget）。"""
+
+
+@cli.group(name="source")
+def source_group():
+    """🔌 管理本机 Agent 历史来源（list / enable / disable / reset）。"""
+
+
+@cli.group(name="admin")
+def admin_group():
+    """🔧 低频维护命令（init-db / migration / index / benchmark / eval / uninstall）。"""
+
+
+@admin_group.group(name="migration")
+def migration_group():
+    """🧳 发现、迁移和回滚旧项目级数据库。"""
 
 
 def _emit_setup_error(exc: SetupError, *, as_json: bool) -> None:
@@ -127,7 +163,7 @@ def _print_setup_plan(plan: dict) -> None:
         click.echo("  Legacy    found; migration is not automatic:")
         for path in plan["legacy_databases"]:
             click.echo(f"            {path}")
-        click.echo("            run: storybook migration run <path> --dry-run")
+        click.echo("            run: book admin migration run <path> --dry-run")
 
 
 @cli.command(name="setup", hidden=True)
@@ -168,6 +204,7 @@ def setup_command(
     enable_schedule, skip_models,
 ):
     """兼容 alias；canonical onboarding 命令为 ``book init``。"""
+    _legacy_alias_hint("init")
 
     return _run_onboarding(
         assume_yes=assume_yes,
@@ -445,7 +482,7 @@ def _run_onboarding(
         click.echo("\nRecall smoke is degraded. Run: book doctor")
 
 
-@cli.command(name="uninstall")
+@admin_group.command(name="uninstall")
 @click.option("--yes", "assume_yes", is_flag=True, help="非交互确认卸载")
 @click.option("--dry-run", is_flag=True, help="只展示卸载计划")
 @click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
@@ -456,7 +493,7 @@ def _run_onboarding(
     help="非交互 purge 的第二重显式确认；必须与 --purge-data 同用",
 )
 def uninstall_command(assume_yes, dry_run, as_json, purge_data, confirm_purge):
-    """恢复 setup 管理的配置；默认 keep-data。"""
+    """恢复 setup 管理的配置；默认 keep-data（低频维护，归入 admin 分组）。"""
 
     manager = SetupManager()
     plan = {
@@ -628,7 +665,7 @@ def profile_switch(profile_ref):
     click.echo(f"   数据目录: {config.DATA_DIR}")
 
 
-@cli.group()
+@cli.group(hidden=True)
 def sync():
     """🔄 查看同步状态（v0.2 仅提供 local-only 边界）。"""
 
@@ -662,11 +699,6 @@ def _emit_migration_error(exc: MigrationError, *, as_json: bool) -> None:
         raise click.exceptions.Exit(1)
     hint = f"\n修复建议: {exc.hint}" if exc.hint else ""
     raise click.ClickException(f"[{exc.code}] {exc}{hint}") from exc
-
-
-@cli.group(name="migration")
-def migration_group():
-    """🧳 发现、迁移和回滚旧项目级数据库。"""
 
 
 @migration_group.command(name="discover")
@@ -705,7 +737,7 @@ def migration_run(source, dry_run, as_json):
             exc = MigrationError(
                 "SB_MIGRATION_SOURCE_REQUIRED",
                 f"自动发现 {len(found)} 个候选库，无法唯一选择",
-                hint="显式传入 storybook migration run <memory.db>",
+                hint="显式传入 book admin migration run <memory.db>",
             )
             _emit_migration_error(exc, as_json=as_json)
             return
@@ -876,11 +908,6 @@ def init_command(
     )
 
 
-@cli.group(name="admin")
-def admin_group():
-    """Low-level maintenance commands."""
-
-
 @admin_group.command(name="init-db")
 def admin_init_db():
     """Initialize the active Profile database."""
@@ -907,13 +934,13 @@ def mcp():
     实现"跨 session 经验复用"。server 为独立进程，不依赖 CLI 运行态。
 
     MCP runtime 已包含在基础安装中；Claude Code/Cursor/Codex 可由
-    ``storybook setup`` 自动接入。
+    ``book init`` 自动接入。
     """
     from . import mcp_server
     mcp_server.main()
 
 
-@cli.command()
+@cli.command(hidden=True)
 @click.option("--cwd", default=None,
               help="当前项目目录（默认取进程 cwd；hook 中传 $CLAUDE_PROJECT_DIR）")
 @click.option("--prompt", "first_prompt", default="",
@@ -934,11 +961,11 @@ def prime(cwd, first_prompt, top_k, token_budget, output_format):
 
     \b
     Hook 用法（默认 text 输出到 stdout，被 Claude Code 作为额外上下文注入）:
-      storybook prime --cwd "$CLAUDE_PROJECT_DIR"
+      book prime --cwd "$CLAUDE_PROJECT_DIR"
 
     \b
     结构化注入（支持 hookSpecificOutput 的 Claude Code 版本）:
-      storybook prime --cwd "$CLAUDE_PROJECT_DIR" --format hook
+      book prime --cwd "$CLAUDE_PROJECT_DIR" --format hook
 
     详见 README「🌅 会话启动注入」一节。
     """
@@ -990,10 +1017,10 @@ def prime(cwd, first_prompt, top_k, token_budget, output_format):
         click.echo(briefing)
     # note（环境问题等）只进 stderr，不进上下文，避免污染
     if result.get("note"):
-        click.echo(f"[storybook prime] {result['note']}", err=True)
+        click.echo(f"[book prime] {result['note']}", err=True)
 
 
-@cli.command()
+@cli.command(name="import-data", hidden=True)
 @click.argument("path", required=False)
 @click.option("--claude", is_flag=True, help="从 Claude Code 采集")
 @click.option("--cursor", is_flag=True, help="从 Cursor 自动采集")
@@ -1007,7 +1034,8 @@ def prime(cwd, first_prompt, top_k, token_budget, output_format):
 @click.option("--n", default=100, help="模拟数据数量(配合--sample)")
 @click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON summary")
 def import_data(path, claude, cursor, codex, source, sample, n, as_json):
-    """导入会话日志"""
+    """兼容 alias；canonical 自动采集入口为 ``book run``。"""
+    _legacy_alias_hint("run")
     store.init_db()
 
     selectors = [bool(path), claude, cursor, codex, bool(source), sample]
@@ -1108,14 +1136,7 @@ def import_data(path, claude, cursor, codex, source, sample, n, as_json):
             )
 
 
-@cli.group(name="sources")
-def sources_group():
-    """管理本机 Agent 历史来源。"""
-
-
-@sources_group.command(name="list")
-@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
-def sources_list(as_json):
+def _source_list_impl(as_json: bool) -> None:
     """显示来源检测、启用、版本和最近导入状态。"""
     store.init_db()
     items = source_manager.list_sources()
@@ -1130,24 +1151,17 @@ def sources_list(as_json):
         )
 
 
-@sources_group.command(name="enable")
-@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
-def sources_enable(name):
+def _source_enable_impl(name: str) -> None:
     source_manager.set_enabled(name, True)
     click.echo(f"enabled: {name}")
 
 
-@sources_group.command(name="disable")
-@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
-def sources_disable(name):
+def _source_disable_impl(name: str) -> None:
     source_manager.set_enabled(name, False)
     click.echo(f"disabled: {name}")
 
 
-@sources_group.command(name="reset-checkpoint")
-@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
-@click.option("--yes", is_flag=True, help="确认删除来源 checkpoint")
-def sources_reset_checkpoint(name, yes):
+def _source_reset_impl(name: str, yes: bool) -> None:
     if not yes:
         raise click.UsageError("重置 checkpoint 需要 --yes")
     store.init_db()
@@ -1155,98 +1169,150 @@ def sources_reset_checkpoint(name, yes):
     click.echo(f"reset {count} checkpoint(s): {name}")
 
 
-@cli.command(name="process")
-@click.option("--session", "-s", type=int, help="处理指定会话ID")
-@click.option("--watch", is_flag=True,
-              help="监听模式：轮询已启用来源，有新会话自动加工（长驻，Ctrl-C 退出）")
-@click.option("--interval", default=None, type=int,
-              help="--watch 轮询间隔（秒），默认读 config.WATCH_POLL_INTERVAL（60）")
-@click.option("--source", type=click.Choice(source_manager.SOURCE_NAMES), help="只监听指定来源")
-def process_cmd(session, watch, interval, source):
-    """🌙 处理会话(做梦)
+@source_group.command(name="list")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+def source_list(as_json):
+    """显示来源检测、启用、版本和最近导入状态。"""
+    _source_list_impl(as_json)
 
-    不带 flag：加工所有 pending 会话（受并发锁保护，与 --watch / launchd 互不重叠）。
-    --watch：长驻监听，发现已启用来源的新会话即自动采集 + 加工。
-    """
-    store.init_db()
 
-    if watch:
-        dreamd.setup_dream_logging()
-        stop = threading.Event()
-        dreamd.install_signal_handlers(stop)
-        poll = interval if interval is not None else config.WATCH_POLL_INTERVAL
-        scope = source or "all enabled sources"
-        click.echo(f"🌙 监听模式启动：每 {poll}s 轮询 {scope}（Ctrl-C 退出）")
-        dreamd.watch_loop(
-            poll_interval=poll,
-            stop_event=stop,
-            verbose=True,
-            sources=[source] if source else None,
+@source_group.command(name="enable")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+def source_enable(name):
+    source_manager.set_enabled(name, True)
+    click.echo(f"enabled: {name}")
+
+
+@source_group.command(name="disable")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+def source_disable(name):
+    source_manager.set_enabled(name, False)
+    click.echo(f"disabled: {name}")
+
+
+@source_group.command(name="reset")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+@click.option("--yes", is_flag=True, help="确认删除来源 checkpoint")
+def source_reset(name, yes):
+    _source_reset_impl(name, yes)
+
+
+@cli.group(name="sources", hidden=True)
+def sources_alias_group():
+    """兼容 alias；canonical 入口为 ``book source``。"""
+
+
+@sources_alias_group.command(name="list")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON")
+def sources_list(as_json):
+    """兼容 alias；canonical 入口为 ``book source list``。"""
+    _legacy_alias_hint("source list")
+    _source_list_impl(as_json)
+
+
+@sources_alias_group.command(name="enable")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+def sources_enable(name):
+    """兼容 alias；canonical 入口为 ``book source enable``。"""
+    _legacy_alias_hint("source enable")
+    _source_enable_impl(name)
+
+
+@sources_alias_group.command(name="disable")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+def sources_disable(name):
+    """兼容 alias；canonical 入口为 ``book source disable``。"""
+    _legacy_alias_hint("source disable")
+    _source_disable_impl(name)
+
+
+@sources_alias_group.command(name="reset-checkpoint")
+@click.argument("name", type=click.Choice(source_manager.SOURCE_NAMES))
+@click.option("--yes", is_flag=True, help="确认删除来源 checkpoint")
+def sources_reset_checkpoint(name, yes):
+    """兼容 alias；canonical 入口为 ``book source reset``。"""
+    _legacy_alias_hint("source reset")
+    _source_reset_impl(name, yes)
+
+
+def _resolve_run_mode(once, watch, daemon, session):
+    """解析互斥的 run 模式；冲突组合 fail-fast。"""
+    long_running = [bool(watch), bool(daemon), session is not None]
+    if sum(long_running) > 1:
+        raise click.UsageError(
+            "--watch / --daemon / --session 互斥：只能选择一种模式"
         )
-        return
+    if once and (watch or daemon):
+        raise click.UsageError("--once 不能与 --watch / --daemon 同用")
+    if watch:
+        return "watch"
+    if daemon:
+        return "daemon"
+    if session is not None:
+        return "session"
+    return "once"
 
-    if session:
-        # 单会话加工同样受锁保护，避免与正在跑的全量周期撞车
-        try:
-            with dreamd.acquire_dream_lock(blocking=False):
-                click.echo(f"🔄 处理会话 #{session}...")
-                result = processor.process_session(session)
-                if result:
-                    click.echo(f"✅ 完成 -> story #{result}")
-                else:
-                    click.echo("❌ 处理失败")
-        except dreamd.DreamLockBusy:
-            click.echo("⏳ 另一个做梦周期正在运行，已跳过")
-        return
 
-    # 全量加工（不采集，仅处理 pending），走锁保护的统一路径
-    result = dreamd.run_dream_cycle_once(import_new=False, verbose=True)
+def _run_once(source, *, import_new: bool) -> None:
+    """单次周期（import_new=True 采集+加工；False 仅加工 pending）后退出。"""
+    dreamd.setup_dream_logging()
+    result = dreamd.run_dream_cycle_once(
+        import_new=import_new,
+        verbose=True,
+        sources=[source] if source else None,
+    )
     if result["status"] == "skipped":
         click.echo("⏳ 另一个做梦周期正在运行，已跳过")
-    elif result["total"] == 0:
+    elif result["total"] == 0 and not import_new:
         click.echo("✅ 没有待处理的会话")
-
-
-@cli.command()
-@click.option("--once", is_flag=True,
-              help="只跑一次完整做梦周期（采集+加工）后退出；launchd 定时任务用此入口")
-@click.option("--interval", default=None, type=int,
-              help="守护进程循环间隔（秒），默认读 config.DREAM_INTERVAL（14400 = 4 小时）")
-@click.option("--source", type=click.Choice(source_manager.SOURCE_NAMES), help="只处理指定来源")
-def dream(once, interval, source):
-    """🌙 做梦周期自动化：定时触发或文件监听，让记忆在后台自动整理。
-
-    --once：单次完整周期（采集启用来源 + 加工 pending）后退出。launchd / cron 调用此入口。
-    不带 --once：定时守护进程（非 macOS 兜底），每 interval 秒一轮，Ctrl-C / SIGTERM 退出。
-    """
-    store.init_db()
-    dreamd.setup_dream_logging()
-
-    if once:
-        result = dreamd.run_dream_cycle_once(
-            import_new=True,
-            verbose=True,
-            sources=[source] if source else None,
+    else:
+        click.echo(
+            f"🌙 做梦周期完成（{result['status']}）：新增 {result['imported']} 条，"
+            f"更新 {result.get('updated', 0)} 条，"
+            f"加工 {result['total']} 条（成功 {result['success']} / 失败 {result['failed']}），"
+            f"用时 {result['duration_s']}s"
         )
-        if result["status"] == "skipped":
-            click.echo("⏳ 另一个做梦周期正在运行，已跳过")
-        else:
-            click.echo(
-                f"🌙 做梦周期完成（{result['status']}）：新增 {result['imported']} 条，"
-                f"更新 {result.get('updated', 0)} 条，"
-                f"加工 {result['total']} 条（成功 {result['success']} / 失败 {result['failed']}），"
-                f"用时 {result['duration_s']}s"
-            )
-            for item in result.get("sources", []):
-                if item.get("detected") or item.get("status") == "degraded":
-                    click.echo(
-                        f"  {item['source']}: {item['status']} "
-                        f"imported={item.get('imported', 0)} "
-                        f"updated={item.get('updated', 0)} "
-                        f"invalid={item.get('invalid', 0)}"
-                    )
-        return
+        for item in result.get("sources", []):
+            if item.get("detected") or item.get("status") == "degraded":
+                click.echo(
+                    f"  {item['source']}: {item['status']} "
+                    f"imported={item.get('imported', 0)} "
+                    f"updated={item.get('updated', 0)} "
+                    f"invalid={item.get('invalid', 0)}"
+                )
 
+
+def _run_watch(source, interval) -> None:
+    dreamd.setup_dream_logging()
+    stop = threading.Event()
+    dreamd.install_signal_handlers(stop)
+    poll = interval if interval is not None else config.WATCH_POLL_INTERVAL
+    scope = source or "all enabled sources"
+    click.echo(f"🌙 监听模式启动：每 {poll}s 轮询 {scope}（Ctrl-C 退出）")
+    dreamd.watch_loop(
+        poll_interval=poll,
+        stop_event=stop,
+        verbose=True,
+        sources=[source] if source else None,
+    )
+
+
+def _run_session(session) -> None:
+    # 单会话加工同样受锁保护，避免与正在跑的全量周期撞车
+    try:
+        with dreamd.acquire_dream_lock(blocking=False):
+            click.echo(f"🔄 处理会话 #{session}...")
+            result = processor.process_session(session)
+            if result:
+                click.echo(f"✅ 完成 -> story #{result}")
+            else:
+                click.echo("❌ 处理失败")
+    except dreamd.DreamLockBusy:
+        click.echo("⏳ 另一个做梦周期正在运行，已跳过")
+
+
+def _run_daemon(source, interval) -> None:
+    dreamd.setup_dream_logging()
     stop = threading.Event()
     dreamd.install_signal_handlers(stop)
     iv = interval if interval is not None else config.DREAM_INTERVAL
@@ -1256,6 +1322,80 @@ def dream(once, interval, source):
         stop_event=stop,
         verbose=False,
         sources=[source] if source else None,
+    )
+
+
+def _run_command(*, once, watch, daemon, session, interval, source, import_new) -> None:
+    """统一 ``book run`` 及其 process / dream 兼容 alias 的实现。"""
+    store.init_db()
+    mode = _resolve_run_mode(once, watch, daemon, session)
+    if mode == "watch":
+        _run_watch(source, interval)
+    elif mode == "daemon":
+        _run_daemon(source, interval)
+    elif mode == "session":
+        _run_session(session)
+    else:
+        _run_once(source, import_new=import_new)
+
+
+@cli.command(name="run")
+@click.option("--once", is_flag=True,
+              help="只跑一次完整周期（采集+加工）后退出；launchd/cron 定时任务用此入口")
+@click.option("--watch", is_flag=True,
+              help="反应式监听：轮询已启用来源，发现新会话即自动采集 + 加工（长驻，Ctrl-C 退出）")
+@click.option("--daemon", is_flag=True,
+              help="定时守护循环：每 --interval 秒（默认 config.DREAM_INTERVAL=14400）跑一次完整周期")
+@click.option("--session", "-s", type=int, help="只加工指定 Session ID（单次）")
+@click.option("--interval", default=None, type=int,
+              help="--watch 轮询间隔或 --daemon 循环间隔（秒）")
+@click.option("--source", type=click.Choice(source_manager.SOURCE_NAMES), help="只处理指定来源")
+def run_cmd(once, watch, daemon, session, interval, source):
+    """🔄 采集并形成记忆（collect + process）。
+
+    \b
+    默认 / --once   单次完整周期：采集启用来源 + 加工 pending，然后退出
+    --watch         反应式监听已启用来源，发现新会话即自动采集 + 加工（长驻）
+    --daemon        定时守护循环，每 --interval 秒一轮（默认 4 小时）
+    --session ID    只加工指定 Session（单次）
+
+    \b
+    --watch / --daemon / --session 互斥；--once 仅与 --session 相容。
+    """
+    _run_command(
+        once=once, watch=watch, daemon=daemon, session=session,
+        interval=interval, source=source, import_new=True,
+    )
+
+
+@cli.command(name="process", hidden=True)
+@click.option("--session", "-s", type=int, help="处理指定会话ID")
+@click.option("--watch", is_flag=True,
+              help="监听模式：轮询已启用来源，有新会话自动加工（长驻，Ctrl-C 退出）")
+@click.option("--interval", default=None, type=int,
+              help="--watch 轮询间隔（秒），默认读 config.WATCH_POLL_INTERVAL（60）")
+@click.option("--source", type=click.Choice(source_manager.SOURCE_NAMES), help="只监听指定来源")
+def process_alias(session, watch, interval, source):
+    """兼容 alias；canonical 入口为 ``book run``。"""
+    _legacy_alias_hint("run")
+    _run_command(
+        once=False, watch=watch, daemon=False, session=session,
+        interval=interval, source=source, import_new=False,
+    )
+
+
+@cli.command(name="dream", hidden=True)
+@click.option("--once", is_flag=True,
+              help="只跑一次完整做梦周期（采集+加工）后退出；launchd 定时任务用此入口")
+@click.option("--interval", default=None, type=int,
+              help="守护进程循环间隔（秒），默认读 config.DREAM_INTERVAL（14400 = 4 小时）")
+@click.option("--source", type=click.Choice(source_manager.SOURCE_NAMES), help="只处理指定来源")
+def dream_alias(once, interval, source):
+    """兼容 alias；canonical 入口为 ``book run``。"""
+    _legacy_alias_hint("run --daemon")
+    _run_command(
+        once=once, watch=False, daemon=(not once), session=None,
+        interval=interval, source=source, import_new=True,
     )
 
 
@@ -1325,7 +1465,7 @@ def search(
     click.echo(output)
 
 
-@cli.command(name="embedding-backfill")
+@admin_group.command(name="index")
 @click.option("--model", default=None, help="目标 embedding API 模型")
 @click.option("--version", required=True, help="不可变的目标 embedding 版本")
 @click.option(
@@ -1338,8 +1478,8 @@ def search(
               show_default=True, help="本次最多处理的 Story 数；重复运行可续跑")
 @click.option("--no-activate", is_flag=True,
               help="即使 shadow 已完整也不切换 serving 索引")
-def embedding_backfill(model, version, representation, batch_size, no_activate):
-    """增量重建 embedding shadow，并在完整后原子切换 serving index。"""
+def admin_index(model, version, representation, batch_size, no_activate):
+    """增量重建 embedding shadow，并在完整后原子切换 serving index（低频维护）。"""
 
     store.init_db()
     result = embeddings.backfill(
@@ -1352,20 +1492,9 @@ def embedding_backfill(model, version, representation, batch_size, no_activate):
     click.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-@cli.command(name="forget")
-@click.option("--half-life-days", type=click.FloatRange(min=0.001), default=30.0,
-              show_default=True, help="访问计数指数衰减半衰期")
-@click.option("--max-access", type=click.IntRange(min=0), default=0,
-              show_default=True, help="衰减后可归档的最大访问计数")
-@click.option("--max-edge-weight", type=click.FloatRange(min=0.0), default=0.25,
-              show_default=True, help="可归档 Story 的最大关联边权")
-@click.option("--min-age-days", type=click.IntRange(min=0), default=90,
-              show_default=True, help="距离最近访问/更新的最短天数")
-@click.option("--apply", is_flag=True, help="执行归档；默认仅预览候选")
-@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
-def forget(half_life_days, max_access, max_edge_weight, min_age_days, apply, as_json):
+def _memory_forget_impl(half_life_days, max_access, max_edge_weight, min_age_days,
+                        apply, as_json):
     """衰减访问热度，并预览或归档低价值记忆。"""
-
     store.init_db()
     decay = store.decay_story_access_counts(half_life_days=half_life_days)
     archive = store.archive_low_value_stories(
@@ -1387,9 +1516,47 @@ def forget(half_life_days, max_access, max_edge_weight, min_age_days, apply, as_
         click.echo("确认后加 --apply 执行；归档保留 Story 与来源证据，但不再参与检索。")
 
 
-@cli.command()
+@memory_group.command(name="forget")
+@click.option("--half-life-days", type=click.FloatRange(min=0.001), default=30.0,
+              show_default=True, help="访问计数指数衰减半衰期")
+@click.option("--max-access", type=click.IntRange(min=0), default=0,
+              show_default=True, help="衰减后可归档的最大访问计数")
+@click.option("--max-edge-weight", type=click.FloatRange(min=0.0), default=0.25,
+              show_default=True, help="可归档 Story 的最大关联边权")
+@click.option("--min-age-days", type=click.IntRange(min=0), default=90,
+              show_default=True, help="距离最近访问/更新的最短天数")
+@click.option("--apply", is_flag=True, help="执行归档；默认仅预览候选")
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
+def memory_forget(half_life_days, max_access, max_edge_weight, min_age_days, apply, as_json):
+    """衰减访问热度，并预览或归档低价值记忆。"""
+    _memory_forget_impl(
+        half_life_days, max_access, max_edge_weight, min_age_days, apply, as_json
+    )
+
+
+@cli.command(name="forget", hidden=True)
+@click.option("--half-life-days", type=click.FloatRange(min=0.001), default=30.0,
+              show_default=True, help="访问计数指数衰减半衰期")
+@click.option("--max-access", type=click.IntRange(min=0), default=0,
+              show_default=True, help="衰减后可归档的最大访问计数")
+@click.option("--max-edge-weight", type=click.FloatRange(min=0.0), default=0.25,
+              show_default=True, help="可归档 Story 的最大关联边权")
+@click.option("--min-age-days", type=click.IntRange(min=0), default=90,
+              show_default=True, help="距离最近访问/更新的最短天数")
+@click.option("--apply", is_flag=True, help="执行归档；默认仅预览候选")
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
+def forget_alias(half_life_days, max_access, max_edge_weight, min_age_days, apply, as_json):
+    """兼容 alias；canonical 入口为 ``book memory forget``。"""
+    _legacy_alias_hint("memory forget")
+    _memory_forget_impl(
+        half_life_days, max_access, max_edge_weight, min_age_days, apply, as_json
+    )
+
+
+@cli.command(hidden=True)
 def stats():
-    """📊 系统统计"""
+    """兼容入口；运行状态已并入 ``book status``。"""
+    _legacy_alias_hint("status")
     store.init_db()
     s = store.get_stats()
     click.echo("\n📊 Storybook 记忆系统统计")
@@ -1469,14 +1636,12 @@ def status(include_performance, as_json):
         click.echo("Stage p95(ms)  " + " · ".join(stage_bits))
 
 
-@cli.command(name="list")
-@click.option("--limit", "-l", default=20, help="显示数量")
-def list_cmd(limit):
-    """📋 列出所有 Story"""
+def _memory_list_impl(limit: int) -> None:
+    """列出所有 Story。"""
     store.init_db()
     stories = store.get_all_stories()
     if not stories:
-        click.echo("暂无记忆。使用 storybook import-data --sample 导入测试数据。")
+        click.echo("暂无记忆。使用 `book run` 采集，或用 `storybook import-data --sample` 生成模拟数据。")
         return
 
     click.echo(f"\n📋 Story 记忆库 ({len(stories)} 条)\n")
@@ -1489,10 +1654,8 @@ def list_cmd(limit):
         click.echo("")
 
 
-@cli.command()
-@click.argument("story_id")
-def show(story_id):
-    """🔎 查看 Story 详情"""
+def _memory_show_impl(story_id: int) -> None:
+    """查看 Story 详情。"""
     store.init_db()
     story = store.get_story(int(story_id))
     if not story:
@@ -1528,11 +1691,41 @@ def show(story_id):
     click.echo("")
 
 
+@memory_group.command(name="list")
+@click.option("--limit", "-l", default=20, help="显示数量")
+def memory_list(limit):
+    """📋 列出所有 Story"""
+    _memory_list_impl(limit)
+
+
+@memory_group.command(name="show")
+@click.argument("story_id")
+def memory_show(story_id):
+    """🔎 查看 Story 详情"""
+    _memory_show_impl(story_id)
+
+
+@cli.command(name="list", hidden=True)
+@click.option("--limit", "-l", default=20, help="显示数量")
+def list_alias(limit):
+    """兼容 alias；canonical 入口为 ``book memory list``。"""
+    _legacy_alias_hint("memory list")
+    _memory_list_impl(limit)
+
+
+@cli.command(name="show", hidden=True)
+@click.argument("story_id")
+def show_alias(story_id):
+    """兼容 alias；canonical 入口为 ``book memory show``。"""
+    _legacy_alias_hint("memory show")
+    _memory_show_impl(story_id)
+
+
 def main():
     cli()
 
 
-@cli.command()
+@admin_group.command(name="eval")
 @click.argument("part", required=False, default="all",
                 type=click.Choice([
                     "all", "retrieval", "processing", "split", "ablation",
@@ -1544,8 +1737,8 @@ def main():
               help="自定义 benchmark 数据集 JSON（默认 data/retrieval_benchmark.json）")
 @click.option("--transform-cache", type=click.Path(exists=True, dir_okay=False),
               help="query-only 预生成 transformation JSON；仅用于可复现质量证据")
-def eval(part, report, benchmark_path, transform_cache):
-    """📐 检索、加工、分裂与 Story v2 embedding 表示消融
+def admin_eval(part, report, benchmark_path, transform_cache):
+    """📐 检索、加工、分裂与 Story v2 embedding 表示消融（低频维护）
 
     PART 取值：retrieval / processing / split / ablation / strategy /
     exact-term / all（默认 all）。
@@ -1606,7 +1799,7 @@ def eval(part, report, benchmark_path, transform_cache):
         click.echo(f"\n📝 JSON 报告已写入: {out}")
 
 
-@cli.command(name="benchmark")
+@admin_group.command(name="benchmark")
 @click.option("--model-state", type=click.Choice(["warm", "cold"]), default="warm",
               show_default=True, help="warm 会先预热；cold 每批请求前卸载 embedding 模型")
 @click.option("--retrieval-mode", type=click.Choice(["fast", "auto", "deep"]),
@@ -1625,9 +1818,9 @@ def eval(part, report, benchmark_path, transform_cache):
               help="把无原始 query 的完整 JSON 报告写入该路径")
 @click.option("--benchmark", "benchmark_path", type=click.Path(exists=True, dir_okay=False),
               help="自定义质量 benchmark JSON")
-def benchmark(model_state, retrieval_mode, stories, queries, repeats, concurrencies, report,
-              benchmark_path):
-    """📈 运行隔离的查询性能与质量基准。"""
+def admin_benchmark(model_state, retrieval_mode, stories, queries, repeats,
+                    concurrencies, report, benchmark_path):
+    """📈 运行隔离的查询性能与质量基准（低频维护）。"""
     result = perf_benchmark.run_performance_benchmark(
         story_count=stories,
         query_count=queries,

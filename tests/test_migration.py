@@ -1262,7 +1262,7 @@ def test_cli_dry_run_and_status_json(tmp_path, migration_profile):
     runner = CliRunner()
 
     dry_run = runner.invoke(
-        cli, ["migration", "run", str(source), "--dry-run", "--json"]
+        cli, ["admin", "migration", "run", str(source), "--dry-run", "--json"]
     )
 
     assert dry_run.exit_code == 0, dry_run.output

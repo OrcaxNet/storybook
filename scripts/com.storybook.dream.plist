@@ -9,7 +9,7 @@
 
   install 脚本会把下列占位符替换为当前环境的真实路径后写入
   ~/Library/LaunchAgents/com.storybook.dream.plist：
-      __PYTHON_BIN__       venv 的 python（.venv/bin/python）
+      __BOOK_BIN__         venv 内的 `book` entrypoint（.venv/bin/book）
       __LOG_DIR__          当前 Profile registry 解析出的日志目录
       __START_INTERVAL__   触发间隔（秒），由 --interval 决定
 
@@ -27,10 +27,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__PYTHON_BIN__</string>
-        <string>-m</string>
-        <string>storybook.cli</string>
-        <string>dream</string>
+        <string>__BOOK_BIN__</string>
+        <string>run</string>
         <string>--once</string>
     </array>
 

@@ -63,15 +63,15 @@ Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambig
 
 每个用户 Profile 一份 `profiles/{随机 UUID}/db/memory.db`（SQLite + sqlite-vec 扩展），不再存于仓库。新 Profile、Session、Story、edge 使用可按时间排序的 UUIDv7 全局 ID。Story v2 增加 `abstract/detail_json/sources_json`、`embedding_model/embedding_version/embedding_content_hash`；`story_revisions` 记录无损本地快照，`memory_events` 以 `event_id/entity_id/base_version/version/device_id/operation/created_at` 记录 create/update/merge/split/delete 的可移植审计链。事件明文 payload 只含固定元数据、关系 UUID 与修订 SHA-256，不复制正文、原始外部 session ID、路径或证据文本，并预留加密 payload 字段。**当前 embedding** 同步存于 `stories.embedding` 与 serving `story_vectors`；`story_embedding_backfill` 是模型切换 shadow，完整后在单事务内切换，部分失败不会影响在线 recall。
 
-`storybook forget` 用持久化浮点热度按半衰期衰减，再将频率无关的整数投影写入 `access_count`，并以最近访问/更新时间、访问计数和最大关联边权共同筛选低价值 Story；归档默认仅预览，`--apply` 后只归档并移出向量/词法/图检索，重复初始化或索引修复也不会重新发布归档向量；高频或强关联记忆受保护，原 Story、embedding 审计数据与 provenance 仍保留。生成式 LLM 与 embedding 的成功结果按 provider/model/schema/输入哈希持久缓存于 Profile 私有 cache；批处理并行执行无数据库写入的 LLM/embedding 准备阶段，再顺序执行 SQLite 合并与写入。
+`book memory forget` 用持久化浮点热度按半衰期衰减，再将频率无关的整数投影写入 `access_count`，并以最近访问/更新时间、访问计数和最大关联边权共同筛选低价值 Story；归档默认仅预览，`--apply` 后只归档并移出向量/词法/图检索，重复初始化或索引修复也不会重新发布归档向量；高频或强关联记忆受保护，原 Story、embedding 审计数据与 provenance 仍保留。生成式 LLM 与 embedding 的成功结果按 provider/model/schema/输入哈希持久缓存于 Profile 私有 cache；批处理并行执行无数据库写入的 LLM/embedding 准备阶段，再顺序执行 SQLite 合并与写入。
 
-删除 Story 时不物理删行：同一事务清除 serving 向量、追加 delete event 并写入不可变 `memory_tombstones`。查询默认排除 tombstone；本地事件重放采用 delete-wins，即使旧 create/update 事件晚到也不会复活对象。v0.2 的 `storybook sync status` 是纯本地状态查询，不登录、不联网，也没有上传/下载入口。
+删除 Story 时不物理删行：同一事务清除 serving 向量、追加 delete event 并写入不可变 `memory_tombstones`。查询默认排除 tombstone；本地事件重放采用 delete-wins，即使旧 create/update 事件晚到也不会复活对象。v0.2 的 `book status` 里的 sync 字段是纯本地状态查询，不登录、不联网，也没有上传/下载入口。
 
 从 v0.1 升级时，无法审计模型、输入表示与 hash 的旧向量会保留为 `story-v1-unversioned/legacy` 服务窗口，Story 标记为 `stale` 且不冒充 v2 元数据；必须完成可续跑的 shadow backfill 后，才会原子切换为 v2 active 状态。重复初始化不会覆盖 `stale`、`failed` 或 `archived` 等真实状态。
 
 ```bash
 # 每次最多重建 100 条；重复运行自动跳过 content_hash 未变化的 ready 项
-storybook embedding-backfill --model qwen3-embedding:0.6b \
+book admin index --model qwen3-embedding:0.6b \
   --version story-v2-default-v2 --batch-size 100
 ```
 
@@ -110,7 +110,7 @@ setup/doctor 会报告 dimension mismatch。base URL 中的 userinfo、query 和
 已有 Profile 的 active 向量索引会持久化 provider、base URL、model 与 version
 身份。setup 若检测到目标 embedding space 不兼容，会在任何写入和网络探测前以
 `SB_MODEL_INDEX_INCOMPATIBLE` 失败；可保持原配置，或先运行
-`storybook profile create provider-migration --switch` 创建隔离 Profile 后重新
+`book profile create provider-migration --switch` 创建隔离 Profile 后重新
 setup。不同 provider/base URL 即使模型同名，也不会共享 inference/query cache。
 - 依赖：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
 
@@ -178,7 +178,7 @@ PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 
 `book init` 会先展示完整改动计划，再创建用户级 Profile/schema、检测并接入
 Claude Code、Cursor、Codex。Ollama 推荐 preset 会检查/下载本地 embedding 模型；自定义 API 不会调用 Ollama 的 tags/pull 接口。最后执行 schema、embedding、
-adapter、recall smoke test。三类 Agent 都复用同一个 `storybook mcp` stdio server；Claude
+adapter、recall smoke test。三类 Agent 都复用同一个 `book mcp` stdio server；Claude
 Code 还会安装幂等的 `SessionStart` recall hook。无需手工编辑 JSON/TOML。
 
 ```bash
@@ -196,10 +196,10 @@ book init --yes --embedding-preset custom \
   --embedding-version your-model-v1 \
   --embedding-api-key-env PRIVATE_EMBED_API_KEY
 
-storybook uninstall                     # 恢复 setup 写入的节点，默认保留全部记忆
-storybook uninstall --dry-run
-storybook uninstall --purge-data        # 交互式二次确认后永久删除数据
-storybook uninstall --yes --purge-data --confirm-purge  # 非交互双重显式确认
+book admin uninstall                    # 恢复 setup 写入的节点，默认保留全部记忆
+book admin uninstall --dry-run
+book admin uninstall --purge-data       # 交互式二次确认后永久删除数据
+book admin uninstall --yes --purge-data --confirm-purge  # 非交互双重显式确认
 ```
 
 配置更新使用同目录原子替换，并在用户 state 目录保存原文件备份与 hash；重复执行不会
@@ -224,11 +224,11 @@ Serving index 的身份包含 endpoint、adapter、model、version、dimension �
 数据库/索引位于 Profile 数据根，缓存与日志走各平台的 cache/state 目录；目录权限在 POSIX 上为 `0700`，registry 与数据库为 `0600`。registry 只持久化随机 UUID、显示名、模式、同步状态和 Profile 内的相对数据库世代指针，不把用户名、hostname 或绝对路径当作主键。
 
 ```bash
-storybook profile show                    # 当前 Profile、数据目录与 local-only 状态
-storybook profile list                    # 列出所有 Profile
-storybook profile create client-a         # 默认创建 isolated Profile
-storybook profile switch client-a         # UUID 或显示名均可
-storybook sync status                     # v0.2 明确显示 local_only、跨设备同步未启用
+book profile show                         # 当前 Profile、数据目录与 local-only 状态
+book profile list                         # 列出所有 Profile
+book profile create client-a              # 默认创建 isolated Profile
+book profile switch client-a              # UUID 或显示名均可
+book status                               # 运行状态（含 sync local_only、跨设备同步未启用）
 ```
 
 可用 `STORYBOOK_PROFILE=<UUID|NAME>` 为单个进程选择 Profile 而不修改 registry；`STORYBOOK_HOME=/private/path` 可显式收拢/隔离 registry、数据库、缓存和日志。旧仓库 `data/memory.db` 不会被删除或覆盖；安全迁移由独立的 migration 流程负责。
@@ -251,12 +251,12 @@ hash；backup 后的提交会使迁移明确失败，活动写事务也会阻止
 静默覆盖回滚后的权威数据。
 
 ```bash
-storybook migration discover --json
-storybook migration run ./data/memory.db --dry-run --json  # 严格零写入
-storybook migration run ./data/memory.db --json            # 备份、转换、校验、切换
-storybook migration status --json
-storybook migration rollback <migration_id> --json         # 原子切回独立 v1 副本
-storybook migration delete-backup <migration_id> --yes      # 用户显式永久删除
+book admin migration discover --json
+book admin migration run ./data/memory.db --dry-run --json  # 严格零写入
+book admin migration run ./data/memory.db --json            # 备份、转换、校验、切换
+book admin migration status --json
+book admin migration rollback <migration_id> --json         # 原子切回独立 v1 副本
+book admin migration delete-backup <migration_id> --yes      # 用户显式永久删除
 ```
 
 `migration_id` 由目标 Profile 与源库逻辑 SHA-256 确定；重复运行同一源库直接复用已验证
@@ -302,18 +302,18 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 
 ## 📐 检索质量评测（benchmark + recall@k + 合并正确率 + 分裂质量）
 
-PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段。`storybook eval` 建立可重复的检索质量基线，
+PRD 要求「重复 bug 检索准确率≥70%」但原本无任何评测手段。`book admin eval` 建立可重复的检索质量基线，
 作为调参与算法改进的度量依据。评测需要已配置的 embedding API 可用，并在隔离临时库中运行，不污染用户 Profile 数据库。仓库现有固定评测证据使用本地 Ollama `qwen3-embedding:0.6b`；不同 endpoint、adapter、模型、维度或版本的指标不可直接等同。
 
 ```bash
-storybook eval all                              # 跑全部六轮评测（默认）
-storybook eval retrieval                        # 仅检索评测
-storybook eval exact-term                       # 精确代码 token：纯向量 vs Hybrid
-storybook eval all --report data/eval_reports/baseline.json   # 落盘 JSON 报告，便于阈值调整前后对比
+book admin eval all                            # 跑全部六轮评测（默认）
+book admin eval retrieval                      # 仅检索评测
+book admin eval exact-term                     # 精确代码 token：纯向量 vs Hybrid
+book admin eval all --report data/eval_reports/baseline.json  # 落盘 JSON 报告，便于阈值调整前后对比
 python scripts/eval.py retrieval                # 等价独立脚本（未做 editable 安装时用）
 python scripts/generate_eval_transforms.py --variant ambiguous --timeout 30 \
   --output data/eval_reports/query-only-transforms.json
-storybook eval strategy --transform-cache data/eval_reports/query-only-transforms.json
+book admin eval strategy --transform-cache data/eval_reports/query-only-transforms.json
 ```
 
 五轮评测：
@@ -350,8 +350,8 @@ python -m storybook.graph_eval --stories 10000 --repeats 200 \
 日常查询会自动记录无内容诊断。查看最近 100 次查询：
 
 ```bash
-storybook status --performance
-storybook status --performance --json
+book status --performance
+book status --performance --json
 ```
 
 `status --json` 同时返回当前 `profile`、混合 provider `model`、setup 管理的
@@ -367,13 +367,13 @@ storybook status --performance --json
 
 ```bash
 # warm：先预热模型，再跑 10k × 50 × 20 × concurrency(1,5)
-storybook benchmark --model-state warm --report data/perf-warm.json
+book admin benchmark --model-state warm --report data/perf-warm.json
 
 # cold：每个并发批次前用 Ollama keep_alive=0 卸载 embedding 模型
-storybook benchmark --model-state cold --report data/perf-cold.json
+book admin benchmark --model-state cold --report data/perf-cold.json
 
 # 快速 smoke（报告会如实记录非标准规模）
-storybook benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
+book admin benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 ```
 
 连续运行时应比较报告中的 machine、embedding model/dim、model_state、dataset seed/size、repeats 与 concurrency；这些字段不同足以解释大多数基线漂移。报告同时按 `cache` / `vector` / `lexical_fallback` lane 给出 p50/p95/p99，分别核验 cache hit ≤80ms、warm ≤1s、cold ≤5s。cold 场景每批先卸载模型并清空进程内缓存，避免把 cache hit 误算为冷启动。
@@ -383,57 +383,90 @@ storybook benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 - `results` / `no_match`：正常向量或缓存路径；`no_match` 才表示已完成正常检索但没有相关记忆。
 - `degraded_results` / `degraded_empty` / `degraded_unavailable`：降级命中、降级空结果、降级自身不可用；这些状态不应被解释为已确认“没有相关记忆”。
 
+## 🛠 CLI 命令总览（FLO-180 信息架构）
+
+`book` 是 canonical 入口（`storybook` 是同名兼容 alias，二者安装时都会生成）。
+高频任务放在顶层，低频能力归入分组；主要任务不超过两层：
+
+```text
+高频顶层:
+  book init                    初始化向导（Profile → 模型 → Agent → schedule → smoke）
+  book doctor [--fix]          环境与健康自检
+  book run [模式]              采集并形成记忆
+  book search "<query>"        搜索记忆
+  book status [--performance]  运行状态
+  book mcp                     启动 MCP server（stdio）
+
+分组:
+  book memory list|show|forget            记忆管理
+  book source list|enable|disable|reset   本机 Agent 历史来源
+  book profile list|show|create|switch    用户级 Profile
+  book admin init-db|migration|index|benchmark|eval|uninstall   低频维护
+```
+
+`book run` 四种模式（互斥，冲突组合 fail-fast）：
+
+| 模式 | 行为 |
+|------|------|
+| `book run` / `book run --once` | 单次完整周期：采集启用来源 + 加工 pending 后退出（launchd/cron 入口） |
+| `book run --watch [--source X] [--interval N]` | 反应式监听，有新会话自动采集 + 加工（长驻） |
+| `book run --daemon [--interval N]` | 定时守护循环，每 N 秒一轮（默认 4 小时） |
+| `book run --session ID` | 只加工指定 Session（单次） |
+
+### 兼容 alias（一个 minor release 后移除）
+
+`setup`、`process`、`dream`、`import-data`、`sources`、顶层 `list/show/forget/stats`
+以及 `storybook` executable 保留为隐藏兼容 alias，调用与 canonical 相同的业务函数，
+默认从 `--help` 隐藏。经 alias 调用时会向 **stderr** 打印移除提示，JSON / MCP
+**stdout 保持协议纯净**。低频命令的旧顶层位置（`migration`/`uninstall`/`embedding-backfill`/
+`benchmark`/`eval`）已迁至 `book admin ...`，不保留顶层 alias。
+
+旧 `storybook init` 在兼容期只做数据库初始化（不进入交互向导），低层 canonical 入口为
+`book admin init-db`。计划在下一个 minor release 移除上述全部兼容 alias。
+
 ## 🚀 使用
 
 ```bash
-storybook init                       # 初始化数据库 schema + vec0 虚表（其它命令也会自动初始化）
-storybook setup [--yes|--dry-run|--json]  # 用户级存储 + 三类 Agent 接入 + smoke test
-storybook uninstall [--purge-data]   # 恢复受管配置；默认保留记忆
-storybook profile show|list          # 查看用户级 Profile 与数据目录
-storybook profile create NAME        # 创建 isolated Profile（可加 --switch）
-storybook profile switch ID_OR_NAME  # 切换当前 Profile
-storybook sync status                # v0.2 显示 local_only
-storybook migration discover         # 只读发现旧项目级 v1 数据库
-storybook migration run PATH         # 安全备份、转换、校验并原子切换
-storybook migration rollback ID      # 原子切回保留的 v1 副本
-storybook sources list --json        # 检测本机来源及启用/版本/最近导入状态
-storybook sources disable codex      # 关闭某来源（enable 重新启用）
-storybook sources reset-checkpoint codex --yes  # 删除来源 checkpoint 后安全重扫
-storybook import-data                # 兼容默认：从 Claude Code 增量采集
-storybook import-data --claude       # 同上（显式写法）
-storybook import-data --codex --json # Codex 结构化增量导入 summary
-storybook import-data --source gemini # 可扩展来源入口
-storybook import-data --sample [--n 100]   # 生成并导入模拟会话（无需真实会话即可体验）
-storybook import-data --cursor       # 扫描 Cursor 的 workspaceStorage（备用数据源）
-storybook import-data <file|dir>     # 导入 JSON（list / {sessions:[...]} / {messages:[...]} 聊天日志）
-
-storybook process [--session ID]     # 做梦周期：处理所有 pending 会话（或指定一条）
-storybook process --watch [--source codex] [--interval N]  # 监听全部启用来源或指定单源
-storybook dream --once [--source codex] # 单次多来源采集+加工；launchd/cron 入口
-storybook dream [--interval N]        # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
-storybook search "<query>" [--top 3] [--scope profile|project|strict] [--mode fast|auto|deep] [--json]
-storybook forget [--half-life-days 30] [--min-age-days 90] [--apply]  # 默认仅预览
-                                    # 默认 fast；auto 门控增强；deep 显式高预算
-storybook status --performance       # 最近 100 次查询 p50/p95、cache/fallback 比例
-storybook benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质量基准
-storybook stats                      # 系统统计
-storybook list [--limit 20]          # 列出所有 Story
-storybook show <story_id>            # 查看 Story 详情（含关联记忆）
-storybook prime [--cwd PATH]         # 会话启动主动注入（晨间简报），供 SessionStart hook 调用
-storybook mcp                        # 启动 MCP server（stdio，供 Claude Code 等 agent 运行时召回）
+book init                            # 初始化向导：Profile/模型/Agent/schedule/smoke（其它命令也会自动初始化）
+book init --yes                      # 非交互安装
+book admin init-db                   # 仅初始化数据库 schema + vec0 虚表（低层入口）
+book admin uninstall [--purge-data]  # 恢复受管配置；默认保留记忆
+book profile show|list               # 查看用户级 Profile 与数据目录
+book profile create NAME             # 创建 isolated Profile（可加 --switch）
+book profile switch ID_OR_NAME       # 切换当前 Profile
+book status                          # 运行状态；--performance 输出最近 100 次查询 p50/p95
+book memory list [--limit 20]        # 列出所有 Story
+book memory show <story_id>          # 查看 Story 详情（含关联记忆与来源环境）
+book memory forget [--min-age-days 90] [--apply]  # 衰减并预览/归档低价值记忆（默认仅预览）
+book source list --json              # 检测本机来源及启用/版本/最近导入状态
+book source disable codex            # 关闭某来源（enable 重新启用）
+book source reset codex --yes        # 删除来源 checkpoint 后安全重扫
+book search "<query>" [--top 3] [--scope profile|project|strict] [--mode fast|auto|deep] [--json]
+book run [--session ID]              # 做梦周期：采集 + 加工全部（或指定一条 Session）
+book run --watch [--source codex] [--interval N]  # 监听全部启用来源或指定单源
+book run --once [--source codex]     # 单次多来源采集+加工；launchd/cron 入口
+book run --daemon [--interval N]     # 定时守护进程（非 macOS 兜底，每 N 秒一轮，默认 4h）
+book admin index --version <v> [--model <m>]  # 增量重建 embedding shadow 并原子切换
+book admin benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质量基准
+book admin eval all                  # 检索/加工/分裂/消融评测（低频维护）
+book admin migration discover|run|rollback|status|delete-backup  # v1 → v2 安全迁移
+book mcp                             # 启动 MCP server（stdio，供 Claude Code 等 agent 运行时召回）
 ```
 
 文本搜索会在主命中和“联想到的相关记忆”前展示真实 Story ID。可直接用该 ID 展开详情；脚本或 Agent 则可使用 `--json` 获取同一份检索结果（包括主命中与 related 的 `story_id`）：
 
 ```bash
-storybook search "开发一个语音机器人" --top 1
+book search "开发一个语音机器人" --top 1
 # 主命中示例：📌 #42 未命名记忆
-storybook show 42
+book memory show 42
 
-storybook search "开发一个语音机器人" --top 1 --json
+book search "开发一个语音机器人" --top 1 --json
 ```
 
-> 命令是 **`import-data`** 而非 `import`（click 把 `import_data` 函数自动连字符化）。无参数/无 flag 时为兼容性默认走 Claude；`dream`/`watch` 无 `--source` 时处理全部已启用且检测到的来源。`--source`、`--claude`、`--cursor`、`--codex`、`--sample` 与 `<path>` 互斥。
+> 兼容 alias 期（一个 minor release 内）：`storybook process`、`storybook dream`、
+> `storybook import-data`、`storybook sources ...`、顶层 `storybook list/show/forget/stats`
+> 仍可用并调用相同业务函数，但默认从 help 隐藏，提示只写 stderr。
+> `--source`、`--claude`、`--cursor`、`--codex`、`--sample` 与 `<path>` 互斥。
 
 Agent history 为 local-first：单来源损坏会在 summary 标记 `degraded`，但不阻断其他来源。MCP 接入与 history ingestion 是两个独立状态。支持矩阵、schema/version 证据及隐私边界见 [Agent History Adapter compatibility](docs/AGENT_HISTORY_ADAPTERS.md)。
 
@@ -442,23 +475,22 @@ Codex JSONL 按 **append-only 增量源**处理：热路径只读取固定上限
 若上游工具或用户改写了既有历史，使用以下命令删除该来源的 checkpoint；下一轮 import/dream 会完整重建 checkpoint，其他来源不受影响：
 
 ```bash
-storybook sources reset-checkpoint codex --yes
-storybook import-data --source codex
+book source reset codex --yes
+book run --source codex --once
 ```
 
 ### ContextEnvelope 与环境感知召回
 
 每条新 Session 都保存 `tool/device/session/workspace/runtime/captured_at/provenance`；每个未知叶子字段使用 `null`（`runtime.kind` 使用枚举 `unknown`）并标记 `provenance=unknown`。Claude/Cursor adapter 采集 `detected/reported/inferred/user_confirmed` 来源，原始外部 session ID 使用 Profile 本地 HMAC，绝对路径、hostname、remote host 与 repo URL 只保留哈希或短别名。
 
-Story 合并多个 Session 时会保留全部来源环境，不由最后一次会话覆盖。历史导入和实时采集都会从 cwd 解析 Git 根目录与 origin：远端仓库哈希作为主身份，同时保留根目录的 Profile 本地 HMAC 作为兼容身份，因此旧版仅含路径指纹的 Story 仍可在 `scope=project` 下召回，且绝对路径不会落库。双方都有远端主身份时以远端为准，不允许相同本地路径覆盖 remote 冲突；仅有一侧缺少远端证据时才使用路径兼容身份。搜索的语义相似度始终是主信号：默认 `scope=profile` 仅以 workspace/tool/runtime/OS 等环境信号做有界软加权，冲突结果仍可召回并带 `warnings`；只有调用方显式指定 `scope=strict` 才过滤环境冲突。`storybook show` 展示来源环境以及 `applies_when` / `excludes_when`。
+Story 合并多个 Session 时会保留全部来源环境，不由最后一次会话覆盖。历史导入和实时采集都会从 cwd 解析 Git 根目录与 origin：远端仓库哈希作为主身份，同时保留根目录的 Profile 本地 HMAC 作为兼容身份，因此旧版仅含路径指纹的 Story 仍可在 `scope=project` 下召回，且绝对路径不会落库。双方都有远端主身份时以远端为准，不允许相同本地路径覆盖 remote 冲突；仅有一侧缺少远端证据时才使用路径兼容身份。搜索的语义相似度始终是主信号：默认 `scope=profile` 仅以 workspace/tool/runtime/OS 等环境信号做有界软加权，冲突结果仍可召回并带 `warnings`；只有调用方显式指定 `scope=strict` 才过滤环境冲突。`book memory show` 展示来源环境以及 `applies_when` / `excludes_when`。
 
 ### 快速体验（无真实会话）
 
 ```bash
-storybook import-data --sample --n 50   # 造 50 条模拟会话
-storybook process                       # 跑做梦周期
-storybook search "如何调试数据库连接"     # 搜一下
-storybook stats                         # 看看沉淀了多少 Story
+book run --once                         # 采集 + 加工一次
+book search "如何调试数据库连接"          # 搜一下
+book status                             # 看看沉淀了多少 Story / 状态
 ```
 
 ## 🌙 做梦周期自动化
@@ -467,16 +499,16 @@ storybook stats                         # 看看沉淀了多少 Story
 
 | 入口 | 用途 | 平台 |
 |------|------|------|
-| `storybook process --watch` | 反应式监听：轮询全部已启用来源（可用 `--source` 限定），有新会话自动采集 + 加工（长驻，Ctrl-C 退出） | 全平台 |
-| `storybook dream --once` | 单次完整周期（采集 + 加工）后退出——**定时调度器的入口** | 全平台 |
-| `storybook dream` | 定时守护进程，每 `DREAM_INTERVAL` 秒一轮（Ctrl-C / SIGTERM 退出） | 非 macOS 兜底 |
+| `book run --watch` | 反应式监听：轮询全部已启用来源（可用 `--source` 限定），有新会话自动采集 + 加工（长驻，Ctrl-C 退出） | 全平台 |
+| `book run --once` | 单次完整周期（采集 + 加工）后退出——**定时调度器的入口** | 全平台 |
+| `book run --daemon` | 定时守护进程，每 `DREAM_INTERVAL` 秒一轮（Ctrl-C / SIGTERM 退出） | 非 macOS 兜底 |
 
 ### macOS：launchd 定时任务
 
 `scripts/` 下提供 plist 模板与一键安装脚本。安装脚本会把模板里的占位符替换为当前 venv 和 Profile 日志目录，写入 `~/Library/LaunchAgents/com.storybook.dream.plist` 并加载；plist 不再把仓库设为工作目录。
 
 ```bash
-# 安装：每 4 小时（默认）自动跑一次 dream --once
+# 安装：每 4 小时（默认）自动跑一次 book run --once
 ./scripts/install_launchd.sh
 # 每 1 小时
 ./scripts/install_launchd.sh --interval 3600
@@ -486,21 +518,21 @@ storybook stats                         # 看看沉淀了多少 Story
 # 常用调试命令
 launchctl start com.storybook.dream            # 立即触发一次
 launchctl print gui/$(id -u)/com.storybook.dream  # 查看状态
-storybook profile show                           # 先查看当前 Profile 日志目录
+book profile show                                # 先查看当前 Profile 日志目录
 ```
 
-plist 触发的是 `<venv>/bin/python -m storybook.cli dream --once`，`StartInterval` 可配置（默认 14400s = 4h），`RunAtLoad=true`（登录时先追补一次离线期间的新会话）。launchd 无 shell 环境，故 `storybook` 必须装在 venv 里、`.env` 由 `config.py` 自动加载——无需手动 `export`。
+plist 触发的是 `<venv>/bin/book run --once`，`StartInterval` 可配置（默认 14400s = 4h），`RunAtLoad=true`（登录时先追补一次离线期间的新会话）。launchd 无 shell 环境，故 `book` 必须装在 venv 里、`.env` 由 `config.py` 自动加载——无需手动 `export`。
 
 ### Linux / 其它平台：守护进程
 
-非 macOS 用 `storybook dream` 守护进程替代 launchd，由 systemd / nohup 托管：
+非 macOS 用 `book run --daemon` 守护进程替代 launchd，由 systemd / nohup 托管：
 
 ```bash
 # 直接前台 / nohup 后台跑（结构化日志另写当前 Profile 日志目录）
-nohup .venv/bin/python -m storybook.cli dream >/dev/null 2>&1 &
+nohup .venv/bin/book run --daemon >/dev/null 2>&1 &
 
 # 或用 systemd user 服务（模板：scripts/com.storybook.dream.service）
-sed -e "s|__PYTHON_BIN__|$PWD/.venv/bin/python|" \
+sed -e "s|__BOOK_BIN__|$PWD/.venv/bin/book|" \
     scripts/com.storybook.dream.service > ~/.config/systemd/user/storybook-dream.service
 systemctl --user daemon-reload
 systemctl --user enable --now storybook-dream.service
@@ -509,11 +541,11 @@ journalctl --user -u storybook-dream.service -f
 
 ### 并发保护
 
-所有做梦周期入口（手动 `process` / `--watch` / `dream --once` / `dream` 守护）共用当前 Profile 数据库目录下的 `dream.lock` 文件锁（`fcntl.flock` 非阻塞）。不同 Profile 互不阻塞；同一 Profile 已有周期在跑时，新触发立即跳过、不重复执行。进程崩溃时 OS 自动释放锁，无 stale-pid 问题。
+所有做梦周期入口（`book run` / `--watch` / `--once` / `--daemon`，及兼容期 `process` / `dream`）共用当前 Profile 数据库目录下的 `dream.lock` 文件锁（`fcntl.flock` 非阻塞）。不同 Profile 互不阻塞；同一 Profile 已有周期在跑时，新触发立即跳过、不重复执行。进程崩溃时 OS 自动释放锁，无 stale-pid 问题。
 
 ## 🔌 MCP 接入（供 agent 运行时召回）
 
-> 项目北极星是 **agent 跨 session 经验复用**。仅靠人工 `storybook search` 无法让 agent 在运行时自动召回；MCP server 把检索暴露为工具后，Claude Code 等 MCP-aware agent 可在新任务中主动查询记忆库。
+> 项目北极星是 **agent 跨 session 经验复用**。仅靠人工 `book search` 无法让 agent 在运行时自动召回；MCP server 把检索暴露为工具后，Claude Code 等 MCP-aware agent 可在新任务中主动查询记忆库。
 
 MCP server 是一个独立 stdio 进程，**复用** `search.search` / `store.get_story` / `store.get_stats`，不重复实现检索逻辑。
 
@@ -528,7 +560,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[mcp]"
 ### 启动方式（二选一，均为独立进程，不依赖 CLI 运行态）
 
 ```bash
-storybook mcp                   # 经 CLI 入口（推荐）
+book mcp                        # 经 CLI 入口（推荐）
 python -m storybook.mcp_server  # 直接跑模块（editable 安装后即可）
 ```
 
@@ -537,7 +569,7 @@ python -m storybook.mcp_server  # 直接跑模块（editable 安装后即可）
 最简方式（命令行注册）：
 
 ```bash
-claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
+claude mcp add storybook -- /绝对路径/storybook/.venv/bin/book mcp
 ```
 
 或手动写入配置（用户级 `~/.claude.json`，或项目级 `.mcp.json`）：
@@ -546,14 +578,14 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 {
   "mcpServers": {
     "storybook": {
-      "command": "/绝对路径/storybook/.venv/bin/storybook",
+      "command": "/绝对路径/storybook/.venv/bin/book",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-> ⚠️ 用 **绝对路径** 指向 venv 里的 `storybook`：Claude Code 启动 MCP 进程时不一定继承 shell 的 PATH，相对命令可能找不到。未做 editable 安装时可用 `python -m storybook.mcp_server`（`command` 指向 `.venv/bin/python`，`args` 为 `["-m", "storybook.mcp_server"]`）。
+> ⚠️ 用 **绝对路径** 指向 venv 里的 `book`：Claude Code 启动 MCP 进程时不一定继承 shell 的 PATH，相对命令可能找不到。未做 editable 安装时可用 `python -m storybook.mcp_server`（`command` 指向 `.venv/bin/python`，`args` 为 `["-m", "storybook.mcp_server"]`）。
 
 ### 暴露的工具
 
@@ -576,11 +608,11 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 > 仅暴露 `recall` 等 MCP 工具仍需 agent **主动**调用。更进一步：新会话开始时，基于 cwd / 首条提问**主动 surface** 最相关 story 注入上下文，实现"下意识回忆"--更贴近项目初衷（人脑处理事项时自动想起相关经历）。
 
-`prime_context` 与 `storybook prime` 共享 `src/storybook/prime.py` 的召回 + 预算控制逻辑，**复用 `search.search`**，不重复实现检索。两条触发路径：
+`prime_context` 与 `book prime` 共享 `src/storybook/prime.py` 的召回 + 预算控制逻辑，**复用 `search.search`**，不重复实现检索。两条触发路径：
 
 | 路径 | 触发时机 | 查询信号 | 接入方式 |
 |------|----------|----------|----------|
-| **SessionStart hook** | 会话启动（尚无首条提问） | 仅 cwd（项目目录派生项目名） | `storybook prime` CLI，stdout 被注入为额外上下文 |
+| **SessionStart hook** | 会话启动（尚无首条提问） | 仅 cwd（项目目录派生项目名） | `book prime` CLI，stdout 被注入为额外上下文 |
 | **MCP `prime_context`** | agent 读到首条提问后主动调用 | cwd + 首条提问（提问为主信号） | agent 调用工具，拿回 `briefing` 自行呈现 |
 
 ### 行为保证（验收标准）
@@ -592,7 +624,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 
 ### 方式一：Claude Code `SessionStart` hook（推荐，纯自动）
 
-`storybook prime` 默认把简报纯文本写到 stdout（被 Claude Code 作为额外上下文注入）；无匹配时 stdout 为空（不注入）。hook 始终 exit 0、非阻塞，任何环境异常都静默退化（不向上下文注入错误）。
+`book prime` 默认把简报纯文本写到 stdout（被 Claude Code 作为额外上下文注入）；无匹配时 stdout 为空（不注入）。hook 始终 exit 0、非阻塞，任何环境异常都静默退化（不向上下文注入错误）。
 
 在项目级 `.claude/settings.json` 或用户级 `~/.claude/settings.json` 配置：
 
@@ -605,7 +637,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
         "hooks": [
           {
             "type": "command",
-            "command": "/绝对路径/storybook/.venv/bin/storybook prime --cwd \"$CLAUDE_PROJECT_DIR\""
+            "command": "/绝对路径/storybook/.venv/bin/book prime --cwd \"$CLAUDE_PROJECT_DIR\""
           }
         ]
       }
@@ -614,18 +646,18 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/storybook mcp
 }
 ```
 
-> ⚠️ 用**绝对路径**指向 venv 里的 `storybook`（Claude Code 启动 hook 进程时不一定继承 shell 的 PATH）。`$CLAUDE_PROJECT_DIR` 由 Claude Code 注入，即当前项目目录。未做 editable 安装时可用 `python -m storybook.prime` 形式（`command` 指向 `.venv/bin/python`，`args` 为 `["-m", "storybook.prime", "--cwd", "$CLAUDE_PROJECT_DIR"]`）。
+> ⚠️ 用**绝对路径**指向 venv 里的 `book`（Claude Code 启动 hook 进程时不一定继承 shell 的 PATH）。`$CLAUDE_PROJECT_DIR` 由 Claude Code 注入，即当前项目目录。未做 editable 安装时可用 `python -m storybook.prime` 形式（`command` 指向 `.venv/bin/python`，`args` 为 `["-m", "storybook.prime", "--cwd", "$CLAUDE_PROJECT_DIR"]`）。
 >
 > 若你的 Claude Code 版本支持 `hookSpecificOutput` 结构化注入，可改用 `--format hook`，仅 `additionalContext` 字段被注入、其余 stdout 被忽略：
 
 ```json
-"command": "/绝对路径/storybook/.venv/bin/storybook prime --cwd \"$CLAUDE_PROJECT_DIR\" --format hook"
+"command": "/绝对路径/storybook/.venv/bin/book prime --cwd \"$CLAUDE_PROJECT_DIR\" --format hook"
 ```
 
 调试时可用 `--format json` 查看完整结构化结果（`query` / `count` / `matches` / `truncated` / `note`）：
 
 ```bash
-storybook prime --cwd "$PWD" --prompt "你的首条提问" --format json
+book prime --cwd "$PWD" --prompt "你的首条提问" --format json
 ```
 
 ### 方式二：MCP `prime_context` 工具（agent 主动调用）
@@ -748,8 +780,8 @@ storybook/
 
 - **隐私边界**：Profile、数据库与原始证据留在本机；本地 Ollama preset 不发送文本离机，远程 embedding/generation API 会接收各自请求文本并在 setup/status 中披露；Fast 查询不调用生成式 LLM。
 - **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖真实 provider（见上文「🧪 测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
-- **MCP server**：`storybook mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「🔌 MCP 接入」）。
-- **晨间简报**：`storybook prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / embedding API 不可用时静默不注入（见上文「🌅 会话启动注入」）。
+- **MCP server**：`book mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「🔌 MCP 接入」）。
+- **晨间简报**：`book prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / embedding API 不可用时静默不注入（见上文「🌅 会话启动注入」）。
 - `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「🧪 测试」与「🌙 做梦周期自动化」）。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 
