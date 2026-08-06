@@ -572,33 +572,47 @@ class SetupManager:
         self, *, download: bool, progress: Progress | None,
         provider_config: model_config.ModelConfig | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        if provider_config is not None and provider_config.embedding.provider == "api":
-            return ([
-                {"name": provider_config.generation.model, "status": "remote"},
-                {"name": provider_config.embedding.model, "status": "remote"},
-            ], [])
-        required = tuple(dict.fromkeys(
-            (provider_config.generation.model, provider_config.embedding.model)
-            if provider_config is not None
-            else (config.EMBED_MODEL,)
-        ))
-        if provider_config is None and config.EMBED_ADAPTER != "ollama":
+        remote: list[dict[str, Any]] = []
+        required: tuple[str, ...]
+        if provider_config is not None:
+            # 端点独立管理：只有 Ollama 端点才走 tags/pull；其余模型生命周期
+            # 由服务端管理，直接标记 remote，可用性由后续 provider smoke 验证。
+            ollama_models = [
+                endpoint.model
+                for endpoint in (
+                    provider_config.generation, provider_config.embedding
+                )
+                if endpoint.provider == "ollama"
+            ]
+            remote = [
+                {"name": endpoint.model, "status": "remote"}
+                for endpoint in (
+                    provider_config.generation, provider_config.embedding
+                )
+                if endpoint.provider != "ollama"
+            ]
+            required = tuple(dict.fromkeys(ollama_models))
+            if not required:
+                return remote, []
+        elif config.EMBED_ADAPTER != "ollama":
             # 通用 API 的模型生命周期由服务端管理；setup 不得调用
             # Ollama 的 tags/pull 端点。可用性由后续 embedding smoke 验证。
             return (
                 [{
-                    "name": name,
+                    "name": config.EMBED_MODEL,
                     "status": "configured",
                     "provider": "api",
                     "adapter": config.EMBED_ADAPTER,
-                } for name in required],
+                }],
                 [],
             )
+        else:
+            required = (config.EMBED_MODEL,)
         try:
             installed = _ollama_tags()
         except Exception as exc:  # noqa: BLE001 -- 网络/daemon 统一降级
             return (
-                [
+                remote + [
                     {"name": name, "status": "unavailable", "size": None}
                     for name in required
                 ],
@@ -632,22 +646,22 @@ class SetupManager:
                     {"name": name, "status": "failed", "error": str(exc), "size": None}
                 )
                 degraded.append(f"model download failed ({name}): {exc}")
-        return results, degraded
+        return remote + results, degraded
 
     def _probe_provider(self, value: model_config.ModelConfig) -> list[dict[str, Any]]:
-        """Verify generation and embedding using the declared wire protocol."""
+        """Verify generation and embedding using each endpoint's wire protocol."""
 
         generation = value.generation
         embedding = value.embedding
         generation_secret = self.environ.get(generation.credential_env or "")
         embedding_secret = self.environ.get(embedding.credential_env or "")
-        if generation.provider == "api" and not generation_secret:
+        if generation.provider != "ollama" and not generation_secret:
             raise SetupError(
                 "SB_MODEL_CREDENTIALS_MISSING",
                 f"generation 环境变量 {generation.credential_env} 未设置",
                 hint="设置该环境变量后重试；密钥不会写入配置",
             )
-        if embedding.provider == "api" and not embedding_secret:
+        if embedding.provider != "ollama" and not embedding_secret:
             raise SetupError(
                 "SB_MODEL_CREDENTIALS_MISSING",
                 f"embedding 环境变量 {embedding.credential_env} 未设置",
@@ -691,6 +705,40 @@ class SetupManager:
                 or not message["content"].strip()
             ):
                 raise SetupError("SB_MODEL_GENERATION_FAILED", "generation provider 未返回 choices")
+        elif generation.provider == "anthropic":
+            gen = request(
+                "generation", f"{generation.base_url}/v1/messages",
+                {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "max_tokens": 4},
+                secret=generation_secret,
+            )
+            content = gen.get("content")
+            text_ok = (
+                isinstance(content, str) and bool(content.strip())
+            ) or (
+                isinstance(content, list)
+                and any(
+                    isinstance(item, dict) and isinstance(item.get("text"), str)
+                    for item in content
+                )
+            )
+            if not text_ok:
+                raise SetupError("SB_MODEL_GENERATION_FAILED", "generation provider 未返回 content")
+        else:
+            gen = request(
+                "generation", f"{generation.base_url}/api/chat",
+                {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "stream": False},
+            )
+            if not isinstance(gen.get("message"), dict):
+                raise SetupError("SB_MODEL_GENERATION_FAILED", "Ollama generation 响应无效")
+
+        if embedding.provider == "ollama":
+            embedded = request(
+                "embedding", f"{embedding.base_url}/api/embeddings",
+                {"model": embedding.model, "prompt": "storybook setup probe"},
+            )
+            vector = embedded.get("embedding")
+        else:
+            # api / anthropic embedding 均按 OpenAI-compatible /v1/embeddings 探测。
             embedded = request(
                 "embedding", f"{embedding.base_url}/v1/embeddings",
                 {"model": embedding.model, "input": "storybook setup probe"},
@@ -699,18 +747,6 @@ class SetupManager:
             rows = embedded.get("data")
             first_row = rows[0] if isinstance(rows, list) and rows else None
             vector = first_row.get("embedding") if isinstance(first_row, dict) else None
-        else:
-            gen = request(
-                "generation", f"{generation.base_url}/api/chat",
-                {"model": generation.model, "messages": [{"role": "user", "content": "Reply OK"}], "stream": False},
-            )
-            if not isinstance(gen.get("message"), dict):
-                raise SetupError("SB_MODEL_GENERATION_FAILED", "Ollama generation 响应无效")
-            embedded = request(
-                "embedding", f"{embedding.base_url}/api/embeddings",
-                {"model": embedding.model, "prompt": "storybook setup probe"},
-            )
-            vector = embedded.get("embedding")
         if not isinstance(vector, list):
             raise SetupError("SB_MODEL_EMBEDDING_FAILED", "embedding provider 未返回向量")
         if len(vector) != config.EMBED_DIM:
@@ -912,7 +948,10 @@ class SetupManager:
         # Provider/index compatibility and managed state must be validated
         # before Profile, config, database, or adapter writes.
         existing_state = self._load_state() or {}
-        if provider_config is not None and provider_config.generation.provider == "api":
+        if (
+            provider_config is not None
+            and provider_config.generation.provider in {"api", "anthropic"}
+        ):
             # Validate remote credentials and both capabilities before any write.
             provider_smoke = self._probe_provider(provider_config)
         else:

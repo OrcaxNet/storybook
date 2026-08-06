@@ -174,7 +174,7 @@ def serving_route_identity(state: dict) -> dict[str, object]:
 
     provider = state.get("active_provider")
     adapter = state.get("active_adapter")
-    if not adapter and provider in {"ollama", "api"}:
+    if not adapter and provider in {"ollama", "api", "anthropic"}:
         adapter = "ollama" if provider == "ollama" else "openai_compatible"
     return {
         "base_url": state.get("active_endpoint") or state.get("active_base_url"),

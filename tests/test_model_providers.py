@@ -191,6 +191,104 @@ def test_unsafe_base_urls_are_rejected(url):
         )
 
 
+def test_build_mixed_providers_persists_independent_endpoints(tmp_path):
+    value = model_config.build(
+        llm_protocol="openai", llm_base_url="https://api.deepseek.com",
+        llm_model="deepseek-v4-flash", llm_credential_env="STORYBOOK_API_KEY",
+        embedding_protocol="ollama", embedding_base_url="http://localhost:11434",
+        embedding_model="bge-m3",
+    )
+    assert value.generation.provider == "api"
+    assert value.generation.protocol == "openai"
+    assert value.embedding.provider == "ollama"
+    assert value.embedding.protocol == "ollama"
+    assert value.embedding.credential_env is None
+    assert value.generation.base_url == "https://api.deepseek.com"
+    assert value.embedding.base_url == "http://localhost:11434"
+
+    path = tmp_path / "model-config.json"
+    model_config.save(path, value)
+    raw = path.read_text(encoding="utf-8")
+    assert "STORYBOOK_API_KEY" in raw
+    assert '"protocol": "openai"' in raw
+    assert '"protocol": "ollama"' in raw
+    loaded = model_config.load(path)
+    assert loaded.generation.provider == "api"
+    assert loaded.generation.protocol == "openai"
+    assert loaded.embedding.provider == "ollama"
+    assert loaded.embedding.protocol == "ollama"
+    assert loaded.generation.credential_env == "STORYBOOK_API_KEY"
+
+
+def test_empty_or_dash_secret_on_ollama_endpoints_never_invalid():
+    value = model_config.build(
+        llm_protocol="ollama", llm_base_url="http://localhost:11434",
+        llm_model="chat", llm_credential_env="-",
+        embedding_protocol="ollama", embedding_base_url="http://localhost:11434",
+        embedding_model="embed", embedding_credential_env="",
+    )
+    assert value.generation.credential_env is None
+    assert value.embedding.credential_env is None
+
+
+def test_anthropic_generation_protocol_is_persisted():
+    value = model_config.build(
+        llm_protocol="anthropic", llm_base_url="https://api.deepseek.com/anthropic",
+        llm_model="deepseek-v4-flash", llm_credential_env="ANTHROPIC_AUTH_TOKEN",
+        embedding_protocol="ollama", embedding_base_url="http://localhost:11434",
+        embedding_model="bge-m3",
+    )
+    assert value.generation.provider == "anthropic"
+    assert value.generation.protocol == "anthropic"
+    assert value.generation.credential_env == "ANTHROPIC_AUTH_TOKEN"
+
+
+def test_v1_schema_without_protocol_loads_with_inferred_protocol(tmp_path):
+    path = tmp_path / "model-config.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "generation": {
+            "provider": "api", "base_url": "https://g.test",
+            "model": "chat", "credential_env": "K",
+        },
+        "embedding": {
+            "provider": "ollama", "base_url": "http://127.0.0.1:11434",
+            "model": "embed",
+        },
+    }), encoding="utf-8")
+    value = model_config.load(path)
+    assert value.generation.provider == "api"
+    assert value.generation.protocol == "openai"
+    assert value.embedding.provider == "ollama"
+    assert value.embedding.protocol == "ollama"
+
+
+def test_invalid_secret_env_name_error_names_the_field():
+    with pytest.raises(model_config.ModelConfigError) as caught:
+        model_config.build(
+            llm_protocol="openai", llm_base_url="https://g.test", llm_model="m",
+            llm_credential_env="-",
+        )
+    assert "LLM" in str(caught.value)
+    assert "credential env-name" in str(caught.value)
+
+    with pytest.raises(model_config.ModelConfigError) as caught:
+        model_config.build(
+            llm_protocol="openai", llm_base_url="https://g.test", llm_model="m",
+            llm_credential_env="K",
+            embedding_protocol="openai", embedding_base_url="https://e.test",
+            embedding_model="em", embedding_credential_env="-",
+        )
+    assert "Embedding" in str(caught.value)
+
+
+def test_protocol_must_agree_with_provider():
+    with pytest.raises(model_config.ModelConfigError):
+        model_config.endpoint(
+            "api", "https://g.test", "m", "K", protocol="anthropic"
+        )
+
+
 def test_api_provider_happy_path_checks_both_contracts(tmp_path, monkeypatch):
     calls = []
 
@@ -437,6 +535,80 @@ def test_ollama_downloads_missing_generation_and_embedding(tmp_path, monkeypatch
     assert degraded == []
 
 
+def test_ensure_models_mixed_remote_generation_and_ollama_embedding(tmp_path, monkeypatch):
+    value = model_config.build(
+        llm_protocol="openai", llm_base_url="https://models.example.test",
+        llm_model="remote-chat", llm_credential_env="GEN_KEY",
+        embedding_protocol="ollama", embedding_base_url="http://127.0.0.1:11434",
+        embedding_model="local-embed",
+    )
+    pulled = []
+    monkeypatch.setattr("storybook.setup_manager._ollama_tags", lambda: {})
+    monkeypatch.setattr(
+        "storybook.setup_manager._pull_model",
+        lambda name, progress=None: pulled.append(name),
+    )
+    manager = SetupManager(environ={"GEN_KEY": SENTINEL}, adapters=(), roots=_roots(tmp_path))
+    models, degraded = manager._ensure_models(
+        download=True, progress=None, provider_config=value
+    )
+    # 只有 embedding 走本地 Ollama 管理；remote generation 只标记 remote，不拉取。
+    assert pulled == ["local-embed"]
+    statuses = {item["name"]: item["status"] for item in models}
+    assert statuses["remote-chat"] == "remote"
+    assert statuses["local-embed"] == "downloaded"
+    assert degraded == []
+
+
+def test_probe_provider_mixed_openai_generation_ollama_embedding(tmp_path, monkeypatch):
+    value = model_config.build(
+        llm_protocol="openai", llm_base_url="https://models.example.test",
+        llm_model="chat-v1", llm_credential_env="GEN_KEY",
+        embedding_protocol="ollama", embedding_base_url="http://127.0.0.1:11434",
+        embedding_model="embed-1024",
+    )
+    urls = []
+
+    def post(url, **kwargs):
+        urls.append(url)
+        if url.endswith("/chat/completions"):
+            return Response({"choices": [{"message": {"content": "OK"}}]})
+        return Response({"embedding": [0.1] * config.EMBED_DIM})
+
+    monkeypatch.setattr("storybook.setup_manager.requests.post", post)
+    manager = SetupManager(environ={"GEN_KEY": SENTINEL}, adapters=(), roots=_roots(tmp_path))
+    result = manager._probe_provider(value)
+    assert len(result) == 2
+    # generation 走 OpenAI /v1/chat/completions；embedding 走 Ollama /api/embeddings。
+    assert urls[0].endswith("/v1/chat/completions")
+    assert urls[1].endswith("/api/embeddings")
+
+
+def test_probe_provider_anthropic_generation_uses_messages_api(tmp_path, monkeypatch):
+    value = model_config.build(
+        llm_protocol="anthropic", llm_base_url="https://api.deepseek.com/anthropic",
+        llm_model="deepseek-v4-flash", llm_credential_env="ANTHROPIC_AUTH_TOKEN",
+        embedding_protocol="ollama", embedding_base_url="http://127.0.0.1:11434",
+        embedding_model="embed-1024",
+    )
+    urls = []
+
+    def post(url, **kwargs):
+        urls.append(url)
+        if url.endswith("/messages"):
+            return Response({"content": [{"type": "text", "text": "OK"}]})
+        return Response({"embedding": [0.1] * config.EMBED_DIM})
+
+    monkeypatch.setattr("storybook.setup_manager.requests.post", post)
+    manager = SetupManager(
+        environ={"ANTHROPIC_AUTH_TOKEN": SENTINEL}, adapters=(), roots=_roots(tmp_path)
+    )
+    result = manager._probe_provider(value)
+    assert len(result) == 2
+    assert urls[0].endswith("/v1/messages")
+    assert urls[1].endswith("/api/embeddings")
+
+
 @pytest.mark.parametrize(
     ("responses", "code"),
     [
@@ -482,7 +654,7 @@ def test_json_dry_run_is_single_json_zero_write_and_secret_free(tmp_path):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="PTY contract is POSIX-only")
-def test_tty_api_setup_prompts_for_complete_provider_config(tmp_path):
+def test_tty_setup_prompts_dual_endpoints_with_protocol_and_inheritance(tmp_path):
     storybook_home = tmp_path / "storybook"
     env = _subprocess_env(tmp_path, storybook_home)
     env["TTY_API_KEY"] = SENTINEL
@@ -510,11 +682,15 @@ def test_tty_api_setup_prompts_for_complete_provider_config(tmp_path):
 
     try:
         for prompt, answer in (
-            ("Model provider", "api"),
-            ("API base URL", "https://models.example.test"),
-            ("Generation model", "chat-v1"),
+            ("LLM protocol (openai, anthropic, ollama)", "openai"),
+            ("LLM base URL（openai", "https://models.example.test"),
+            ("LLM model", "chat-v1"),
+            ("LLM secret env-name", "TTY_API_KEY"),
+            ("Embedding protocol (openai, anthropic, ollama)", "ollama"),
+            ("Embedding base URL（ollama", "http://127.0.0.1:11434"),
             ("Embedding model", "embed-1024"),
-            ("API key environment variable", "TTY_API_KEY"),
+            # Embedding secret 直接回车留空：Ollama 本地端点视为无凭据（AC2）
+            ("Embedding secret env-name", ""),
         ):
             expect(prompt)
             os.write(master, f"{answer}\n".encode())
@@ -527,10 +703,13 @@ def test_tty_api_setup_prompts_for_complete_provider_config(tmp_path):
             process.wait(timeout=2)
     output = b"".join(chunks).decode(errors="replace")
     assert process.returncode == 0, output
-    assert "API base URL" in output
-    assert "Generation model" in output
+    assert "LLM protocol (openai, anthropic, ollama)" in output
+    assert "LLM base URL（openai" in output
+    assert "Embedding base URL（ollama" in output
+    assert "LLM model" in output
     assert "Embedding model" in output
-    assert "API key environment variable" in output
+    assert "LLM secret env-name" in output
+    assert "Embedding secret env-name" in output
     assert "Dry-run complete: no writes performed." in output
     assert "SB_MODEL_BASE_URL_REQUIRED" not in output
     assert SENTINEL not in output

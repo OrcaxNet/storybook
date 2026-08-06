@@ -1224,21 +1224,89 @@ def test_book_init_interactive_api_secret_is_ephemeral_and_hidden(
         lambda name: TtyInput(original_stream(name)) if name == "stdin" else original_stream(name),
     )
     user_input = "\n".join([
-        "api",
+        # LLM 端点：protocol=openai → baseUrl → model → secret env-name
+        "openai",
         "https://models.example.test",
         "generation-v1",
-        "embedding-v1",
         "TEST_BOOK_KEY",
+        # Embedding 端点：protocol=ollama → baseUrl（覆盖默认）→ model → secret 留空
+        "ollama",
+        "http://127.0.0.1:11434",
+        "embedding-v1",
+        "",
+        # Agent / schedule / apply / LLM 本次运行 secret
         "auto",
         "skip",
         "y",
         sentinel,
-        "",
     ])
 
     result = CliRunner().invoke(cli, ["init"], input=user_input, prog_name="book")
 
     assert result.exit_code == 0, result.output
+    assert sentinel not in result.output
+    assert "TEST_BOOK_KEY" not in manager.environ
+    written = b"".join(
+        path.read_bytes() for path in tmp_files(roots.config, roots.state)
+    )
+    assert sentinel.encode() not in written
+
+
+def test_book_init_interactive_embedding_inherits_llm_values(isolated_setup, monkeypatch):
+    manager, roots = isolated_setup
+    sentinel = "SECRET-SENTINEL-NEVER-PERSIST"
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    captured = {}
+
+    def probe(value):
+        captured["config"] = value
+        # 交互继承：embedding baseUrl/secret 默认取 LLM 值（AC4）。
+        assert value.embedding.base_url == value.generation.base_url
+        assert value.embedding.credential_env == value.generation.credential_env
+        return [
+            {"name": "generation", "ok": True, "detail": "ready"},
+            {"name": "embedding-provider", "ok": True, "detail": "ready"},
+        ]
+
+    monkeypatch.setattr(manager, "_probe_provider", probe)
+    original_stream = click.get_text_stream
+
+    class TtyInput:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def isatty(self):
+            return True
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    monkeypatch.setattr(
+        click,
+        "get_text_stream",
+        lambda name: TtyInput(original_stream(name)) if name == "stdin" else original_stream(name),
+    )
+    # embedding baseUrl/secret 直接回车留空 → 继承 LLM 值；端点均 openai。
+    user_input = "\n".join([
+        "openai",
+        "https://models.example.test",
+        "chat-v1",
+        "TEST_BOOK_KEY",
+        "openai",
+        "",
+        "embed-1024",
+        "",
+        "auto",
+        "skip",
+        "y",
+        sentinel,
+    ])
+
+    result = CliRunner().invoke(cli, ["init"], input=user_input, prog_name="book")
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].embedding.base_url == "https://models.example.test"
+    assert captured["config"].embedding.credential_env == "TEST_BOOK_KEY"
     assert sentinel not in result.output
     assert "TEST_BOOK_KEY" not in manager.environ
     written = b"".join(
@@ -1281,6 +1349,188 @@ def test_book_init_provider_failure_returns_doctor_repair_path(
     else:
         assert "SB_MODEL_NETWORK_FAILED" in result.output
         assert "book doctor" in result.output
+
+
+def test_book_init_mixed_provider_json_noninteractive(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    monkeypatch.setattr(
+        manager,
+        "_probe_provider",
+        lambda value: [
+            {"name": "generation", "ok": True, "detail": "ready"},
+            {"name": "embedding-provider", "ok": True, "detail": "ready"},
+        ],
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "init", "--yes", "--json", "--skip-models", "--agent", "codex",
+            "--llm-protocol", "openai",
+            "--llm-base-url", "https://models.example.test",
+            "--llm-model", "chat-v1",
+            "--llm-api-key-env", "TEST_STORYBOOK_KEY",
+            "--embedding-protocol", "ollama",
+            "--embedding-base-url", "http://127.0.0.1:11434",
+            "--embedding-model", "embed-1024",
+        ],
+        prog_name="book",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ready"
+    generation = payload["model_config"]["generation"]
+    embedding = payload["model_config"]["embedding"]
+    assert generation["provider"] == "api"
+    assert generation["protocol"] == "openai"
+    assert generation["base_url"] == "https://models.example.test"
+    assert embedding["provider"] == "ollama"
+    assert embedding["protocol"] == "ollama"
+    assert embedding["base_url"] == "http://127.0.0.1:11434"
+    assert embedding["credential_status"] == "not_required"
+    # 持久化 model-config.json 同时包含两个独立端点且无明文凭据。
+    written = config.MODEL_CONFIG_PATH.read_text(encoding="utf-8")
+    assert '"provider": "api"' in written
+    assert '"provider": "ollama"' in written
+    assert '"protocol": "openai"' in written
+    assert '"protocol": "ollama"' in written
+    assert "TEST_STORYBOOK_KEY" in written
+
+
+def test_book_init_dry_run_mixed_model_config_json(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "init", "--dry-run", "--json",
+            "--llm-protocol", "openai",
+            "--llm-base-url", "https://models.example.test",
+            "--llm-model", "chat-v1",
+            "--llm-api-key-env", "TEST_STORYBOOK_KEY",
+            "--embedding-protocol", "ollama",
+            "--embedding-base-url", "http://127.0.0.1:11434",
+            "--embedding-model", "embed-1024",
+        ],
+        prog_name="book",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "dry_run"
+    model_config_payload = payload["plan"]["model_config"]
+    assert model_config_payload["generation"]["provider"] == "api"
+    assert model_config_payload["generation"]["protocol"] == "openai"
+    assert model_config_payload["embedding"]["provider"] == "ollama"
+    assert model_config_payload["embedding"]["protocol"] == "ollama"
+
+
+def test_book_init_legacy_flags_apply_to_both_endpoints(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    monkeypatch.setattr(
+        manager,
+        "_probe_provider",
+        lambda value: [
+            {"name": "generation", "ok": True, "detail": "ready"},
+            {"name": "embedding-provider", "ok": True, "detail": "ready"},
+        ],
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "init", "--yes", "--json", "--skip-models", "--agent", "codex",
+            "--provider", "api", "--base-url", "https://models.example.test",
+            "--llm-model", "chat-v1", "--embedding-model", "embed-1024",
+            "--api-key-env", "TEST_STORYBOOK_KEY",
+        ],
+        prog_name="book",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ready"
+    model_config_payload = payload["model_config"]
+    assert model_config_payload["generation"]["provider"] == "api"
+    assert model_config_payload["embedding"]["provider"] == "api"
+    assert model_config_payload["generation"]["protocol"] == "openai"
+    assert model_config_payload["embedding"]["protocol"] == "openai"
+
+
+def test_book_init_empty_secret_ollama_endpoints_no_invalid(isolated_setup, monkeypatch):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    monkeypatch.setattr(
+        manager,
+        "_probe_provider",
+        lambda value: [
+            {"name": "generation", "ok": True, "detail": "ready"},
+            {"name": "embedding-provider", "ok": True, "detail": "ready"},
+        ],
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "init", "--yes", "--json", "--skip-models", "--agent", "codex",
+            "--llm-protocol", "ollama",
+            "--llm-base-url", "http://127.0.0.1:11434",
+            "--llm-model", "local-chat",
+            "--embedding-protocol", "ollama",
+            "--embedding-base-url", "http://127.0.0.1:11434",
+            "--embedding-model", "local-embed",
+        ],
+        prog_name="book",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ready"
+    assert payload["model_config"]["generation"]["credential_env"] is None
+    assert payload["model_config"]["embedding"]["credential_env"] is None
+    assert "SB_MODEL_CONFIG_INVALID" not in result.output
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_book_init_invalid_env_name_error_names_field(
+    isolated_setup, monkeypatch, as_json
+):
+    manager, _ = isolated_setup
+    monkeypatch.setattr("storybook.cli.SetupManager", lambda: manager)
+    args = [
+        "init", "--yes",
+        "--provider", "api", "--base-url", "https://models.example.test",
+        "--llm-model", "chat-v1", "--embedding-model", "embed-1024",
+        "--api-key-env", "-",
+    ]
+    if as_json:
+        args.append("--json")
+
+    result = CliRunner().invoke(cli, args, prog_name="book")
+
+    assert result.exit_code == 1
+    if as_json:
+        payload = json.loads(result.output)
+        assert payload["error"]["code"] == "SB_MODEL_CONFIG_INVALID"
+        assert "LLM" in payload["error"]["message"]
+    else:
+        assert "SB_MODEL_CONFIG_INVALID" in result.output
+        assert "LLM" in result.output
+
+
+def test_book_init_help_exposes_dual_endpoint_flags():
+    result = CliRunner().invoke(cli, ["init", "--help"], prog_name="book")
+
+    assert result.exit_code == 0
+    assert "--llm-protocol [ollama|openai|anthropic]" in result.output
+    assert "--llm-base-url" in result.output
+    assert "--llm-api-key-env" in result.output
+    assert "--embedding-protocol [ollama|openai|anthropic]" in result.output
+    assert "--provider [ollama|api|anthropic]" in result.output
 
 
 def tmp_files(*roots: Path) -> list[Path]:

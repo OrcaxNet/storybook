@@ -190,10 +190,26 @@ def _print_setup_plan(plan: dict) -> None:
     "--embedding-api-key-env",
     help="凭据所在的环境变量名（不接受明文凭据）",
 )
-@click.option("--provider", type=click.Choice(["ollama", "api"]), help="模型 provider")
-@click.option("--base-url", help="provider 根 URL（不得包含凭据或 query）")
+@click.option(
+    "--provider",
+    type=click.Choice(["ollama", "api", "anthropic"]),
+    help="模型 provider（旧 shorthand，同时作用于 generation 与 embedding 两个端点）",
+)
+@click.option("--base-url", help="provider 根 URL（旧 shorthand，同时作用于两个端点）")
 @click.option("--llm-model", help="generation 模型名")
-@click.option("--api-key-env", help="API key 所在环境变量名；只保存变量名")
+@click.option("--api-key-env", help="API key 环境变量名（旧 shorthand，同时作用于两个端点）")
+@click.option(
+    "--llm-protocol",
+    type=click.Choice(["ollama", "openai", "anthropic"]),
+    help="generation 端点协议（openai=OpenAI 兼容需 /v1；anthropic 走 /v1/messages）",
+)
+@click.option("--llm-base-url", help="generation 端点 base URL")
+@click.option("--llm-api-key-env", help="generation 端点凭据环境变量名")
+@click.option(
+    "--embedding-protocol",
+    type=click.Choice(["ollama", "openai", "anthropic"]),
+    help="embedding 端点协议（默认 ollama）",
+)
 @click.option("--enable-schedule", is_flag=True, help="配置用户级 watch schedule")
 @click.option("--skip-models", "--skip-download", is_flag=True,
               help="不下载缺失 Ollama 模型并进入 degraded")
@@ -201,6 +217,7 @@ def setup_command(
     assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
     embedding_model, api_key_env, embedding_preset, embedding_base_url,
     embedding_dimension, embedding_version, embedding_api_key_env,
+    llm_protocol, llm_base_url, llm_api_key_env, embedding_protocol,
     enable_schedule, skip_models,
 ):
     """兼容 alias；canonical onboarding 命令为 ``book init``。"""
@@ -221,9 +238,101 @@ def setup_command(
         embedding_dimension=embedding_dimension,
         embedding_version=embedding_version,
         embedding_api_key_env=embedding_api_key_env,
+        llm_protocol=llm_protocol,
+        llm_base_url=llm_base_url,
+        llm_api_key_env=llm_api_key_env,
+        embedding_protocol=embedding_protocol,
         enable_schedule=enable_schedule,
         skip_models=skip_models,
         full_onboarding=False,
+    )
+
+
+def _base_url_hint(protocol: str, *, kind: str) -> str:
+    """协议标注 + /v1 说明的 baseUrl 提示文案（AC3）。"""
+
+    if protocol == "ollama":
+        return f"{kind} base URL（ollama 原生 http://host:11434，无需 /v1）"
+    if protocol == "anthropic":
+        return (
+            f"{kind} base URL（anthropic：Anthropic-compatible 走 /v1/messages，"
+            "如 https://api.deepseek.com/anthropic）"
+        )
+    return (
+        f"{kind} base URL（openai：OpenAI-compatible 需含 /v1，"
+        "如 http://localhost:11434/v1）"
+    )
+
+
+def _prompt_model_endpoints(
+    *, llm_protocol, llm_base_url, llm_model, llm_api_key_env,
+    embedding_protocol, embedding_base_url, embedding_model, embedding_api_key_env,
+    provider: str | None = None,
+) -> tuple:
+    """双端点交互提示：LLM → Embedding，embedding baseUrl/secret 默认继承 LLM。
+
+    只对仍未给定的字段提示；已由 flags 提供的字段跳过。secret 留空视为无凭据
+    （本地/Ollama 端点不会因空 secret 报错，AC2）。
+    """
+
+    # 旧 shorthand `--provider` 提供协议默认值：api→openai、anthropic→anthropic。
+    default_llm_protocol = {
+        "api": "openai", "anthropic": "anthropic", "ollama": "ollama",
+    }.get(provider or "", "openai")
+    if llm_protocol is None:
+        llm_protocol = click.prompt(
+            "LLM protocol (openai, anthropic, ollama)",
+            type=click.Choice(["openai", "anthropic", "ollama"]),
+            default=default_llm_protocol,
+        )
+    if llm_base_url is None:
+        llm_base_url = click.prompt(
+            _base_url_hint(llm_protocol, kind="LLM"),
+            default=(
+                None if llm_protocol != "ollama" else model_config.DEFAULT_OLLAMA_URL
+            ),
+        )
+    if llm_model is None:
+        llm_model = click.prompt(
+            "LLM model",
+            default=(
+                None if llm_protocol != "ollama" else model_config.DEFAULT_LLM_MODEL
+            ),
+        )
+    if llm_api_key_env is None:
+        llm_api_key_env = click.prompt(
+            "LLM secret env-name (留空表示无凭据，如本地 Ollama)",
+            default="",
+        ).strip() or None
+    if embedding_protocol is None:
+        embedding_protocol = click.prompt(
+            "Embedding protocol (openai, anthropic, ollama)",
+            type=click.Choice(["openai", "anthropic", "ollama"]),
+            default=llm_protocol,
+        )
+    if embedding_base_url is None:
+        embedding_base_url = click.prompt(
+            _base_url_hint(embedding_protocol, kind="Embedding"),
+            default=llm_base_url,
+        )
+    if embedding_model is None:
+        embedding_model = click.prompt(
+            "Embedding model",
+            default=(
+                None
+                if embedding_protocol != "ollama"
+                else model_config.DEFAULT_EMBED_MODEL
+            ),
+        )
+    if embedding_api_key_env is None:
+        embedding_api_key_env = click.prompt(
+            "Embedding secret env-name (默认同 LLM secret，留空表示无凭据)",
+            default=llm_api_key_env or "",
+        ).strip() or None
+    return (
+        llm_protocol, llm_base_url, llm_model, llm_api_key_env,
+        embedding_protocol, embedding_base_url, embedding_model,
+        embedding_api_key_env,
     )
 
 
@@ -231,20 +340,29 @@ def _run_onboarding(
     *, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
     embedding_model, api_key_env, embedding_preset, embedding_base_url,
     embedding_dimension, embedding_version, embedding_api_key_env,
+    llm_protocol, llm_base_url, llm_api_key_env, embedding_protocol,
     enable_schedule, skip_models, full_onboarding,
 ):
     """Shared, rerunnable implementation for ``book init`` and setup alias."""
 
-    embedding_options = (
-        embedding_base_url, embedding_dimension, embedding_version,
-        embedding_api_key_env,
-    )
-    if embedding_preset and provider:
-        raise click.UsageError(
-            "--embedding-preset and --provider are alternative setup interfaces"
+    # 双端点模型配置面（model-config）与 embedding-preset 配置面（setup-state）
+    # 是替代接口：LLM/共享 shorthand flags 只能用于 model-config 面。
+    if embedding_preset and any(
+        value is not None
+        for value in (
+            provider, base_url, llm_model, api_key_env, llm_protocol,
+            llm_base_url, llm_api_key_env, embedding_protocol,
         )
-    if not embedding_preset and any(value is not None for value in embedding_options):
-        raise click.UsageError("embedding 详细选项需与 --embedding-preset 同用")
+    ):
+        raise click.UsageError(
+            "--embedding-preset 与 LLM/共享模型端点 flags 是替代的配置面，不能同用"
+        )
+    if not embedding_preset and any(
+        value is not None for value in (embedding_dimension, embedding_version)
+    ):
+        raise click.UsageError(
+            "embedding dimension/version 选项需与 --embedding-preset 同用"
+        )
     if embedding_preset:
         try:
             config.apply_embedding_config(
@@ -262,7 +380,11 @@ def _run_onboarding(
     agents = tuple(agents) if agents else None
     model_options_supplied = not embedding_preset and any(
         value is not None
-        for value in (provider, base_url, llm_model, embedding_model, api_key_env)
+        for value in (
+            provider, base_url, llm_model, api_key_env, llm_protocol,
+            llm_base_url, llm_api_key_env, embedding_protocol,
+            embedding_model, embedding_base_url, embedding_api_key_env,
+        )
     )
     interactive = (
         not assume_yes
@@ -277,33 +399,70 @@ def _run_onboarding(
             click.echo(
                 f"Profile: reuse {active_profile.display_name} ({active_profile.id})"
             )
-    if provider is None and interactive:
-        provider = click.prompt(
-            "Model provider", type=click.Choice(["ollama", "api"]), default="ollama"
+    if interactive and not embedding_preset:
+        # 双端点交互：LLM → Embedding；baseUrl/secret 默认继承 LLM，均可覆盖。
+        (llm_protocol, llm_base_url, llm_model, llm_api_key_env,
+         embedding_protocol, embedding_base_url, embedding_model,
+         embedding_api_key_env) = _prompt_model_endpoints(
+            llm_protocol=llm_protocol, llm_base_url=llm_base_url,
+            llm_model=llm_model, llm_api_key_env=llm_api_key_env,
+            embedding_protocol=embedding_protocol,
+            embedding_base_url=embedding_base_url,
+            embedding_model=embedding_model,
+            embedding_api_key_env=embedding_api_key_env,
+            provider=provider,
         )
         model_options_supplied = True
     selected_model_config = None
-    provider = provider or "ollama"
-    if interactive and model_options_supplied:
-        if not base_url:
-            base_url = click.prompt(
-                "API base URL" if provider == "api" else "Ollama base URL",
-                default=(None if provider == "api" else model_config.DEFAULT_OLLAMA_URL),
+    if model_options_supplied:
+        # 非交互下远程 provider 必须有 base URL（交互模式由必填提示保证）。
+        gen_provider = model_config._provider_from_protocol(llm_protocol) or provider or "ollama"
+        if gen_provider in {"api", "anthropic"} and not (llm_base_url or base_url):
+            _emit_setup_error(
+                SetupError(
+                    "SB_MODEL_BASE_URL_REQUIRED",
+                    "api/anthropic LLM provider 需要 --llm-base-url 或 --base-url",
+                ),
+                as_json=as_json,
             )
-        if not llm_model:
-            llm_model = click.prompt(
-                "Generation model",
-                default=(None if provider == "api" else model_config.DEFAULT_LLM_MODEL),
+            return
+        emb_provider = (
+            model_config._provider_from_protocol(embedding_protocol)
+            or provider
+            or gen_provider
+        )
+        if (
+            emb_provider in {"api", "anthropic"}
+            and not (embedding_base_url or llm_base_url or base_url)
+        ):
+            _emit_setup_error(
+                SetupError(
+                    "SB_MODEL_BASE_URL_REQUIRED",
+                    "api/anthropic embedding provider 需要 --embedding-base-url 或 --base-url",
+                ),
+                as_json=as_json,
             )
-        if not embedding_model:
-            embedding_model = click.prompt(
-                "Embedding model",
-                default=(None if provider == "api" else model_config.DEFAULT_EMBED_MODEL),
+            return
+        try:
+            selected_model_config = model_config.build(
+                provider=provider,
+                base_url=base_url,
+                llm_model=llm_model,
+                embedding_model=embedding_model,
+                api_key_env=api_key_env
+                or ("STORYBOOK_API_KEY" if provider == "api" else None),
+                llm_protocol=llm_protocol,
+                llm_base_url=llm_base_url,
+                llm_credential_env=llm_api_key_env,
+                embedding_protocol=embedding_protocol,
+                embedding_base_url=embedding_base_url,
+                embedding_credential_env=embedding_api_key_env,
             )
-        if provider == "api" and not api_key_env:
-            api_key_env = click.prompt(
-                "API key environment variable", default="STORYBOOK_API_KEY"
+        except model_config.ModelConfigError as exc:
+            _emit_setup_error(
+                SetupError("SB_MODEL_CONFIG_INVALID", str(exc)), as_json=as_json
             )
+            return
     if interactive and full_onboarding and not agents:
         agent_answer = click.prompt(
             "Agent adapters (auto, skip, back, or comma-separated names)",
@@ -316,6 +475,8 @@ def _run_onboarding(
                 embedding_model=None, api_key_env=None, embedding_preset=None,
                 embedding_base_url=None, embedding_dimension=None,
                 embedding_version=None, embedding_api_key_env=None,
+                llm_protocol=None, llm_base_url=None, llm_api_key_env=None,
+                embedding_protocol=None,
                 enable_schedule=False,
                 skip_models=skip_models, full_onboarding=True,
             )
@@ -349,28 +510,12 @@ def _run_onboarding(
                 embedding_model=None, api_key_env=None, embedding_preset=None,
                 embedding_base_url=None, embedding_dimension=None,
                 embedding_version=None, embedding_api_key_env=None,
+                llm_protocol=None, llm_base_url=None, llm_api_key_env=None,
+                embedding_protocol=None,
                 enable_schedule=False,
                 skip_models=skip_models, full_onboarding=True,
             )
         enable_schedule = schedule_answer == "enable"
-    if model_options_supplied and provider == "api" and not base_url:
-        _emit_setup_error(
-            SetupError("SB_MODEL_BASE_URL_REQUIRED", "api provider 需要 --base-url"),
-            as_json=as_json,
-        )
-        return
-    if model_options_supplied:
-        try:
-            selected_model_config = model_config.build(
-                provider=provider,
-                base_url=base_url,
-                llm_model=llm_model,
-                embedding_model=embedding_model,
-                api_key_env=api_key_env or ("STORYBOOK_API_KEY" if provider == "api" else None),
-            )
-        except model_config.ModelConfigError as exc:
-            _emit_setup_error(SetupError("SB_MODEL_CONFIG_INVALID", str(exc)), as_json=as_json)
-            return
     try:
         plan = manager.plan(
             agents, provider_config=selected_model_config
@@ -405,20 +550,28 @@ def _run_onboarding(
     if not assume_yes and not as_json:
         click.confirm("Apply this plan?", abort=True)
 
-    temporary_secret = None
+    temporary_secrets: list[tuple[str, object]] = []
     secret_marker = object()
-    previous_secret = secret_marker
-    if (
-        interactive
-        and provider == "api"
-        and api_key_env
-        and not manager.environ.get(api_key_env)
-    ):
-        temporary_secret = click.prompt(
-            "API key (used for this run only)", hide_input=True
-        )
-        previous_secret = manager.environ.get(api_key_env, secret_marker)
-        manager.environ[api_key_env] = temporary_secret
+    if interactive and selected_model_config is not None:
+        prompted_envs: set[str] = set()
+        for kind, endpoint in (
+            ("LLM", selected_model_config.generation),
+            ("Embedding", selected_model_config.embedding),
+        ):
+            env_name = endpoint.credential_env
+            if (
+                endpoint.provider != "ollama"
+                and env_name
+                and not manager.environ.get(env_name)
+                and env_name not in prompted_envs
+            ):
+                temporary_secret = click.prompt(
+                    f"{kind} API key (used for this run only)", hide_input=True
+                )
+                previous = manager.environ.get(env_name, secret_marker)
+                manager.environ[env_name] = temporary_secret
+                temporary_secrets.append((env_name, previous))
+                prompted_envs.add(env_name)
 
     def progress(event: dict) -> None:
         if as_json:
@@ -445,11 +598,11 @@ def _run_onboarding(
             _emit_setup_error(exc, as_json=as_json)
             return
     finally:
-        if temporary_secret is not None:
-            if previous_secret is secret_marker:
-                manager.environ.pop(api_key_env, None)
+        for env_name, previous in temporary_secrets:
+            if previous is secret_marker:
+                manager.environ.pop(env_name, None)
             else:
-                manager.environ[api_key_env] = previous_secret
+                manager.environ[env_name] = previous
 
     recall = next(
         (item for item in result["smoke_tests"] if item["name"] == "recall"), None
@@ -848,11 +1001,27 @@ def _legacy_init_db() -> None:
     type=click.Choice(["claude", "cursor", "codex"]),
     help="只配置指定 Agent；可重复",
 )
-@click.option("--provider", type=click.Choice(["ollama", "api"]), help="模型 provider")
-@click.option("--base-url", help="provider 根 URL")
+@click.option(
+    "--provider",
+    type=click.Choice(["ollama", "api", "anthropic"]),
+    help="模型 provider（旧 shorthand，同时作用于 generation 与 embedding 两个端点）",
+)
+@click.option("--base-url", help="provider 根 URL（旧 shorthand，同时作用于两个端点）")
 @click.option("--llm-model", help="generation 模型名")
 @click.option("--embedding-model", help="embedding 模型名")
-@click.option("--api-key-env", help="API key 环境变量名；只保存变量名")
+@click.option("--api-key-env", help="API key 环境变量名（旧 shorthand，同时作用于两个端点）")
+@click.option(
+    "--llm-protocol",
+    type=click.Choice(["ollama", "openai", "anthropic"]),
+    help="generation 端点协议（openai=OpenAI 兼容需 /v1；anthropic 走 /v1/messages）",
+)
+@click.option("--llm-base-url", help="generation 端点 base URL")
+@click.option("--llm-api-key-env", help="generation 端点凭据环境变量名")
+@click.option(
+    "--embedding-protocol",
+    type=click.Choice(["ollama", "openai", "anthropic"]),
+    help="embedding 端点协议（默认 ollama）",
+)
 @click.option(
     "--embedding-preset",
     type=click.Choice(["ollama", "custom"]),
@@ -869,6 +1038,7 @@ def init_command(
     ctx, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
     embedding_model, api_key_env, embedding_preset, embedding_base_url,
     embedding_dimension, embedding_version, embedding_api_key_env,
+    llm_protocol, llm_base_url, llm_api_key_env, embedding_protocol,
     enable_schedule, skip_models,
 ):
     """Canonical ``book init`` onboarding; legacy ``storybook init`` initializes DB."""
@@ -879,7 +1049,8 @@ def init_command(
             assume_yes or dry_run or as_json or agents or provider or base_url
             or llm_model or embedding_model or api_key_env or embedding_preset
             or embedding_base_url or embedding_dimension or embedding_version
-            or embedding_api_key_env or enable_schedule or skip_models
+            or embedding_api_key_env or llm_protocol or llm_base_url
+            or llm_api_key_env or embedding_protocol or enable_schedule or skip_models
         )
         if supplied:
             raise click.UsageError(
@@ -902,6 +1073,10 @@ def init_command(
         embedding_dimension=embedding_dimension,
         embedding_version=embedding_version,
         embedding_api_key_env=embedding_api_key_env,
+        llm_protocol=llm_protocol,
+        llm_base_url=llm_base_url,
+        llm_api_key_env=llm_api_key_env,
+        embedding_protocol=embedding_protocol,
         enable_schedule=enable_schedule,
         skip_models=skip_models,
         full_onboarding=True,

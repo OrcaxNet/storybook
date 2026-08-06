@@ -489,7 +489,7 @@ def _ensure_embedding_identity_columns(db: sqlite3.Connection) -> None:
     adapter = state.get("active_adapter")
     if not endpoint and alias_base_url:
         endpoint = str(alias_base_url).rstrip("/")
-    if not adapter and alias_provider in {"ollama", "api"}:
+    if not adapter and alias_provider in {"ollama", "api", "anthropic"}:
         adapter = "ollama" if alias_provider == "ollama" else "openai_compatible"
 
     # Schemas older than FLO-179 have no route aliases. Every such released
