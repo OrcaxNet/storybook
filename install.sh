@@ -311,7 +311,7 @@ esac
 
 if [ "$RUN_INIT" -eq 1 ]; then
     if [ -t 0 ] && [ -t 1 ]; then
-        printf 'Run onboarding now? [Y/n] '
+        printf "Run 'book init' onboarding now? [Y/n] "
         read -r answer || answer=n
         case $answer in
             n|N|no|NO) printf 'Next: book init\n' ;;
