@@ -15,42 +15,46 @@ Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
   - LLM: `qwythos-hermes:latest` (override `STORYBOOK_LLM_MODEL`)
   - Embedding: `qwen3-embedding:0.6b`, **1024-dim** (override `STORYBOOK_EMBED_MODEL`). `EMBED_DIM` in config must match.
 - `config.py` auto-loads a project-root `.env` at import (no error if absent; copy `.env.example`). Pre-existing env vars / command-line `VAR=val` take priority over `.env` (`.env` never overwrites them).
-- The venv has no `pip` (created with `uv`). Install editable to get the `storybook` command: `VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .` (re-run if the project dir moves and the `storybook` shebang goes stale). Without installing, run via `PYTHONPATH=src .venv/bin/python -m storybook.cli <command>`.
+- The venv has no `pip` (created with `uv`). Install editable to get the `book` command (and `storybook` compat alias): `VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .` (re-run if the project dir moves and the `book` shebang goes stale). Without installing, run via `PYTHONPATH=src .venv/bin/python -m storybook.cli <command>`.
 
 ## Commands
 
 ```
-storybook init                          # create SQLite schema + vec0 virtual table (also auto-run by other commands)
-storybook setup [--yes|--dry-run|--json]  # user Profile + detected Claude/Cursor/Codex adapters + smoke tests
-storybook uninstall [--purge-data]      # restore managed config nodes; keep memory by default
-storybook profile show|list             # inspect the user-level Profile registry
-storybook profile create NAME           # create an isolated Profile
-storybook profile switch ID_OR_NAME     # switch the active Profile
-storybook migration discover            # find project-level v1 databases read-only
-storybook migration run PATH --dry-run  # zero-write migration plan
-storybook migration run PATH            # backup, convert, verify, atomic cut-over
-storybook migration rollback ID         # atomically point back to a v1 rollback copy
-storybook sync status                   # v0.2: explicit local_only status
-storybook doctor [--fix]                # env health check (Ollama/models/dim/sqlite-vec/vector double-write); --fix repairs double-write inconsistency
-storybook import-data                   # default: collect Claude Code sessions from ~/.claude/projects (incremental, dedup by sessionId)
-storybook import-data --claude          # same as above (explicit)
-storybook import-data --sample [--n 100]   # generate & import simulated Claude Code sessions (no real sessions needed)
-storybook import-data --cursor              # scan ~/Library/Application Support/Cursor/User/workspaceStorage (backup source)
-storybook import-data <file|dir>            # import JSON (list, {sessions:[...]}, or {messages:[...]} chat-log shape)
-storybook process [--session ID]        # "dream cycle": process all pending sessions (or one)
-storybook search "<query>" [--top 3]    # vector search + related-story activation
-storybook status --performance          # recent query p50/p95 + cache/fallback ratios
-storybook benchmark --model-state warm  # isolated 10k Story performance/quality baseline
-storybook stats | storybook list | storybook show <id>
+book init                               # onboarding wizard: Profile/model/Agent/schedule/smoke (other commands also auto-init)
+book admin init-db                      # create SQLite schema + vec0 virtual table (low-level entry)
+book admin uninstall [--purge-data]     # restore managed config nodes; keep memory by default
+book profile show|list                  # inspect the user-level Profile registry
+book profile create NAME                # create an isolated Profile
+book profile switch ID_OR_NAME          # switch the active Profile
+book admin migration discover           # find project-level v1 databases read-only
+book admin migration run PATH --dry-run # zero-write migration plan
+book admin migration run PATH           # backup, convert, verify, atomic cut-over
+book admin migration rollback ID        # atomically point back to a v1 rollback copy
+book doctor [--fix]                     # env health check (Ollama/models/dim/sqlite-vec/vector double-write); --fix repairs double-write inconsistency
+book run [--session ID]                 # "dream cycle": collect + process all pending sessions (or one)
+book search "<query>" [--top 3]         # vector search + related-story activation
+book status [--performance]             # run status + recent query p50/p95 + cache/fallback ratios
+book memory list | book memory show <id> | book memory forget
+book source list|enable|disable|reset   # manage local Agent history sources
+book admin benchmark --model-state warm # isolated 10k Story performance/quality baseline
+book admin index --version <v>          # incremental embedding shadow rebuild + atomic switch
+book admin eval all                     # retrieval/processing/split/ablation evaluation
+book mcp                                # start stdio MCP server for MCP-aware agents
 ```
 
-Note the command is **`import-data`**, not `import` (click auto-hyphenates the `import_data` function). With no flags/path it defaults to `--claude`. The `--claude`, `--sample`, `--cursor`, and `<path>` forms are mutually exclusive.
+For one minor release the legacy names (`storybook` executable, `setup`, `process`, `dream`,
+`import-data`, `sources`, top-level `list/show/forget/stats`) remain as hidden compat aliases
+calling the same business functions; their hints go only to stderr so JSON/MCP stdout stays clean.
+`book run` modes: default/`--once` (collect+process once), `--watch` (reactive), `--daemon`
+(scheduled loop), `--session ID` (process one session); watch/daemon/session are mutually exclusive.
+
+Note the legacy command is **`import-data`**, not `import` (click auto-hyphenates the `import_data` function). With no flags/path it defaults to `--claude`. The `--claude`, `--sample`, `--cursor`, and `<path>` forms are mutually exclusive.
 
 The pytest suite lives in `tests/` and mocks Ollama by default. `test_logs/*.json` and `hermes_sessions.json` are sample data sources for `import-data`.
 
 ## Architecture
 
-Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `context.py` owns ContextEnvelope capture, privacy normalization and environment-fit scoring; `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `storybook doctor` (env + vector double-write consistency self-check, reads via `store`). `setup_manager.py` orchestrates one-click setup/uninstall; `setup_adapters/` owns plugin-registered, node-scoped Claude Code/Cursor/Codex config merges and rollback.
+Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `context.py` owns ContextEnvelope capture, privacy normalization and environment-fit scoring; `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `book doctor` (env + vector double-write consistency self-check, reads via `store`). `setup_manager.py` orchestrates one-click setup/uninstall; `setup_adapters/` owns plugin-registered, node-scoped Claude Code/Cursor/Codex config merges and rollback.
 
 ### Storage layer (`store.py`) — SQLite + sqlite-vec
 Each random-UUID user Profile owns a database generation under `profiles/<profile_id>/`; the default is `db/memory.db`, while safe migrations use `migrations/<migration_id>/v2.db`. The registry stores only that Profile-relative `database_ref`, and switches it atomically after conversion validation. `profiles.py` is the sole registry/path resolver used by CLI, collectors, hooks and MCP; repository paths are not memory boundaries. Three tables (`sessions`, `stories`, `edges`) plus the **`story_vectors` vec0 virtual table** carry path-independent `global_id`, `profile_id`, and `sync_state=local_only`. Each `get_db()` call opens a fresh connection (WAL mode, foreign keys on) and loads the sqlite-vec extension.
@@ -79,7 +83,7 @@ Every query returns and locally records a privacy-safe latency breakdown:
 `cache/embed/vector/graph/rerank/serialize/total`. Diagnostics are written to
 `query_performance.jsonl` in the active Profile's log directory, with a strict
 metadata-only schema (never raw query,
-Story content, absolute paths, hostnames, or repository URLs). `storybook benchmark`
+Story content, absolute paths, hostnames, or repository URLs). `book admin benchmark`
 uses an isolated fixed-seed dataset and reports performance together with recall/MRR.
 
 When a caller supplies a ContextEnvelope, semantic similarity remains the primary

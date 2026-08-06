@@ -581,7 +581,7 @@ def _assert_reapply_authority(
     raise MigrationError(
         "SB_MIGRATION_ACTIVE_GENERATION_CHANGED",
         "当前 Profile 已指向其他数据库世代，不能复用该迁移产物",
-        hint="查看 storybook migration status 后重新规划",
+        hint="查看 book admin migration status 后重新规划",
     )
 
 
@@ -840,7 +840,7 @@ class MigrationManager:
             raise MigrationError(
                 "SB_MIGRATION_PROFILE_MISSING",
                 "Profile registry 尚未初始化",
-                hint="先运行 storybook setup，再执行迁移",
+                hint="先运行 book init，再执行迁移",
             )
         return profile
 
@@ -1445,7 +1445,7 @@ class MigrationManager:
                 raise MigrationError(
                     "SB_MIGRATION_ACTIVE_GENERATION_CHANGED",
                     "当前 Profile 已不再指向该迁移生成库",
-                    hint="先查看 storybook migration status，避免覆盖后续切换",
+                    hint="先查看 book admin migration status，避免覆盖后续切换",
                 )
             if not backup.is_file():
                 raise MigrationError(

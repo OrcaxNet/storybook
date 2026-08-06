@@ -432,7 +432,7 @@ def test_state_write_failure_rolls_back_first_install_and_returns_json_error(
     )
 
     assert result.exit_code == 1
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["status"] == "failed"
     assert payload["error"]["code"] == "SB_SETUP_STATE_WRITE_FAILED"
     assert payload["error"]["message"]
@@ -1046,7 +1046,7 @@ def test_setup_help_exposes_embedding_provider_selection():
     "command",
     [
         ["setup", "--yes", "--json", "--skip-models", "--agent", "cursor"],
-        ["uninstall", "--yes", "--json"],
+        ["admin", "uninstall", "--yes", "--json"],
     ],
     ids=["setup", "uninstall"],
 )
@@ -1530,7 +1530,7 @@ def test_custom_api_never_calls_ollama_model_management(isolated_setup, monkeypa
 
 def test_noninteractive_purge_requires_second_confirmation():
     result = CliRunner().invoke(
-        cli, ["uninstall", "--yes", "--purge-data", "--json"]
+        cli, ["admin", "uninstall", "--yes", "--purge-data", "--json"]
     )
 
     assert result.exit_code == 1

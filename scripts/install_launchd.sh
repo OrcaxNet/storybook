@@ -11,7 +11,7 @@
 # 做的事：把 scripts/com.storybook.dream.plist 模板里的占位符替换为真实路径，
 # 写入 ~/Library/LaunchAgents/com.storybook.dream.plist，然后 launchctl bootstrap 加载。
 #
-# 触发的命令是： <python> -m storybook.cli dream --once   （单次采集+加工，受文件锁保护）
+# 触发的命令是： <book> run --once   （单次采集+加工，受文件锁保护）
 set -euo pipefail
 
 LABEL="com.storybook.dream"
@@ -79,18 +79,26 @@ fi
 LOG_DIR="$("$PYTHON_BIN" -c 'from storybook import config; print(config.LOG_DIR)')"
 mkdir -p "$PLIST_DIR" "$LOG_DIR"
 
+# `book` entrypoint 与 python 同目录（如 .venv/bin/book）。
+BOOK_BIN="$(dirname "$PYTHON_BIN")/book"
+if [[ ! -x "$BOOK_BIN" ]]; then
+  echo "❌ 未找到 $BOOK_BIN。请确认该 venv 已安装 book entrypoint。" >&2
+  echo "   安装：VIRTUAL_ENV=\$(dirname $PYTHON_BIN) uv pip install -e ." >&2
+  exit 1
+fi
+
 # ── 从模板渲染 ──
 echo "📝 渲染 plist -> $PLIST"
 # 用 python 做占位符替换，避免 sed 的分隔符/特殊字符问题
-"$PYTHON_BIN" - "$TEMPLATE" "$PLIST" "$PYTHON_BIN" "$LOG_DIR" "$INTERVAL" <<'PYEOF'
+"$PYTHON_BIN" - "$TEMPLATE" "$PLIST" "$BOOK_BIN" "$LOG_DIR" "$INTERVAL" <<'PYEOF'
 import sys
-src, dst, pybin, logdir, interval = sys.argv[1:6]
+src, dst, bookbin, logdir, interval = sys.argv[1:6]
 text = open(src, encoding="utf-8").read()
-text = text.replace("__PYTHON_BIN__", pybin)
+text = text.replace("__BOOK_BIN__", bookbin)
 text = text.replace("__LOG_DIR__", logdir)
 text = text.replace("__START_INTERVAL__", interval)
 open(dst, "w", encoding="utf-8").write(text)
-print(f"   python={pybin}\n   logdir={logdir}\n   interval={interval}s")
+print(f"   book={bookbin}\n   logdir={logdir}\n   interval={interval}s")
 PYEOF
 
 # ── 加载（先卸载旧实例，再 bootstrap；bootstrap 失败回退 load -w）──

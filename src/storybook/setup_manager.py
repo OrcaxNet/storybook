@@ -510,7 +510,7 @@ class SetupManager:
     def _write_schedule(self) -> dict[str, Any]:
         """Write a user-owned, login-persistent watch definition without sudo."""
 
-        command = [self.launcher.command, *self.launcher.args, "process", "--watch"]
+        command = [self.launcher.command, *self.launcher.args, "run", "--watch"]
         if sys.platform == "darwin":
             import plistlib
 
@@ -855,7 +855,7 @@ class SetupManager:
             raise SetupError(
                 "SB_MODEL_INDEX_STATE_INVALID",
                 "无法只读检查 active embedding index",
-                hint="运行 `storybook doctor` 修复数据库后重试",
+                hint="运行 `book doctor` 修复数据库后重试",
             ) from exc
         if row is None:
             return
@@ -891,7 +891,7 @@ class SetupManager:
                 f"target={candidate.provider}/{candidate.model}"
             ),
             hint=(
-                "保持当前配置，或运行 `storybook profile create provider-migration "
+                "保持当前配置，或运行 `book profile create provider-migration "
                 "--switch` 创建隔离 Profile 并重新执行 setup；禁止在旧索引上静默切换"
             ),
         )

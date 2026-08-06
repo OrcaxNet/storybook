@@ -262,7 +262,7 @@ class TestPrimeContextMemories:
         out = mcp_server.prime_context_memories(cwd="/x/proj", first_prompt="q")
         assert out["injected"] is False
         assert out["note"] is not None
-        assert "storybook doctor" in out["note"]
+        assert "book doctor" in out["note"]
 
 
 # ═══════════════════════════════════════════════

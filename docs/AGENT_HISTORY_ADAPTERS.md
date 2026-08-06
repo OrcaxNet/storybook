@@ -49,8 +49,8 @@ If an upstream tool rewrites existing history, rebuild only that source's
 checkpoint, then import it again:
 
 ```bash
-storybook sources reset-checkpoint codex --yes
-storybook import-data --source codex
+book source reset codex --yes
+book run --source codex --once
 ```
 
 Resetting a source checkpoint does not reset other adapters. The next import

@@ -142,7 +142,7 @@ class TestPrimeContextSilence:
         assert out["injected"] is False
         assert out["briefing"] == ""
         assert out["note"] is not None
-        assert "storybook doctor" in out["note"]
+        assert "book doctor" in out["note"]
 
     def test_empty_query_silent(self, fake_embedder):
         """cwd 与 first_prompt 均空 -> 无 query，静默不注入。"""

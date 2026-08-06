@@ -1,4 +1,4 @@
-"""环境与健康自检 - ``storybook doctor``
+"""环境与健康自检 - ``book doctor``
 
 逐项检查 Embedding API / DeepSeek LLM 配置 / Embedding 模型 / 向量维度 /
 sqlite-vec 扩展与虚表 / 向量双写一致性，给出 ✅/❌ 与可操作修复建议；
@@ -200,7 +200,7 @@ def run_doctor(fix: bool = False) -> bool:
                     "Embedding 维度", False,
                     detail=f"期望 {config.EMBED_DIM}，实际 {actual}（不一致）",
                     suggestion=(f"换用 {config.EMBED_DIM} 维的 embedding 模型，"
-                                f"或同步调整 config.EMBED_DIM 后 `storybook init` 重建虚表")))
+                                f"或同步调整 config.EMBED_DIM 后 `book init` 重建虚表")))
         else:
             results.append(CheckResult(
                 "Embedding 维度", False,
@@ -225,7 +225,7 @@ def run_doctor(fix: bool = False) -> bool:
         results.append(CheckResult(
             "Serving index 兼容性", False,
             detail=f"reason=serving_index_mismatch：{compatibility['detail']}",
-            suggestion=("保留当前 serving index；使用 `storybook embedding-backfill` "
+            suggestion=("保留当前 serving index；使用 `book admin index` "
                         "完成 shadow 后再原子切换")))
 
     # [6] sqlite-vec 扩展 + story_vectors 虚表
@@ -242,12 +242,12 @@ def run_doctor(fix: bool = False) -> bool:
         results.append(CheckResult(
             "sqlite-vec 扩展 + story_vectors 虚表", False,
             detail="数据库未初始化（缺少 stories 表）",
-            suggestion="`storybook init`"))
+            suggestion="`book init`"))
     elif not vec_exists:
         results.append(CheckResult(
             "sqlite-vec 扩展 + story_vectors 虚表", False,
             detail="sqlite-vec ✅，但 story_vectors 虚表缺失",
-            suggestion="`storybook init`（幂等，会补建虚表）"))
+            suggestion="`book init`（幂等，会补建虚表）"))
     else:
         results.append(CheckResult(
             "sqlite-vec 扩展 + story_vectors 虚表", True,
@@ -272,7 +272,7 @@ def run_doctor(fix: bool = False) -> bool:
                 detail=(f"不一致 {inconsistent} 项：缺 vec0 行 {len(cons['missing_vec'])}，"
                         f"孤立 vec0 行 {len(cons['orphan_vec'])}"
                         f"（BLOB {cons['blob_count']} / vec0 {cons['vec_count']}）"),
-                suggestion="`storybook doctor --fix` 重建缺失行 / 清除孤立行"))
+                suggestion="`book doctor --fix` 重建缺失行 / 清除孤立行"))
 
     # ── --fix：修复向量双写一致性并复检 ──
     fix_line = None

@@ -1,10 +1,10 @@
 # Storybook 做梦周期 - Linux systemd 服务模板（非 macOS 兜底）
 #
 # macOS 用 launchd（见 com.storybook.dream.plist + install_launchd.sh）；
-# Linux 用 systemd 托管 `storybook dream` 守护进程（每 DREAM_INTERVAL 秒一轮）。
+# Linux 用 systemd 托管 `book run --daemon` 守护进程（每 DREAM_INTERVAL 秒一轮）。
 #
-# 安装步骤（替换占位符 __PYTHON_BIN__）：
-#   1. 渲染：sed -e 's|__PYTHON_BIN__|/home/you/storybook/.venv/bin/python|' \
+# 安装步骤（替换占位符 __BOOK_BIN__）：
+#   1. 渲染：sed -e 's|__BOOK_BIN__|/home/you/storybook/.venv/bin/book|' \
 #                scripts/com.storybook.dream.service \
 #                > ~/.config/systemd/user/storybook-dream.service
 #   2. 加载：systemctl --user daemon-reload
@@ -13,7 +13,7 @@
 #            （dreamd 另写当前 Profile 日志目录下的 dream.log）
 #
 # 不想用 systemd 也可直接 nohup 后台跑：
-#   nohup __PYTHON_BIN__ -m storybook.cli dream >/dev/null 2>&1 &
+#   nohup __BOOK_BIN__ run --daemon >/dev/null 2>&1 &
 
 [Unit]
 Description=Storybook dream cycle (offline coding-memory consolidation)
@@ -21,7 +21,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=__PYTHON_BIN__ -m storybook.cli dream
+ExecStart=__BOOK_BIN__ run --daemon
 Restart=on-failure
 RestartSec=60
 # 让出前台资源：做梦周期会调本地 Ollama
