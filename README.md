@@ -297,20 +297,38 @@ flowchart LR
 ### 模型 Provider onboarding
 
 `book` 是 canonical 命令，`storybook` 在兼容期保留旧入口。新安装会在 active Profile 内写入版本化的
-`model-config.json`，generation 与 embedding 可分别诊断；文件只保存 credential
-环境变量名，绝不保存密钥。
+`model-config.json`。**generation（LLM）与 embedding 是两个独立端点**，各自具备
+协议 `ollama | openai | anthropic`、base URL、model 与可选的 credential 环境变量名；
+文件只保存 credential 环境变量名，绝不保存密钥。base URL 提示会标注协议类型与 `/v1`
+说明（openai 兼容需含 `/v1`、anthropic 走 `/v1/messages`、ollama 原生无需 `/v1`），
+且不强制“全局 provider 单选”。本地/Ollama 端点的 secret 可留空，视为无凭据。
 
 ```bash
-# 本地 Ollama：探测服务，按需拉取 generation/embedding 模型
-book init --provider ollama --llm-model qwen3:8b \
+# 本地 Ollama（双端点均 Ollama）：探测服务，按需拉取 generation/embedding 模型
+book init --llm-protocol ollama --llm-base-url http://localhost:11434 \
+  --llm-model qwen3:8b \
+  --embedding-protocol ollama --embedding-base-url http://localhost:11434 \
   --embedding-model qwen3-embedding:0.6b
 
-# OpenAI-compatible API：明确使用 /v1/chat/completions 与 /v1/embeddings
+# 混合场景：LLM=OpenAI-compatible（如 DeepSeek，/v1/chat/completions）+
+#            Embedding=本地 Ollama（/api/embeddings），端点完全独立
 export STORYBOOK_API_KEY='...'
-book init --provider api --base-url https://gateway.example/v1-root \
-  --llm-model chat-model --embedding-model embedding-model \
-  --api-key-env STORYBOOK_API_KEY
+book init --llm-protocol openai --llm-base-url https://api.deepseek.com \
+  --llm-model deepseek-v4-flash --llm-api-key-env STORYBOOK_API_KEY \
+  --embedding-protocol ollama --embedding-base-url http://localhost:11434 \
+  --embedding-model bge-m3
+
+# Anthropic-compatible LLM（/v1/messages）
+export ANTHROPIC_AUTH_TOKEN='...'
+book init --llm-protocol anthropic --llm-base-url https://api.deepseek.com/anthropic \
+  --llm-model deepseek-v4-flash --llm-api-key-env ANTHROPIC_AUTH_TOKEN \
+  --embedding-protocol ollama --embedding-model qwen3-embedding:0.6b
 ```
+
+交互式 `book init` 按「LLM baseUrl → model → secret」→「Embedding baseUrl（默认=LLM）→
+model → secret（默认=LLM）」顺序提示；embedding 取值可覆盖。非交互 flags 中，
+`--provider / --base-url / --api-key-env` 是“同时作用于两个端点”的旧 shorthand，
+`--llm-* / --embedding-*` 按端点独立覆盖。
 
 外部 embedding 必须返回当前 Profile 配置的 `STORYBOOK_EMBED_DIM` 维度，否则
 setup/doctor 会报告 dimension mismatch。base URL 中的 userinfo、query 和 fragment
@@ -349,8 +367,11 @@ book status
 book search "what should I remember about this task?"
 ```
 
-非交互环境可使用 `book init --provider ... --agent codex --yes --json`；API
-密钥只从 `--api-key-env` 指定的进程环境变量读取，Profile 只保存变量名。
+非交互环境可使用 `book init --agent codex --yes --json` 配合双端点模型 flags
+（`--llm-protocol/--llm-base-url/--llm-api-key-env` 与
+`--embedding-protocol/--embedding-base-url/--embedding-api-key-env`，旧
+`--provider/--base-url/--api-key-env` 仍可同时作用于两个端点）；API 密钥只从
+指定的凭据环境变量读取，Profile 只保存变量名。
 `book setup` 是一个 minor release 内的隐藏兼容 alias。旧 `storybook init` 继续只做
 数据库初始化，低层 canonical 入口为 `book admin init-db`。
 
