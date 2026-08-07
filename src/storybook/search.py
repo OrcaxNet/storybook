@@ -17,7 +17,40 @@ from . import context as context_module
 
 logger = logging.getLogger(__name__)
 
+# [SB] 检索管线标签化 trace 专用 logger（见 cli.setup_logging）。DEBUG 级门控：
+# 默认不输出；--verbose 时各阶段行以 ``[SB] [req=...] [stage=...]`` 前缀输出到
+# stderr，stdout 的 JSON / MCP 协议保持纯净。
+sb_logger = logging.getLogger("storybook.sb")
+
 T = TypeVar("T")
+
+
+def _sb_trace(request_id: str, stage: str, message: str) -> None:
+    """Emit one labeled [SB] pipeline trace record (DEBUG, silent unless --verbose)."""
+    sb_logger.debug(
+        message,
+        extra={"sb_trace": True, "sb_request_id": request_id, "sb_stage": stage},
+    )
+
+
+def _vector_preview(vector: list[float], limit: int = 5) -> str:
+    """Compact numeric summary of an embedding — never a full dump."""
+    if not vector:
+        return "[]"
+    shown = ", ".join(f"{value:.3f}" for value in vector[:limit])
+    return f"[{shown}{', …' if len(vector) > limit else ''}]"
+
+
+def _matches_summary(matches: list[dict], limit: int = 5) -> str:
+    """``#id:title(score)`` compact summary for trace lines; truncates long titles."""
+    parts = []
+    for match in matches[:limit]:
+        title = (match.get("title") or "?")
+        if len(title) > 32:
+            title = title[:31] + "…"
+        score = float(match.get("score", match.get("similarity", 0.0)))
+        parts.append(f"#{match['story_id']}:{title}({score:.4f})")
+    return ", ".join(parts) or "-"
 
 
 def search(
@@ -60,6 +93,10 @@ def search(
     if not normalized_query:
         raise ValueError("query 不能为空")
     request_id = uuid.uuid4().hex
+    _sb_trace(
+        request_id, "query",
+        f"original={query!r} normalized={normalized_query!r}",
+    )
     latency = performance.empty_latency()
     total_started = performance.now()
     model_state = embeddings.model_state()
@@ -144,6 +181,12 @@ def search(
             [match["story_id"] for match in cached.get("top_matches", [])]
         )
         cached["query_vector_cache_hit"] = True
+        _sb_trace(
+            request_id, "final",
+            "cache_hit "
+            f"top_k={len(cached.get('top_matches', []))} "
+            f"ids={[m['story_id'] for m in cached.get('top_matches', [])]}",
+        )
         return finish(cached, mode="cache")
 
     # ── Step 1: 生成查询向量 ──
@@ -183,10 +226,23 @@ def search(
             query_cache.set_query_vector(identity, normalized_query, query_vec)
     keywords = []   # 不再提取；保留字段以兼容返回结构
 
+    if query_vec:
+        _sb_trace(
+            request_id, "embed",
+            f"dim={len(query_vec)} preview={_vector_preview(query_vec)} "
+            f"source={'cache' if query_vector_cache_hit else 'compute'}",
+        )
+    else:
+        _sb_trace(
+            request_id, "embed",
+            f"unavailable reason={embed_failure_reason or 'embedding_unavailable'}",
+        )
+
     if not query_vec:
         return _lexical_fallback(
             query=query,
             normalized_query=normalized_query,
+            request_id=request_id,
             top_k=top_k,
             latency=latency,
             finish=finish,
@@ -218,6 +274,7 @@ def search(
         return _lexical_fallback(
             query=query,
             normalized_query=normalized_query,
+            request_id=request_id,
             top_k=top_k,
             latency=latency,
             finish=finish,
@@ -238,6 +295,10 @@ def search(
         match for match in matches
         if match["similarity"] >= config.SIM_THRESHOLD_SEARCH
     ]
+    _sb_trace(
+        request_id, "recall-vector",
+        f"candidates={len(vector_matches)} " + _matches_summary(vector_matches),
+    )
     lexical_started = performance.now()
     lexical_status, lexical_matches = _call_with_deadline(
         lambda: store.search_by_lexical(
@@ -251,8 +312,17 @@ def search(
     latency["lexical"] = performance.elapsed_ms(lexical_started)
     degraded_reasons: list[str] = []
     if lexical_status != "ok" or lexical_matches is None:
+        _sb_trace(
+            request_id, "recall-lexical",
+            "unavailable degraded=lexical_index_unavailable",
+        )
         lexical_matches = []
         degraded_reasons.append("lexical_index_unavailable")
+    else:
+        _sb_trace(
+            request_id, "recall-lexical",
+            f"candidates={len(lexical_matches)} " + _matches_summary(lexical_matches),
+        )
 
     fusion_started = performance.now()
     matches = adaptive.fuse_rankings(
@@ -267,6 +337,10 @@ def search(
         top_k=candidate_limit,
     )
     latency["fusion"] = performance.elapsed_ms(fusion_started)
+    _sb_trace(
+        request_id, "fusion",
+        f"candidates={len(matches)} top_ids={[m['story_id'] for m in matches[:5]]}",
+    )
 
     # ── Step 4: explainable auto/deep gate + independently budgeted stage ──
     query_plan = adaptive.plan_query(
@@ -285,6 +359,11 @@ def search(
         "degraded_reasons": [],
     }
     if query_plan["should_transform"]:
+        _sb_trace(
+            request_id, "transform",
+            f"gate triggers={query_plan.get('trigger_reasons', [])} "
+            f"selected={query_plan.get('selected_transforms', [])}",
+        )
         second_stage_timeout = (
             config.QUERY_DEEP_SECOND_STAGE_TIMEOUT_SECONDS
             if retrieval_mode == "deep"
@@ -310,6 +389,7 @@ def search(
         transform_status, transformed = _call_with_deadline(
             lambda: _run_second_stage(
                 normalized_query,
+                request_id=request_id,
                 selected_transforms=query_plan["selected_transforms"],
                 retrieval_mode=retrieval_mode,
                 identity=identity,
@@ -349,8 +429,15 @@ def search(
                 "retrievals_completed": 0,
                 "degraded_reasons": [reason],
             }
+            _sb_trace(
+                request_id, "transform",
+                f"failed status={transform_status} reason={reason}",
+            )
+    else:
+        _sb_trace(request_id, "transform", "skipped")
 
     if not matches:
+        _sb_trace(request_id, "final", "top_k=0 ids=[] result_state=no_match")
         result = {
             "query": query,
             "keywords": keywords,
@@ -412,6 +499,15 @@ def search(
     )
     strict_filtered += graph_strict_filtered
     latency["graph"] = performance.elapsed_ms(graph_started)
+    graph_trace = graph_info["trace"]
+    _sb_trace(
+        request_id, "graph",
+        f"status={graph_trace.get('status')} "
+        f"seeds={len(graph_trace.get('seed_story_ids', []))} "
+        f"expanded={graph_trace.get('expanded_candidates')} "
+        f"paths={graph_trace.get('paths_considered')} "
+        f"returned={[str(i) for i in graph_trace.get('returned_story_ids', [])[:10]]}",
+    )
     if graph_info["trace"].get("status") == "degraded":
         degraded_reasons.append(
             graph_info["trace"].get("degraded_reason", "graph_unavailable")
@@ -433,8 +529,19 @@ def search(
     matches = _strip_rerank_details(matches)
     latency["rerank"] = performance.elapsed_ms(rerank_started)
     degraded_reasons.extend(rerank_reasons)
+    _sb_trace(
+        request_id, "rerank",
+        f"enabled={rerank_trace.get('enabled')} status={rerank_trace.get('status')} "
+        f"top={[(m['story_id'], round(float(m.get('score', m.get('similarity', 0.0))), 4)) for m in matches[:top_k]]}",
+    )
     matches = matches[:top_k]
     top_matches = _attach_related(matches)
+    _sb_trace(
+        request_id, "final",
+        f"top_k={len(top_matches)} "
+        f"ids={[m['story_id'] for m in top_matches]} "
+        f"titles={[str(m.get('title', ''))[:40] for m in top_matches]}",
+    )
 
     feedback_queued = feedback.enqueue_recall_feedback(
         [match["story_id"] for match in top_matches]
@@ -469,6 +576,7 @@ def search(
 def _run_second_stage(
     normalized_query: str,
     *,
+    request_id: str,
     selected_transforms: list[str],
     retrieval_mode: str,
     identity: str,
@@ -488,6 +596,11 @@ def _run_second_stage(
         timeout_seconds=transform_timeout,
     )
     if not payload:
+        _sb_trace(
+            request_id, "transform",
+            f"status=unavailable reason=query_transform_unavailable "
+            f"transforms={selected_transforms}",
+        )
         return {
             "rankings": [],
             "transform_used": [],
@@ -518,6 +631,14 @@ def _run_second_stage(
             deduplicated.append((transform, candidate))
             seen.add(candidate)
     variants = deduplicated[:max(1, config.QUERY_MULTI_QUERY_LIMIT + 2)]
+    generated_queries = ", ".join(
+        f"{transform}={str(query)[:60]!r}" for transform, query in variants
+    )
+    _sb_trace(
+        request_id, "transform",
+        f"status=ok generated_queries={len(variants)} "
+        + (generated_queries or "none"),
+    )
 
     rankings: list[dict] = []
     used: list[str] = []
@@ -610,6 +731,7 @@ def _lexical_fallback(
     *,
     query: str,
     normalized_query: str,
+    request_id: str,
     top_k: int,
     latency: dict[str, float],
     finish: Callable[..., dict],
@@ -627,6 +749,7 @@ def _lexical_fallback(
         lambda: _run_lexical_fallback(
             normalized_query,
             top_k,
+            request_id=request_id,
             current_context=current_context,
             scope=scope,
             graph_enabled=graph_enabled,
@@ -651,6 +774,11 @@ def _lexical_fallback(
         fallback_status = "ok"
     else:
         latency["fallback"] = performance.elapsed_ms(fallback_started)
+        _sb_trace(
+            request_id, "final",
+            "top_k=0 ids=[] result_state=degraded_unavailable "
+            f"fallback_status={call_status}",
+        )
         top_matches = []
         feedback_queued = True
         result_state = "degraded_unavailable"
@@ -682,6 +810,10 @@ def _lexical_fallback(
     query_plan["should_transform"] = False
     query_plan["effective_mode"] = "fast_fallback"
     query_plan["skip_reason"] = "primary_embedding_unavailable"
+    _sb_trace(
+        request_id, "transform",
+        "skipped reason=primary_embedding_unavailable",
+    )
     degraded_reasons = [degraded_reason, *fallback_degraded_reasons]
 
     return finish(
@@ -719,6 +851,7 @@ def _run_lexical_fallback(
     normalized_query: str,
     top_k: int,
     *,
+    request_id: str,
     current_context: dict | None,
     scope: str,
     graph_enabled: bool,
@@ -739,12 +872,20 @@ def _run_lexical_fallback(
     )
     fallback_ms = round((time.perf_counter() - fallback_started) * 1000, 3)
     candidate_limit = max(top_k * 4, top_k, min(64, config.RERANK_TOP_N))
+    _sb_trace(
+        request_id, "recall-lexical",
+        f"candidates={len(lexical_matches)} " + _matches_summary(lexical_matches),
+    )
     matches = adaptive.fuse_rankings([], lexical_matches, limit=candidate_limit)
     matches, strict_filtered = _environment_rerank(
         matches,
         current_context=current_context,
         scope=scope,
         top_k=candidate_limit,
+    )
+    _sb_trace(
+        request_id, "fusion",
+        f"candidates={len(matches)} top_ids={[m['story_id'] for m in matches[:5]]}",
     )
     graph_started = time.perf_counter()
     matches, graph_info, graph_strict_filtered = _graph_rerank(
@@ -766,6 +907,15 @@ def _run_lexical_fallback(
         ),
     )
     strict_filtered += graph_strict_filtered
+    graph_trace = graph_info["trace"]
+    _sb_trace(
+        request_id, "graph",
+        f"status={graph_trace.get('status')} "
+        f"seeds={len(graph_trace.get('seed_story_ids', []))} "
+        f"expanded={graph_trace.get('expanded_candidates')} "
+        f"paths={graph_trace.get('paths_considered')} "
+        f"returned={[str(i) for i in graph_trace.get('returned_story_ids', [])[:10]]}",
+    )
     matches, rerank_detail_trace = _hydrate_rerank_details(
         matches, enabled=rerank_enabled
     )
@@ -776,8 +926,19 @@ def _run_lexical_fallback(
         rerank_trace, rerank_detail_trace
     )
     matches = _strip_rerank_details(matches)
+    _sb_trace(
+        request_id, "rerank",
+        f"enabled={rerank_trace.get('enabled')} status={rerank_trace.get('status')} "
+        f"top={[(m['story_id'], round(float(m.get('score', m.get('similarity', 0.0))), 4)) for m in matches[:top_k]]}",
+    )
     matches = matches[:top_k]
     top_matches = _attach_related(matches)
+    _sb_trace(
+        request_id, "final",
+        f"top_k={len(top_matches)} "
+        f"ids={[m['story_id'] for m in top_matches]} "
+        f"titles={[str(m.get('title', ''))[:40] for m in top_matches]}",
+    )
     graph_ms = round((time.perf_counter() - graph_started) * 1000, 3)
     degraded_reasons = []
     if graph_info["trace"].get("status") == "degraded":
