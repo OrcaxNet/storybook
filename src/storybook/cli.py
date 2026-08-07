@@ -9,6 +9,7 @@ Canonical 信息架构（FLO-180）:
     book run [模式]             采集并形成记忆（默认 / --once / --watch / --daemon / --session）
     book search <query>         搜索记忆
     book status [--performance] 本地运行状态与可选查询性能摘要
+    book version                查看当前版本
     book mcp                    启动 MCP server（stdio，供 Claude Code 等 agent 召回）
 
   分组:
@@ -88,7 +89,7 @@ def cli(ctx, verbose):
     """🧠 Storybook - 离线 Coding 记忆系统
 
     \b
-    高频任务:  init / doctor / run / search / status / mcp
+    高频任务:  init / doctor / run / search / status / version / mcp
     分组:       memory / source / profile / admin
     """
     setup_logging(verbose)
@@ -1809,6 +1810,21 @@ def status(include_performance, as_json):
             for stage in performance.LATENCY_STAGES[:-1]
         ]
         click.echo("Stage p95(ms)  " + " · ".join(stage_bits))
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
+def version(as_json):
+    """📦 查看当前版本。"""
+    from . import __version__
+
+    if as_json:
+        click.echo(
+            json.dumps({"name": "storybook", "version": __version__},
+                       ensure_ascii=False)
+        )
+        return
+    click.echo(f"storybook {__version__}")
 
 
 def _memory_list_impl(limit: int) -> None:

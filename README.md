@@ -656,6 +656,7 @@ book admin benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
   book run [模式]              采集并形成记忆
   book search "<query>"        搜索记忆
   book status [--performance]  运行状态
+  book version [--json]        查看当前版本
   book mcp                     启动 MCP server（stdio）
 
 分组:
@@ -698,6 +699,8 @@ book profile show|list               # 查看用户级 Profile 与数据目录
 book profile create NAME             # 创建 isolated Profile（可加 --switch）
 book profile switch ID_OR_NAME       # 切换当前 Profile
 book status                          # 运行状态；--performance 输出最近 100 次查询 p50/p95
+book version                         # 查看当前版本（storybook X.Y.Z）
+book version --json                  # 结构化版本（{"name":"storybook","version":"X.Y.Z"}）
 book memory list [--limit 20]        # 列出所有 Story
 book memory show <story_id>          # 查看 Story 详情（含关联记忆与来源环境）
 book memory forget [--min-age-days 90] [--apply]  # 衰减并预览/归档低价值记忆（默认仅预览）
