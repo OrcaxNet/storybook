@@ -27,6 +27,7 @@ Canonical 信息架构（FLO-180）:
 import json
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -48,6 +49,8 @@ from . import (
 from . import eval as eval_module
 from . import search as search_module
 from . import context as context_module
+from . import updater as updater_module
+from . import __version__
 from .profiles import ProfileError
 from .migration import MigrationError
 from .setup_manager import SetupError, SetupManager
@@ -135,6 +138,25 @@ def _emit_setup_error(exc: SetupError, *, as_json: bool) -> None:
         raise click.exceptions.Exit(1)
     rendered_hint = f"\n修复建议: {hint}" if hint else ""
     raise click.ClickException(f"[{exc.code}] {exc}{rendered_hint}") from exc
+
+
+def _emit_update_error(exc, *, as_json: bool) -> None:
+    """输出 ``book update`` 失败：稳定 ``SB_*`` 错误码 + 退出非 0。"""
+    if exc.detail:
+        click.echo(exc.detail.rstrip("\n"), err=True)
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "error": {"code": exc.code, "message": exc.message},
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        raise click.exceptions.Exit(1)
+    raise click.ClickException(f"[{exc.code}] {exc.message}") from exc
 
 
 def _print_setup_plan(plan: dict) -> None:
@@ -1100,6 +1122,147 @@ def doctor(fix):
     加 --fix 自动修复向量双写不一致。
     """
     health.run_doctor(fix=fix)
+
+
+@cli.command(name="update")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="跳过确认直接安装")
+@click.option("--dry-run", is_flag=True, help="只输出升级计划；零写入")
+@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
+@click.option(
+    "--prefix",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="安装前缀（默认从当前安装推断，回退 $HOME/.local）",
+)
+@click.option(
+    "--timeout",
+    type=float,
+    default=30.0,
+    hidden=True,
+    help="版本检测网络超时（秒）",
+)
+@click.option(
+    "--installer",
+    type=click.Path(path_type=Path),
+    default=None,
+    hidden=True,
+    help="install.sh 路径（镜像/测试覆盖；也可用 STORYBOOK_INSTALL_SCRIPT）",
+)
+def update_command(assume_yes, dry_run, as_json, prefix, timeout, installer):
+    """⬆️ 检测并升级到最新正式版本（自动安装，不动 Profile/数据库）
+
+    检测最新版本（GitHub Releases），已是最新则直接退出；有新版时下载并校验
+    sha256 后原子安装（backup + swap + rollback）。默认要求确认，可用 --yes 跳过。
+    """
+    current = __version__
+    target_prefix = prefix or updater_module.infer_prefix() or (Path.home() / ".local")
+
+    try:
+        latest = updater_module.detect_latest_version(timeout=timeout)
+        available = updater_module.is_update_available(current, latest)
+    except updater_module.UpdateError as exc:
+        _emit_update_error(exc, as_json=as_json)
+        return
+
+    if not available:
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "status": "up_to_date",
+                        "current_version": current,
+                        "latest_version": latest,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            click.echo(f"Already up to date (v{latest})")
+        return
+
+    if dry_run:
+        source = updater_module.detection_url()
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "status": "dry_run",
+                        "current_version": current,
+                        "latest_version": latest,
+                        "prefix": str(target_prefix),
+                        "source": source,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            click.echo("Storybook update plan")
+            click.echo(f"  Current   {current}")
+            click.echo(f"  Latest    {latest}")
+            click.echo(f"  Prefix    {target_prefix}")
+            click.echo(f"  Source    {source}")
+            click.echo("")
+            click.echo("Dry-run complete: no writes performed.")
+        return
+
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            _emit_update_error(
+                updater_module.UpdateError(
+                    "SB_UPDATE_CONFIRM_REQUIRED",
+                    "非交互环境升级需要 --yes/-y 确认",
+                ),
+                as_json=as_json,
+            )
+            return
+        try:
+            click.confirm(
+                f"Update Storybook {current} -> {latest} in {target_prefix}?",
+                abort=True,
+            )
+        except click.exceptions.Abort:
+            raise click.exceptions.Exit(1)
+
+    try:
+        installer_path = updater_module.resolve_installer(installer)
+        result = updater_module.run_installer(installer_path, latest, target_prefix)
+    except updater_module.UpdateError as exc:
+        _emit_update_error(exc, as_json=as_json)
+        return
+
+    if result.returncode != 0:
+        code = updater_module.extract_sb_code(result.stderr) or "SB_UPDATE_INSTALL_FAILED"
+        message = (
+            updater_module.last_stderr_line(result.stderr)
+            or "安装失败；现有安装不受影响"
+        )
+        _emit_update_error(
+            updater_module.UpdateError(code, message, detail=result.stderr),
+            as_json=as_json,
+        )
+        return
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "status": "updated",
+                    "current_version": current,
+                    "latest_version": latest,
+                    "prefix": str(target_prefix),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    # install.sh 自身输出安装计划与结果（含 "Installed Storybook <版本>" 与 PATH 提示），原样透传
+    if result.stdout:
+        click.echo(result.stdout.rstrip("\n"))
+    if result.stderr:
+        click.echo(result.stderr.rstrip("\n"), err=True)
 
 
 @cli.command()
