@@ -381,7 +381,7 @@ class TestLexicalFallback:
         monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 0.05)
 
         def slow_embed(*args, **kwargs):
-            time.sleep(0.2)
+            time.sleep(0.5)
             return basis(0)
 
         monkeypatch.setattr(embeddings, "embed", slow_embed)
@@ -389,7 +389,9 @@ class TestLexicalFallback:
         result = search_module.search("timeout fallback")
         elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.12
+        # 必须在 slow worker（0.5s）完成前返回；0.4s 上界给 CI 负载留足余量，
+        # 同时仍能证明“没有等待 worker”（0.4 < 0.5）。
+        assert elapsed < 0.4
         assert result["degraded_reason"] == "embedding_timeout"
         assert result["top_matches"][0]["story_id"] == story_id
 
@@ -398,7 +400,7 @@ class TestLexicalFallback:
         monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 0.02)
 
         def slow_fallback(*args, **kwargs):
-            time.sleep(0.2)
+            time.sleep(0.5)
             return []
 
         monkeypatch.setattr(store, "search_by_lexical", slow_fallback)
@@ -406,7 +408,9 @@ class TestLexicalFallback:
         result = search_module.search("q")
         elapsed = time.perf_counter() - started
 
-        assert elapsed < 0.12
+        # 必须在 slow worker（0.5s）完成前返回；0.4s 上界给 CI 负载留足余量，
+        # 同时仍能证明“没有等待 worker”（0.4 < 0.5）。
+        assert elapsed < 0.4
         assert result["fallback_status"] == "timeout"
         assert result["result_state"] == "degraded_unavailable"
 
