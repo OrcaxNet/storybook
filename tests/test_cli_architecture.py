@@ -25,7 +25,7 @@ from storybook.setup_manager import SetupManager
 
 CANONICAL_TOP_LEVEL = {
     "admin", "doctor", "init", "mcp", "memory", "profile", "run",
-    "search", "source", "status",
+    "search", "source", "status", "version",
 }
 LEGACY_TOP_LEVEL = {
     "setup", "process", "dream", "import-data", "sources",
