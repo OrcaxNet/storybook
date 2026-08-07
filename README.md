@@ -729,6 +729,47 @@ book memory show 42
 book search "开发一个语音机器人" --top 1 --json
 ```
 
+### `--verbose` 标签化关键日志（检索可观测性）
+
+组级 `--verbose/-v`（`book --verbose search "..."`）会在检索管线各关键阶段把
+**标签化 trace** 写到 **stderr**——stdout 的人读输出与 `--json` 完全不变，保证
+脚本 / MCP 协议纯净。默认（不加 `--verbose`）不输出任何 trace，保持静默。
+
+每条 trace 行格式稳定，便于 `tail` / `grep`：
+
+```text
+HH:MM:SS [DEBUG] [SB] [req=<request_id>] [stage=<stage>] <message>
+```
+
+同一查询的所有阶段共享同一 `request_id`（即 `search` 响应里的 `request_id`），
+可用 `grep <request_id>` 追踪单次查询全链路。阶段标签：
+
+| stage | 含义 |
+|-------|------|
+| `query` | 原始 query 与归一化 query |
+| `transform` | LLM 变换输出（rewrite / multi_query / hyde 生成的 query 列表；未触发为 `skipped`） |
+| `embed` | 查询向量摘要（维度 + 前 N 维预览 + 来源 cache/compute） |
+| `recall-vector` | 向量召回候选（story_id + title + similarity） |
+| `recall-lexical` | 词法/BM25 召回候选（story_id + title + score；不可用时记录降级原因） |
+| `fusion` | RRF/加权融合后候选数与 top ids |
+| `graph` | 图扩散结果（种子数 / 扩散候选 / 被采纳 story_id；degraded 时记录原因） |
+| `rerank` | 本地有界 reranker 后的 top 顺序（story_id + 分数） |
+| `final` | 最终返回的 top_k 列表（story_id + title；缓存命中时标记 `cache_hit`） |
+
+示例：
+
+```bash
+# 只看图扩散阶段
+book --verbose search "如何调试数据库连接" 2>&1 | grep 'stage=graph'
+
+# 跟踪单次查询全链路
+book --verbose search "如何调试数据库连接" 2>&1 | grep 'stage='
+```
+
+向量日志只输出维度与有限维度预览（摘要截断），不 dump 全量、不泄露 API key 等
+敏感信息。`book run` / `book status` 等命令保留组级 `--verbose` 既有语义
+（log level 切到 DEBUG），不新增 trace。
+
 > 兼容 alias 期（一个 minor release 内）：`storybook process`、`storybook dream`、
 > `storybook import-data`、`storybook sources ...`、顶层 `storybook list/show/forget/stats`
 > 仍可用并调用相同业务函数，但默认从 help 隐藏，提示只写 stderr。

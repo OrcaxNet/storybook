@@ -27,6 +27,7 @@ Canonical 信息架构（FLO-180）:
 import json
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -54,13 +55,53 @@ from .setup_manager import SetupError, SetupManager
 from .history_adapters import manager as source_manager
 
 
-def setup_logging(verbose: bool = False):
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+class SbFormatter(logging.Formatter):
+    """Root handler formatter with a dedicated layout for [SB] pipeline traces.
+
+    Normal records keep the standard ``%(name)s: %(message)s`` layout; records
+    tagged with ``sb_trace=True`` (emitted by ``storybook.sb``) render the
+    stable, README-documented prefix ``[SB] [req=<request_id>] [stage=<stage>]``
+    so a query's full path can be followed with ``grep <request_id>``.
+    """
+
+    _SB_FMT = (
+        "%(asctime)s [%(levelname)s] [SB] [req=%(sb_request_id)s] "
+        "[stage=%(sb_stage)s] %(message)s"
     )
+    _BASE_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+    def __init__(self, datefmt: str = "%H:%M:%S") -> None:
+        super().__init__(fmt=self._SB_FMT, datefmt=datefmt)
+        self._sb_formatter = logging.Formatter(self._SB_FMT, datefmt=datefmt)
+        self._base_formatter = logging.Formatter(self._BASE_FMT, datefmt=datefmt)
+
+    def format(self, record: logging.LogRecord) -> str:
+        if getattr(record, "sb_trace", False):
+            return self._sb_formatter.format(record)
+        return self._base_formatter.format(record)
+
+
+def setup_logging(verbose: bool = False):
+    """Configure root logging once; ``--verbose`` additionally arms the [SB] trace channel."""
+    level = logging.DEBUG if verbose else logging.INFO
+    root = logging.getLogger()
+    if not root.handlers:
+        # 首次调用拥有默认 stderr handler（新进程场景）；后续调用只调整已有 handler。
+        logging.basicConfig(level=level, datefmt="%H:%M:%S")
+    root.setLevel(level)
+    for handler in root.handlers:
+        if type(handler) is logging.StreamHandler:
+            handler.setLevel(level)
+            handler.setFormatter(SbFormatter())
+            # 进程内多次 CLI 调用（测试 / 复用进程）时把 stream 指回当前 stderr，
+            # 避免 StreamHandler 绑定到上一次调用已关闭的捕获流。
+            if handler.stream is not sys.stderr:
+                handler.stream = sys.stderr
+    # storybook.sb 是检索管线标签化 trace 专用 channel：DEBUG 级门控保证
+    # 默认（无 --verbose）不输出任何 [stage= 行，且只写 stderr（stdout 协议纯净）。
+    sb_logger = logging.getLogger("storybook.sb")
+    sb_logger.setLevel(level)
+    sb_logger.propagate = True
 
 
 def _legacy_alias_hint(canonical: str) -> None:
