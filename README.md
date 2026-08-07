@@ -416,6 +416,29 @@ sh install.sh --prefix "$HOME/tools/storybook" --no-init
 sh install.sh --dry-run                       # 严格零写入
 ```
 
+### 快速升级：`book update`
+
+已安装版本内置 `book update`，检测 GitHub Releases 最新正式版本并快速升级；下载、
+sha256 校验与原子安装（backup + swap + rollback）完整复用官方 `install.sh` 语义，
+失败时现有安装不受影响、不产生部分安装：
+
+```bash
+book update                 # 检测最新版本；有新版时确认后安装（默认确认，Ctrl-C 取消）
+book update --yes           # 跳过确认直接安装（非交互环境必须加 --yes/-y）
+book update --dry-run       # 只输出计划：当前版本 / 最新版本 / 目标 prefix / 来源 URL，零写入
+book update --prefix PATH   # 覆盖安装前缀（默认从当前安装推断，回退 $HOME/.local）
+```
+
+已是最新版本时输出 `Already up to date (vX.Y.Z)` 并退出 0，不下载、零写入。升级只
+更新安装 prefix，**不触碰 Profile 数据 / 数据库**。`book update` 与 `install.sh`
+共用以下环境变量（镜像/测试覆盖，与安装器一致）：
+
+- `STORYBOOK_INSTALL_REPOSITORY`：发布仓库地址（默认 `https://github.com/OrcaxNet/storybook`）；
+  版本检测请求 `{REPOSITORY}/releases/latest`（GitHub Releases 会 302 到最新 tag 页）。
+- `STORYBOOK_INSTALL_ARCHIVE_URL` / `STORYBOOK_INSTALL_CHECKSUM_URL`：下载归档与
+  sha256 校验文件的 URL 覆盖（未设置时按 `install.sh` 的默认约定由版本号推导）。
+- `STORYBOOK_INSTALL_SCRIPT`：覆盖 `install.sh` 路径（默认使用随包分发副本）。
+
 维护者发布版本时推送 `v*` tag；release workflow 会先运行完整测试，再执行
 `scripts/build_release_assets.sh` 构建并验证固定文件名的 `storybook.tar.gz` 与
 `storybook.tar.gz.sha256`，随后发布到 GitHub Release。也可在本地安装 `build` 后执行
@@ -658,6 +681,7 @@ book admin benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
   book status [--performance]  运行状态
   book version [--json]        查看当前版本
   book mcp                     启动 MCP server（stdio）
+  book update [--yes]          检测并升级到最新正式版本
 
 分组:
   book memory list|show|forget            记忆管理
@@ -717,6 +741,9 @@ book admin benchmark --model-state warm|cold  # 隔离的 10k Story 性能+质�
 book admin eval all                  # 检索/加工/分裂/消融评测（低频维护）
 book admin migration discover|run|rollback|status|delete-backup  # v1 → v2 安全迁移
 book mcp                             # 启动 MCP server（stdio，供 Claude Code 等 agent 运行时召回）
+book update                          # 检测最新正式版本；有新版时确认后下载 + sha256 校验 + 原子安装
+book update --dry-run                # 只输出升级计划（当前版本 / 最新版本 / 目标 prefix），零写入
+book update --yes                    # 跳过确认直接安装（非交互环境必须加 --yes/-y）
 ```
 
 文本搜索会在主命中和“联想到的相关记忆”前展示真实 Story ID。可直接用该 ID 展开详情；脚本或 Agent 则可使用 `--json` 获取同一份检索结果（包括主命中与 related 的 `story_id`）：
