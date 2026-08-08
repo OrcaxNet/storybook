@@ -48,6 +48,13 @@ jobs:
         run: >-
           test "$GITHUB_REF_NAME" =
           "v$("$STORYBOOK_CI_PYTHON" -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+      - name: Stress search deadline fallbacks
+        run: |
+          for attempt in {1..20}; do
+            $STORYBOOK_CI_PYTHON -m pytest -q \
+              tests/test_search.py::TestLexicalFallback::test_warm_embedding_hard_timeout_falls_back_without_waiting_for_worker \
+              tests/test_search.py::TestLexicalFallback::test_fallback_has_its_own_hard_timeout
+          done
       - name: Run release gate
         run: $STORYBOOK_CI_PYTHON -m pytest
 

@@ -379,40 +379,82 @@ class TestLexicalFallback:
         embeddings.mark_model_used()
         monkeypatch.setattr(config, "QUERY_WARM_TIMEOUT_SECONDS", 0.02)
         monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 0.05)
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls = 0
 
         def slow_embed(*args, **kwargs):
-            time.sleep(0.5)
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                try:
+                    release.wait(timeout=2.0)
+                finally:
+                    finished.set()
             return basis(0)
 
         monkeypatch.setattr(embeddings, "embed", slow_embed)
-        started = time.perf_counter()
-        result = search_module.search("timeout fallback")
-        elapsed = time.perf_counter() - started
+        try:
+            result = search_module.search("timeout fallback")
 
-        # 必须在 slow worker（0.5s）完成前返回；0.4s 上界给 CI 负载留足余量，
-        # 同时仍能证明“没有等待 worker”（0.4 < 0.5）。
-        assert elapsed < 0.4
-        assert result["degraded_reason"] == "embedding_timeout"
-        assert result["top_matches"][0]["story_id"] == story_id
+            # 不使用易受 CI 调度影响的 wall-clock 上界：worker 仍被同步点阻塞，
+            # search 却已经返回，直接证明调用方只等待 20ms 配置预算而非完整 worker。
+            assert entered.wait(timeout=1.0)
+            assert not finished.is_set()
+            assert result["degraded_reason"] == "embedding_timeout"
+            assert result["top_matches"][0]["story_id"] == story_id
+        finally:
+            release.set()
+        assert finished.wait(timeout=1.0)
+
+        # 已超时 worker 的迟到结果不能写入查询缓存或污染后续查询。
+        recovered = search_module.search("timeout fallback")
+        assert calls == 2
+        assert recovered["degraded"] is False
+        assert recovered["top_matches"][0]["story_id"] == story_id
 
     def test_fallback_has_its_own_hard_timeout(self, fake_embedder, monkeypatch):
+        story_id = _seed("q", basis(0))
         fake_embedder.register("q", None)
         monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 0.02)
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original_fallback = store.search_by_lexical
+        calls = 0
 
         def slow_fallback(*args, **kwargs):
-            time.sleep(0.5)
-            return []
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                try:
+                    release.wait(timeout=2.0)
+                finally:
+                    finished.set()
+                return []
+            return original_fallback(*args, **kwargs)
 
         monkeypatch.setattr(store, "search_by_lexical", slow_fallback)
-        started = time.perf_counter()
-        result = search_module.search("q")
-        elapsed = time.perf_counter() - started
+        try:
+            result = search_module.search("q")
 
-        # 必须在 slow worker（0.5s）完成前返回；0.4s 上界给 CI 负载留足余量，
-        # 同时仍能证明“没有等待 worker”（0.4 < 0.5）。
-        assert elapsed < 0.4
-        assert result["fallback_status"] == "timeout"
-        assert result["result_state"] == "degraded_unavailable"
+            # fallback worker 尚未越过同步点时调用已返回，证明独立的 20ms
+            # fallback deadline 生效，且没有等待 daemon worker 清理。
+            assert entered.wait(timeout=1.0)
+            assert not finished.is_set()
+            assert result["fallback_status"] == "timeout"
+            assert result["result_state"] == "degraded_unavailable"
+        finally:
+            release.set()
+        assert finished.wait(timeout=1.0)
+
+        recovered = search_module.search("q")
+        assert calls == 2
+        assert recovered["fallback_status"] == "ok"
+        assert recovered["top_matches"][0]["story_id"] == story_id
 
     def test_feedback_write_does_not_block_query(
         self, fake_embedder, monkeypatch
