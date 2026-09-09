@@ -426,7 +426,7 @@ def test_update_installs_new_version_end_to_end(tmp_path, release_server):
     v2 = tmp_path / "storybook-v2.whl"
     _write_probe_wheel(v2, "v2")
     _write_checksum(tmp_path / "storybook-v2.whl.sha256", v2)
-    release_server.latest_tag = "v0.1.4"
+    release_server.latest_tag = "v9.9.9"
     prefix = tmp_path / "prefix"
     isolated = tmp_path / "isolated-home"
 
@@ -443,13 +443,13 @@ def test_update_installs_new_version_end_to_end(tmp_path, release_server):
     )
 
     assert result.exit_code == 0, result.stderr
-    assert "Installed Storybook 0.1.4." in result.stdout
+    assert "Installed Storybook 9.9.9." in result.stdout
     assert release_server.counts["archive"] >= 1
     assert release_server.counts["checksum"] >= 1
-    # 新版本已激活：current → 0.1.4 release，book 入口输出新 probe tag
+    # 新版本已激活：current → 测试用未来版本，book 入口输出新 probe tag
     current = prefix / "lib" / "storybook" / "current"
     assert current.is_symlink()
-    assert "0.1.4-" in current.resolve().name
+    assert "9.9.9-" in current.resolve().name
     assert _book_tag(prefix) == "v2"
     assert (prefix / "bin" / "storybook").is_symlink()
     # 隔离 HOME 下不产生 storybook Profile / 数据库产物（允许通用工具链缓存）
@@ -480,7 +480,7 @@ def test_update_failure_keeps_existing_install(tmp_path, release_server):
     (tmp_path / "storybook-v2.whl.sha256").write_text(
         "0" * 64 + "  storybook-v2.whl\n", encoding="ascii"
     )
-    release_server.latest_tag = "v0.1.4"
+    release_server.latest_tag = "v9.9.9"
 
     result = _invoke(
         ["update", "--yes", "--prefix", str(prefix)],
