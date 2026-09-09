@@ -5,6 +5,8 @@ set -eu
 
 PROGRAM=storybook-install
 VERSION=latest
+VERSION_EXPLICIT=0
+SOURCE_DIR=
 PREFIX=${HOME:-}/.local
 DRY_RUN=0
 RUN_INIT=1
@@ -19,11 +21,15 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --version VERSION  Install an official release (default: latest)
+  --source PATH      Build and install local Storybook source (including edits)
+  --version VERSION  Install an official release (use latest for the newest)
   --prefix PATH      User-owned install prefix (default: $HOME/.local)
   --dry-run          Validate and print the plan without writing
   --no-init          Do not offer to run book init after installation
   --help             Show this help
+
+When run from a source checkout, defaults to that local source.
+Otherwise downloads the latest release. --source and --version are exclusive.
 
 Environment for mirrors/testing:
   STORYBOOK_INSTALL_ARCHIVE_URL   Override the release archive URL
@@ -54,6 +60,12 @@ while [ "$#" -gt 0 ]; do
         --version)
             [ "$#" -ge 2 ] || fail SB_INSTALL_USAGE "--version requires a value"
             VERSION=$2
+            VERSION_EXPLICIT=1
+            shift 2
+            ;;
+        --source)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail SB_INSTALL_USAGE "--source requires a path"
+            SOURCE_DIR=$2
             shift 2
             ;;
         --prefix)
@@ -67,6 +79,20 @@ while [ "$#" -gt 0 ]; do
         *) fail SB_INSTALL_USAGE "unknown option: $1 (run with --help)" ;;
     esac
 done
+
+if [ -n "$SOURCE_DIR" ] && [ "$VERSION_EXPLICIT" -eq 1 ]; then
+    fail SB_INSTALL_USAGE "--source and --version cannot be combined"
+fi
+# Only a script located in a source tree enables automatic local installation.
+# Piped scripts and the bundled updater keep using releases; explicit mirrors win.
+if [ -z "$SOURCE_DIR" ] && [ "$VERSION_EXPLICIT" -eq 0 ] \
+    && [ -z "${STORYBOOK_INSTALL_ARCHIVE_URL:-}${STORYBOOK_INSTALL_CHECKSUM_URL:-}${STORYBOOK_INSTALL_REPOSITORY:-}" ] \
+    && [ -f "$0" ]; then
+    SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+    if [ -f "$SCRIPT_DIR/pyproject.toml" ] && [ -d "$SCRIPT_DIR/src/storybook" ]; then
+        SOURCE_DIR=$SCRIPT_DIR
+    fi
+fi
 
 [ -n "$PREFIX" ] || fail SB_INSTALL_PREFIX_INVALID "prefix cannot be empty"
 case $PREFIX in /*) ;; *) PREFIX=$(pwd)/$PREFIX ;; esac
@@ -111,22 +137,6 @@ connection.close()
     esac
 fi
 
-if command -v curl >/dev/null 2>&1; then
-    DOWNLOADER=curl
-elif command -v wget >/dev/null 2>&1; then
-    DOWNLOADER=wget
-else
-    fail SB_INSTALL_DOWNLOADER_MISSING "install curl or wget and retry"
-fi
-
-if [ "$VERSION" = latest ]; then
-    ARCHIVE_URL=${STORYBOOK_INSTALL_ARCHIVE_URL:-$REPOSITORY/releases/latest/download/storybook.tar.gz}
-    CHECKSUM_URL=${STORYBOOK_INSTALL_CHECKSUM_URL:-$REPOSITORY/releases/latest/download/storybook.tar.gz.sha256}
-else
-    ARCHIVE_URL=${STORYBOOK_INSTALL_ARCHIVE_URL:-$REPOSITORY/releases/download/v$VERSION/storybook.tar.gz}
-    CHECKSUM_URL=${STORYBOOK_INSTALL_CHECKSUM_URL:-$ARCHIVE_URL.sha256}
-fi
-
 validate_download_url() {
     "$PYTHON" - "$1" >/dev/null 2>&1 <<'PY'
 import sys
@@ -156,21 +166,58 @@ except (ValueError, UnicodeError):
 PY
 }
 
-validate_download_url "$ARCHIVE_URL" || \
-    fail SB_INSTALL_URL_UNSAFE "download URLs must use HTTPS without credentials, query, or fragment"
-validate_download_url "$CHECKSUM_URL" || \
-    fail SB_INSTALL_URL_UNSAFE "download URLs must use HTTPS without credentials, query, or fragment"
+if [ -n "$SOURCE_DIR" ]; then
+    SOURCE_DIR=$(CDPATH='' cd -- "$SOURCE_DIR" 2>/dev/null && pwd) || \
+        fail SB_INSTALL_SOURCE_INVALID "local source directory does not exist"
+    VERSION=$("$PYTHON" - "$SOURCE_DIR" 2>/dev/null <<'PY'
+from pathlib import Path
+import re
+import sys
+import tomllib
+
+root = Path(sys.argv[1])
+project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+version = project.get("version", "")
+if (project.get("name") != "storybook" or not (root / "src/storybook").is_dir()
+        or not isinstance(version, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", version)):
+    raise SystemExit(1)
+print(version)
+PY
+    ) || fail SB_INSTALL_SOURCE_INVALID "expected Storybook pyproject.toml and src/storybook in local source"
+    SOURCE_LABEL="$SOURCE_DIR (local source)"
+else
+    if command -v curl >/dev/null 2>&1; then
+        DOWNLOADER=curl
+    elif command -v wget >/dev/null 2>&1; then
+        DOWNLOADER=wget
+    else
+        fail SB_INSTALL_DOWNLOADER_MISSING "install curl or wget and retry"
+    fi
+    if [ "$VERSION" = latest ]; then
+        ARCHIVE_URL=${STORYBOOK_INSTALL_ARCHIVE_URL:-$REPOSITORY/releases/latest/download/storybook.tar.gz}
+        CHECKSUM_URL=${STORYBOOK_INSTALL_CHECKSUM_URL:-$REPOSITORY/releases/latest/download/storybook.tar.gz.sha256}
+    else
+        ARCHIVE_URL=${STORYBOOK_INSTALL_ARCHIVE_URL:-$REPOSITORY/releases/download/v$VERSION/storybook.tar.gz}
+        CHECKSUM_URL=${STORYBOOK_INSTALL_CHECKSUM_URL:-$ARCHIVE_URL.sha256}
+    fi
+    validate_download_url "$ARCHIVE_URL" || \
+        fail SB_INSTALL_URL_UNSAFE "download URLs must use HTTPS without credentials, query, or fragment"
+    validate_download_url "$CHECKSUM_URL" || \
+        fail SB_INSTALL_URL_UNSAFE "download URLs must use HTTPS without credentials, query, or fragment"
+    SOURCE_LABEL=$ARCHIVE_URL
+fi
 
 INSTALL_ROOT=$PREFIX/lib/storybook
 BIN_DIR=$PREFIX/bin
 RELEASE_NAME=$VERSION
+[ -z "$SOURCE_DIR" ] || RELEASE_NAME=$VERSION-local
 
 printf 'Storybook install plan\n'
 printf '  Platform  %s/%s\n' "$OS" "$ARCH"
 printf '  Python    %s (%s)\n' "$PYTHON" "$PYTHON_VERSION"
 printf '  Version   %s\n' "$VERSION"
 printf '  Prefix    %s\n' "$PREFIX"
-printf '  Source    %s\n' "$ARCHIVE_URL"
+printf '  Source    %s\n' "$SOURCE_LABEL"
 
 # Prerelease Python (alpha/beta/rc) may break venv/ensurepip and lack wheels
 # for sqlite-vec/numpy; warn early and steer toward a stable release.
@@ -208,18 +255,29 @@ download() {
 }
 
 TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/storybook-install.XXXXXX") || fail SB_INSTALL_TEMP_FAILED "cannot create temporary directory"
-case $ARCHIVE_URL in
-    *.whl) ARCHIVE=$TEMP_DIR/storybook-0.0.0-py3-none-any.whl ;;
-    *) ARCHIVE=$TEMP_DIR/storybook.tar.gz ;;
-esac
-CHECKSUM=$TEMP_DIR/storybook.tar.gz.sha256
-download "$ARCHIVE_URL" "$ARCHIVE" || fail SB_INSTALL_DOWNLOAD_FAILED "release download failed; the previous installation is unchanged"
-download "$CHECKSUM_URL" "$CHECKSUM" || fail SB_INSTALL_CHECKSUM_DOWNLOAD_FAILED "checksum download failed; the previous installation is unchanged"
+if [ -n "$SOURCE_DIR" ]; then
+    BUILD_PYTHON=$("$PYTHON" -c 'import os, sys; print(os.path.realpath(sys.executable))')
+    "$BUILD_PYTHON" -m venv "$TEMP_DIR/build" || fail SB_INSTALL_VENV_FAILED "cannot create local build environment"
+    "$TEMP_DIR/build/bin/python" -m pip wheel --disable-pip-version-check --no-deps \
+        --wheel-dir "$TEMP_DIR/wheels" "$SOURCE_DIR" >/dev/null || \
+        fail SB_INSTALL_BUILD_FAILED "local source build failed; the previous installation is unchanged"
+    set -- "$TEMP_DIR"/wheels/storybook-*.whl
+    [ "$#" -eq 1 ] && [ -f "$1" ] || fail SB_INSTALL_BUILD_FAILED "expected one Storybook wheel from local source"
+    ARCHIVE=$1
+else
+    case $ARCHIVE_URL in
+        *.whl) ARCHIVE=$TEMP_DIR/storybook-0.0.0-py3-none-any.whl ;;
+        *) ARCHIVE=$TEMP_DIR/storybook.tar.gz ;;
+    esac
+    CHECKSUM=$TEMP_DIR/storybook.tar.gz.sha256
+    download "$ARCHIVE_URL" "$ARCHIVE" || fail SB_INSTALL_DOWNLOAD_FAILED "release download failed; the previous installation is unchanged"
+    download "$CHECKSUM_URL" "$CHECKSUM" || fail SB_INSTALL_CHECKSUM_DOWNLOAD_FAILED "checksum download failed; the previous installation is unchanged"
 
-EXPECTED=$(awk 'NF {print $1; exit}' "$CHECKSUM")
-[ "${#EXPECTED}" -eq 64 ] || fail SB_INSTALL_CHECKSUM_INVALID "official checksum file is invalid"
-case $EXPECTED in *[!0-9A-Fa-f]*) fail SB_INSTALL_CHECKSUM_INVALID "official checksum file is invalid" ;; esac
-EXPECTED=$(printf '%s' "$EXPECTED" | tr 'A-F' 'a-f')
+    EXPECTED=$(awk 'NF {print $1; exit}' "$CHECKSUM")
+    [ "${#EXPECTED}" -eq 64 ] || fail SB_INSTALL_CHECKSUM_INVALID "official checksum file is invalid"
+    case $EXPECTED in *[!0-9A-Fa-f]*) fail SB_INSTALL_CHECKSUM_INVALID "official checksum file is invalid" ;; esac
+    EXPECTED=$(printf '%s' "$EXPECTED" | tr 'A-F' 'a-f')
+fi
 if command -v shasum >/dev/null 2>&1; then
     ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
 elif command -v sha256sum >/dev/null 2>&1; then
@@ -227,7 +285,9 @@ elif command -v sha256sum >/dev/null 2>&1; then
 else
     ACTUAL=$("$PYTHON" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$ARCHIVE")
 fi
-[ "$EXPECTED" = "$ACTUAL" ] || fail SB_INSTALL_CHECKSUM_MISMATCH "release checksum mismatch; the previous installation is unchanged"
+if [ -z "$SOURCE_DIR" ]; then
+    [ "$EXPECTED" = "$ACTUAL" ] || fail SB_INSTALL_CHECKSUM_MISMATCH "release checksum mismatch; the previous installation is unchanged"
+fi
 
 mkdir -p "$INSTALL_ROOT/releases" "$BIN_DIR"
 TARGET_NAME=$RELEASE_NAME-$(printf '%s' "$ACTUAL" | cut -c1-16)-venv2

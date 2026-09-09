@@ -1,6 +1,6 @@
 """环境与健康自检 - ``book doctor``
 
-逐项检查 Embedding API / DeepSeek LLM 配置 / Embedding 模型 / 向量维度 /
+逐项检查 Embedding API / LLM 配置 / Embedding 模型 / 向量维度 /
 sqlite-vec 扩展与虚表 / 向量双写一致性，给出 ✅/❌ 与可操作修复建议；
 ``--fix`` 可修复向量双写不一致。
 
@@ -139,7 +139,7 @@ def run_doctor(fix: bool = False) -> bool:
             detail += f"，reason=endpoint_unreachable：{endpoint_err}"
         results.append(CheckResult(
             "Embedding API", endpoint_ok, detail=detail,
-            suggestion="启动 Ollama：`ollama serve`（或设置 STORYBOOK_EMBED_BASE_URL）"
+            suggestion="启动 Ollama：`ollama serve`，或修改 model-config.json 的 embedding.base_url"
             if not endpoint_ok else ""))
         model_ready = endpoint_ok and _model_pulled(tags, config.EMBED_MODEL)
         probe_result = None
@@ -152,7 +152,7 @@ def run_doctor(fix: bool = False) -> bool:
             detail=(f"type=api，adapter={config.EMBED_ADAPTER}，"
                     f"{config.EMBED_BASE_URL}"
                     + ("" if endpoint_ok else f"，reason={probe_result['reason']}")),
-            suggestion="检查 endpoint、凭据环境变量、模型名与响应协议"
+            suggestion="检查 model-config.json 中的地址、secret、模型名与协议"
             if not endpoint_ok else ""))
 
     # [2] 云端生成式 LLM 只做无费用的配置就绪检查，不发送生成请求，也不依赖 Ollama。
@@ -302,6 +302,11 @@ def run_doctor(fix: bool = False) -> bool:
         else:
             fix_line = "🔧 跳过修复：向量依赖未就绪（见 sqlite-vec / 虚表 检查项）"
 
+    if config.MODEL_CONFIG.source == "defaults":
+        click.echo("模型配置来源：默认值（尚未保存 model-config.json；不包含失败向导中的输入）。")
+    else:
+        click.echo(f"模型配置文件：{config.MODEL_CONFIG_PATH}")
+    click.echo("LLM 项仅检查配置字段，不验证生成接口连通性。")
     _print_report(results, fix_line)
     return all(r.ok for r in results if not r.skipped)
 

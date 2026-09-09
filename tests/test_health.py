@@ -1,7 +1,7 @@
 """Mixed-provider doctor checks."""
 from __future__ import annotations
 
-from storybook import config, health
+from storybook import config, health, model_config
 
 
 def _ready_local_dependencies(monkeypatch, tmp_path) -> None:
@@ -81,6 +81,16 @@ def test_doctor_reports_missing_llm_configuration_without_network(
     assert "reason=llm_config_missing" in output
     assert "book init" in output
     assert "ollama pull deepseek-v4-flash" not in output
+
+
+def test_doctor_identifies_default_configuration_after_failed_setup(monkeypatch, tmp_path, capsys):
+    _ready_local_dependencies(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "MODEL_CONFIG", model_config.defaults())
+    health.run_doctor()
+    output = capsys.readouterr().out
+    assert "模型配置来源：默认值" in output
+    assert "不包含失败向导中的输入" in output
+    assert "不验证生成接口连通性" in output
 
 
 def test_doctor_custom_api_reports_protocol_reason_without_ollama_calls(

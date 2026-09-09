@@ -11,6 +11,7 @@ Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
 ## Environment & running
 
 - Python **3.11+** (venv at `.venv/`). Dependencies: `click`, `requests`, `numpy`, `sqlite-vec`, `mcp`.
+- In a source checkout, `sh ./install.sh --no-init` builds and installs the current local files, including uncommitted edits. `--source PATH` selects a checkout explicitly; `--version latest` selects the release. Piped online installation and `book update` use releases. The root installer and `src/storybook/data/install.sh` must remain identical.
 - Configure models with `book init --config model-config.json` or the interactive `book init` wizard. See [model-config.example.json](model-config.example.json). Import copies the resolved tuples into the active Profile; subsequent edits must target that file or be imported again. Restart existing MCP/watch/daemon processes to load edits.
 - `book config --path` prints the active file path; `book config` redacts secrets. Generation supports OpenAI, Anthropic Messages and Ollama protocols; embedding supports OpenAI and Ollama. Missing embedding fields inherit generation values, and empty secret clears inheritance. Fresh indexes discover dimension automatically.
 - Both `generation` and `embedding` objects are required. Generation must contain all four string fields; embedding may be `{}` to inherit all four. Changing protocol does not reset inherited URL, secret or model. If generation uses Anthropic, embedding must explicitly select a supported protocol.

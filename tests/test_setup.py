@@ -1108,7 +1108,7 @@ def test_book_init_interactive_embedding_inherits_llm_values(isolated_setup, mon
 
 
 @pytest.mark.parametrize("as_json", [False, True])
-def test_book_init_provider_failure_returns_doctor_repair_path(
+def test_book_init_provider_failure_explains_unsaved_configuration(
     isolated_setup, monkeypatch, as_json
 ):
     manager, _ = isolated_setup
@@ -1138,9 +1138,13 @@ def test_book_init_provider_failure_returns_doctor_repair_path(
         assert payload["status"] == "failed"
         assert payload["error"]["code"] == "SB_MODEL_NETWORK_FAILED"
         assert "book doctor" in payload["error"]["hint"]
+        assert "本次模型配置尚未保存" in payload["error"]["hint"]
+        assert "book init --config" in payload["error"]["hint"]
     else:
         assert "SB_MODEL_NETWORK_FAILED" in result.output
         assert "book doctor" in result.output
+        assert "本次模型配置尚未保存" in result.output
+        assert "book init --config" in result.output
 
 
 def test_book_init_mixed_provider_json_noninteractive(isolated_setup, monkeypatch):

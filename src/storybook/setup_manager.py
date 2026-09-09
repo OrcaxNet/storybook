@@ -43,6 +43,82 @@ class SetupError(RuntimeError):
         return {"code": self.code, "message": str(self), "hint": self.hint}
 
 
+def _post_model_probe(
+    item: model_config.ModelEndpoint, kind: str, resource: str, payload: dict,
+) -> dict:
+    try:
+        response = requests.post(
+            model_config.request_url(item.base_url, item.protocol, resource),
+            headers=model_config.request_headers(item.protocol, item.secret),
+            json=payload, timeout=30 if kind == "generation" else 8,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise ValueError("response must be object")
+        return body
+    except requests.exceptions.Timeout as exc:
+        raise SetupError("SB_MODEL_TIMEOUT", f"{kind} 请求超时") from exc
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        code = "SB_MODEL_AUTH_FAILED" if status in {401, 403} else f"SB_MODEL_{kind.upper()}_FAILED"
+        raise SetupError(code, f"{kind} 返回 HTTP {status}") from exc
+    except requests.exceptions.RequestException as exc:
+        raise SetupError("SB_MODEL_NETWORK_FAILED", f"{kind} 端点不可达") from exc
+    except (ValueError, TypeError) as exc:
+        raise SetupError(f"SB_MODEL_{kind.upper()}_FAILED", f"{kind} 响应无效") from exc
+
+
+def _probe_generation(item: model_config.ModelEndpoint) -> None:
+    """Allow reasoning tokens, with one bounded retry for truncated empty output."""
+    protocol = item.protocol
+    resource = "chat" if protocol == "ollama" else (
+        "messages" if protocol == "anthropic" else "chat/completions"
+    )
+    for budget in (256, 4096):
+        payload = {
+            "model": item.model,
+            "messages": [{"role": "user", "content": "Reply OK"}],
+            "stream": False,
+        }
+        if protocol == "ollama":
+            payload["options"] = {"num_predict": budget}
+        else:
+            payload["max_tokens"] = budget
+        body = _post_model_probe(item, "generation", resource, payload)
+        if protocol == "anthropic":
+            blocks = body.get("content")
+            text_ok = isinstance(blocks, list) and any(
+                isinstance(block, dict) and isinstance(block.get("text"), str)
+                and block["text"].strip() for block in blocks
+            )
+            truncated = body.get("stop_reason") == "max_tokens"
+        else:
+            choices = body.get("choices")
+            first = choices[0] if isinstance(choices, list) and choices else None
+            message = body.get("message") if protocol == "ollama" else (
+                first.get("message") if isinstance(first, dict) else None
+            )
+            text_ok = (
+                isinstance(message, dict) and isinstance(message.get("content"), str)
+                and bool(message["content"].strip())
+            )
+            truncated = body.get("done_reason") == "length" if protocol == "ollama" else (
+                isinstance(first, dict) and first.get("finish_reason") == "length"
+            )
+        if text_ok:
+            return
+        if truncated and budget == 256:
+            continue
+        if truncated:
+            raise SetupError(
+                "SB_MODEL_GENERATION_TRUNCATED",
+                "generation 已耗尽 4096 token 探测预算，仍未返回正文",
+                hint="检查模型的输出能力或服务端推理预算后重试",
+            )
+        raise SetupError("SB_MODEL_GENERATION_FAILED", "generation 未返回有效文本")
+
+
 def default_launcher() -> Launcher:
     """优先使用安装后的 console script，源码运行时回退到 ``python -m``。"""
 
@@ -666,66 +742,20 @@ class SetupManager:
         """Use the same URL and authentication rules as runtime requests."""
         expected_dimension = expected_dimension or config.EMBED_DIM
         endpoints = {kind: getattr(value, kind) for kind in kinds}
-        secrets = {kind: item.secret for kind, item in endpoints.items()}
-
         results = []
         for kind, item in endpoints.items():
             protocol = item.protocol
             if kind == "embedding" and protocol == "anthropic":
                 raise SetupError("SB_MODEL_CONFIG_INVALID", "Embedding 不支持 anthropic 协议，请选择 openai 或 ollama")
-            payload = {"model": item.model}
-            if kind == "generation":
-                payload["messages"] = [{"role": "user", "content": "Reply OK"}]
-                resource = "chat" if protocol == "ollama" else (
-                    "messages" if protocol == "anthropic" else "chat/completions"
-                )
-                if protocol == "ollama":
-                    payload["stream"] = False
-                else:
-                    payload["max_tokens"] = 32
-            else:
-                resource = "embeddings"
-                payload["prompt" if protocol == "ollama" else "input"] = "storybook setup probe"
-            try:
-                response = requests.post(
-                    model_config.request_url(item.base_url, protocol, resource),
-                    headers=model_config.request_headers(protocol, secrets[kind]),
-                    json=payload, timeout=8,
-                )
-                response.raise_for_status()
-                body = response.json()
-                if not isinstance(body, dict):
-                    raise ValueError("response must be object")
-            except requests.exceptions.Timeout as exc:
-                raise SetupError("SB_MODEL_TIMEOUT", f"{kind} 请求超时") from exc
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else None
-                code = "SB_MODEL_AUTH_FAILED" if status in {401, 403} else f"SB_MODEL_{kind.upper()}_FAILED"
-                raise SetupError(code, f"{kind} 返回 HTTP {status}") from exc
-            except requests.exceptions.RequestException as exc:
-                raise SetupError("SB_MODEL_NETWORK_FAILED", f"{kind} 端点不可达") from exc
-            except (ValueError, TypeError) as exc:
-                raise SetupError(f"SB_MODEL_{kind.upper()}_FAILED", f"{kind} 响应无效") from exc
-
             detail = f"protocol={protocol}; model={item.model}"
             if kind == "generation":
-                if protocol == "anthropic":
-                    blocks = body.get("content")
-                    text_ok = isinstance(blocks, list) and any(
-                        isinstance(block, dict) and isinstance(block.get("text"), str)
-                        and block["text"].strip() for block in blocks
-                    )
-                else:
-                    choices = body.get("choices")
-                    first = choices[0] if isinstance(choices, list) and choices else None
-                    message = body.get("message") if protocol == "ollama" else (
-                        first.get("message") if isinstance(first, dict) else None
-                    )
-                    text_ok = isinstance(message, dict) and isinstance(message.get("content"), str) and message["content"].strip()
-                if not text_ok:
-                    raise SetupError("SB_MODEL_GENERATION_FAILED", "generation 未返回有效文本")
+                _probe_generation(item)
                 name = "generation"
             else:
+                body = _post_model_probe(item, kind, "embeddings", {
+                    "model": item.model,
+                    "prompt" if protocol == "ollama" else "input": "storybook setup probe",
+                })
                 rows = body.get("data")
                 first = rows[0] if isinstance(rows, list) and rows else None
                 vector = body.get("embedding") if protocol == "ollama" else (

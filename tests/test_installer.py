@@ -151,6 +151,112 @@ def _read_pty(fd: int, size: int) -> bytes:
         raise
 
 
+def _local_source(tmp_path: Path) -> Path:
+    source = tmp_path / "local source"
+    (source / "src/storybook").mkdir(parents=True)
+    (source / "pyproject.toml").write_text('''
+[project]
+name = "storybook"
+version = "0.0.0"
+[build-system]
+requires = []
+build-backend = "backend"
+backend-path = ["."]
+''')
+    (source / "install.sh").write_bytes(INSTALLER.read_bytes())
+    (source / "backend.py").write_text('''
+from pathlib import Path
+import shutil
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    source = Path(__file__).parent
+    if (source / "fail-build").exists():
+        raise RuntimeError("deliberate build failure")
+    filename = "storybook-0.0.0-py3-none-any.whl"
+    shutil.copyfile(source / "probe.whl", Path(wheel_directory) / filename)
+    return filename
+''')
+    _write_probe_wheel(source / "probe.whl", "local-v1")
+    return source
+
+
+def _local_env(tmp_path: Path) -> dict[str, str]:
+    _, env = _fake_tools(tmp_path)
+    for key in ("STORYBOOK_INSTALL_ARCHIVE_URL", "STORYBOOK_INSTALL_CHECKSUM_URL", "STORYBOOK_INSTALL_REPOSITORY"):
+        env.pop(key, None)
+    env.update(STORYBOOK_INSTALL_PYTHON=sys.executable, FAKE_DOWNLOAD_FAIL="1", PIP_NO_INDEX="1")
+    return env
+
+
+def test_local_checkout_install_update_and_failed_build_preserve_current(tmp_path):
+    source = _local_source(tmp_path)
+    env = _local_env(tmp_path)
+    prefix = tmp_path / "prefix with spaces"
+    command = ["sh", str(source / "install.sh"), "--prefix", str(prefix), "--no-init"]
+    original_files = sorted(str(path.relative_to(source)) for path in source.rglob("*"))
+    dry = subprocess.run(command + ["--dry-run"], cwd=tmp_path, env=env, text=True, capture_output=True)
+    assert dry.returncode == 0, dry.stderr
+    assert "(local source)" in dry.stdout
+    assert not prefix.exists()
+    assert original_files == sorted(str(path.relative_to(source)) for path in source.rglob("*"))
+
+    first = subprocess.run(command, cwd=tmp_path, env=env, text=True, capture_output=True)
+    assert first.returncode == 0, first.stderr
+    assert subprocess.check_output([prefix / "bin/book"], text=True).strip() == "local-v1"
+    current = prefix / "lib/storybook/current"
+    first_target = current.resolve()
+    assert "0.0.0-local-" in first_target.name
+
+    # Same version, changed local contents: must install the new build.
+    _write_probe_wheel(source / "probe.whl", "local-v2")
+    updated = _run(prefix, env, "--source", str(source))
+    assert updated.returncode == 0, updated.stderr
+    assert subprocess.check_output([prefix / "bin/book"], text=True).strip() == "local-v2"
+    assert current.resolve() != first_target
+    second_target = current.resolve()
+
+    (source / "fail-build").touch()
+    failed = _run(prefix, env, "--source", str(source))
+    assert failed.returncode == 1
+    assert "SB_INSTALL_BUILD_FAILED" in failed.stderr
+    assert current.resolve() == second_target
+    assert subprocess.check_output([prefix / "bin/book"], text=True).strip() == "local-v2"
+
+
+def test_explicit_release_overrides_local_checkout(tmp_path):
+    env = _local_env(tmp_path)
+    result = _run(tmp_path / "prefix", env, "--version", "latest", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "/releases/latest/download/storybook.tar.gz" in result.stdout
+    assert "(local source)" not in result.stdout
+
+
+def test_piped_installer_uses_release_even_when_cwd_is_checkout(tmp_path):
+    env = _local_env(tmp_path)
+    prefix = tmp_path / "prefix"
+    result = subprocess.run(
+        ["sh", "-s", "--", "--dry-run", "--prefix", str(prefix)],
+        input=INSTALLER.read_text(), cwd=ROOT, env=env, text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "/releases/latest/download/storybook.tar.gz" in result.stdout
+    assert "(local source)" not in result.stdout
+    assert not prefix.exists()
+
+
+@pytest.mark.parametrize("options,code", [
+    (("--source", "missing"), "SB_INSTALL_SOURCE_INVALID"),
+    (("--source", ".", "--version", "latest"), "SB_INSTALL_USAGE"),
+])
+def test_invalid_source_options_do_not_write(tmp_path, options, code):
+    env = _local_env(tmp_path)
+    prefix = tmp_path / "prefix"
+    result = _run(prefix, env, *options)
+    assert result.returncode == 1
+    assert code in result.stderr
+    assert not prefix.exists()
+
+
 def _write_probe_wheel(path: Path, tag: str, *, both_entrypoints: bool = True) -> None:
     dist_info = "storybook-0.0.0.dist-info"
     module = f'''import os

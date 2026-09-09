@@ -161,9 +161,13 @@ def migration_group():
 
 def _emit_setup_error(exc: SetupError, *, as_json: bool) -> None:
     hint = exc.hint
-    if exc.code.startswith("SB_MODEL_") and "book doctor" not in (hint or ""):
+    if exc.code.startswith("SB_MODEL_"):
         hint = "; ".join(
-            item for item in (hint, "运行 `book doctor` 诊断 provider 后重试") if item
+            item for item in (
+                hint,
+                "本次模型配置尚未保存；核对配置后重新运行 `book init --config model-config.json`。"
+                "`book doctor` 只检查已保存的配置，缺失时使用默认值",
+            ) if item
         )
     if as_json:
         error = exc.as_dict()

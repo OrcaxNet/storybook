@@ -362,6 +362,11 @@ Ollama 原生协议同样支持根地址或 `/api` 地址。
 `book init --config model-config.json --dry-run --json` 可检查配置计划，且不写文件、不调用模型。
 需要自动化时追加 `--yes`；模型字段 flags 也遵循相同继承规则，但不能与 `--config` 同用。
 
+初始化的 LLM 探测会预留生成预算；若端点因输出上限返回空正文，会提高预算重试一次。
+端点探测失败时，本次配置尚未写入 Profile，`book doctor` 会检查原有配置；没有配置文件时会明确标注使用默认值。
+doctor 的 LLM 项仅检查配置字段，不代表生成接口已连通。使用 `--config` 导入可在失败后直接修改源文件并重试，
+无需重填向导；本地 Ollama 的 secret 输入 `-`（文件中为 `""`）可避免继承远程 LLM 密钥。
+
 已有 Profile 的 active 向量索引会记录协议适配器、base URL、model、version 和维度。
 `book init` 若检测到目标 embedding 与现有索引不兼容，会在任何写入和网络探测前以
 `SB_MODEL_INDEX_INCOMPATIBLE` 失败；可保持原配置，或先运行
@@ -370,18 +375,16 @@ Ollama 原生协议同样支持根地址或 `/api` 地址。
 
 ## 安装 / Installation
 
-> 从下载到首次 recall 的完整路径。
+在线一行安装（macOS/Linux、Python 3.11+）：
 
 ```bash
-# 1. 下载并审阅安装器（macOS/Linux、Python 3.11+，不使用 sudo）
-curl -fsSLO https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh
-less install.sh
-sh install.sh
+curl -fsSL https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh | sh
+```
 
-# 2. 选择 Profile、Provider/model、Agent adapter 与可选 watch schedule
+安装完成后配置模型与 Agent，再开始检索：
+
+```bash
 book init
-
-# 3. 查看状态并完成首次有效 recall
 book status
 book search "what should I remember about this task?"
 ```
@@ -391,10 +394,25 @@ book search "what should I remember about this task?"
 `book setup` 是一个 minor release 内的隐藏兼容 alias。旧 `storybook init` 继续只做
 数据库初始化，低层 canonical 入口为 `book admin init-db`。
 
-`curl ... | sh` 会把远端当前内容直接交给 shell，无法先审阅，且信任 HTTPS、GitHub
-账号与发布流程；安全要求较高时使用上面的“下载 → 审阅 → 执行”路径。安装器默认写入
-`~/.local`，不会修改 shell rc；PATH 缺失时只打印可复制的修复命令。指定版本升级会下载
-官方 release checksum，先在临时 venv 验证并安装，最后原子切换；失败时旧版本仍可运行：
+安装器自动下载最新正式版并校验 SHA-256，在隔离环境验证后原子切换。默认安装到
+`~/.local`；PATH 缺失时会打印配置命令。安装失败时保留原版本。
+
+### 从本地代码安装或更新
+
+已有源码仓库时，无需等待 Release，也无需下载 Storybook 安装包：
+
+```bash
+sh ./install.sh                    # 自动使用安装脚本所在仓库的当前代码
+git pull && sh ./install.sh --no-init  # 拉取后更新，跳过重新初始化
+sh ./install.sh --source /path/to/storybook --no-init  # 显式指定源码目录
+```
+
+本地安装会构建当前文件（包括未提交修改），验证后切换已安装版本；之后修改源码需再次运行安装命令。
+模型配置与记忆数据保留。依赖由 pip 安装或复用缓存。
+需要在仓库中安装正式版时，使用 `sh ./install.sh --version latest`；`--source` 与 `--version` 不能同时使用。
+未指定 `--source` 时，显式设置发布镜像地址会选择在线安装。
+
+### 安装环境与选项
 
 Storybook 的 sqlite-vec 索引要求 Python SQLite 支持 loadable extensions；安装器会在任何
 写入前检查该能力。macOS arm64 若使用了不具备该能力的 Python，可执行
@@ -427,9 +445,9 @@ pip 失败，无法创建隔离环境），说明当前 Python 的 venv/ensurepi
 既有版本，也不会在 prefix 下留下残留 target。
 
 ```bash
-sh install.sh --version 0.2.0
-sh install.sh --prefix "$HOME/tools/storybook" --no-init
-sh install.sh --dry-run                       # 严格零写入
+curl -fsSL https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh | sh -s -- --version 0.2.1
+curl -fsSL https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh | sh -s -- --prefix "$HOME/tools/storybook" --no-init
+sh ./install.sh --dry-run          # 本地安装计划，严格零写入
 ```
 
 ### 快速升级：`book update`

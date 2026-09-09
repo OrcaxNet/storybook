@@ -74,6 +74,8 @@ def _provider_server(*, models=(), api_mode="ready", dimension=1024):
                     if state["api_mode"] == "generation_null"
                     else {"choices": [{"message": {"content": "OK"}}]}
                 )
+                if state["api_mode"] == "generation_reasoning" and payload.get("max_tokens", 0) < 78:
+                    response = {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]}
                 self._send(response)
             elif self.path == "/v1/embeddings":
                 response = (
@@ -465,6 +467,45 @@ def test_probe_provider_anthropic_generation_uses_messages_api(tmp_path, monkeyp
     assert urls[1].endswith("/api/embeddings")
 
 
+@pytest.mark.parametrize("protocol", ["openai", "anthropic", "ollama"])
+@pytest.mark.parametrize("recover", [True, False])
+def test_generation_probe_retries_only_truncated_empty_output(
+    tmp_path, monkeypatch, protocol, recover,
+):
+    value = model_config.build(
+        llm_protocol=protocol, llm_base_url="https://models.example.test", llm_secret=SENTINEL,
+        llm_model="reasoning-chat", embedding_protocol="ollama", embedding_model="embed",
+    )
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        text = "OK" if recover and len(calls) == 2 else ""
+        if protocol == "anthropic":
+            return Response({"content": [{"type": "text", "text": text}], "stop_reason": "max_tokens"})
+        if protocol == "ollama":
+            return Response({"message": {"content": text}, "done_reason": "length"})
+        return Response({"choices": [{"message": {"content": text}, "finish_reason": "length"}]})
+
+    monkeypatch.setattr("storybook.setup_manager.requests.post", post)
+    manager = SetupManager(environ={}, adapters=(), roots=_roots(tmp_path))
+    if recover:
+        assert manager._probe_provider(value, kinds=("generation",))[0]["ok"]
+    else:
+        with pytest.raises(SetupError) as caught:
+            manager._probe_provider(value, kinds=("generation",))
+        assert caught.value.code == "SB_MODEL_GENERATION_TRUNCATED"
+        assert "4096" in str(caught.value)
+        assert SENTINEL not in str(caught.value)
+    assert len(calls) == 2
+    payloads = [kwargs["json"] for _, kwargs in calls]
+    budgets = [payload["options"]["num_predict"] if protocol == "ollama" else payload["max_tokens"] for payload in payloads]
+    assert budgets == [256, 4096]
+    assert all(kwargs["timeout"] == 30 for _, kwargs in calls)
+    assert all(kwargs["headers"] == model_config.request_headers(protocol, SENTINEL) for _, kwargs in calls)
+    assert all(payload["stream"] is False for payload in payloads)
+
+
 @pytest.mark.parametrize(
     ("responses", "code"),
     [
@@ -716,7 +757,8 @@ def test_anthropic_probe_uses_same_auth_as_runtime(tmp_path, monkeypatch):
 def test_fresh_mixed_tuple_setup_and_runtime_in_a_new_process(tmp_path, embedding_protocol, dimension):
     storybook_home = tmp_path / "storybook"
     env = _subprocess_env(tmp_path, storybook_home)
-    with _provider_server() as (llm_url, llm_state), _provider_server(dimension=dimension) as (embed_url, embed_state):
+    # 模拟真实网关：生成 OK 需要 78 token（包括正文前的内部计算）。
+    with _provider_server(api_mode="generation_reasoning") as (llm_url, llm_state), _provider_server(dimension=dimension) as (embed_url, embed_state):
         completed = subprocess.run(
             [sys.executable, "-m", "storybook.cli", "setup", "--yes", "--json",
              "--llm-protocol", "openai", "--llm-base-url", llm_url + "/v1",
