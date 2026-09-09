@@ -181,10 +181,16 @@ def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
 
 
 def _local_env(tmp_path: Path) -> dict[str, str]:
-    _, env = _fake_tools(tmp_path)
+    # Exercise real Python/venv on each platform; only block release downloads.
+    # Fake python/uname shims are for shell unit tests, not real build subprocesses.
+    tools = tmp_path / "download-blockers"
+    tools.mkdir()
+    for command in ("curl", "wget"):
+        _executable(tools / command, "#!/bin/sh\nexit 22\n")
+    env = {**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}
     for key in ("STORYBOOK_INSTALL_ARCHIVE_URL", "STORYBOOK_INSTALL_CHECKSUM_URL", "STORYBOOK_INSTALL_REPOSITORY"):
         env.pop(key, None)
-    env.update(STORYBOOK_INSTALL_PYTHON=sys.executable, FAKE_DOWNLOAD_FAIL="1", PIP_NO_INDEX="1")
+    env.update(STORYBOOK_INSTALL_PYTHON=sys.executable, PIP_NO_INDEX="1")
     return env
 
 
