@@ -4,16 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An offline "coding memory" system (project name: **Storybook**) that ingests AI-coding session logs (Claude Code session logs, JSON files, or a built-in simulator), then runs a **"dream cycle"** that consolidates each session into a structured memory unit (a *Story*) and links Stories into a weighted association graph. Retrieval is vector-similarity plus edge-graph activation. LLM and embedding each use a protocol/base_url/secret/model tuple in the active Profile model-config.json. They may use independent local or remote endpoints; environment variables do not configure models.
+A local-first "coding memory" system (project name: **Storybook**) that ingests AI-coding session logs (Claude Code session logs, JSON files, or a built-in simulator), then runs a **"dream cycle"** that consolidates each session into a structured memory unit (a *Story*) and links Stories into a weighted association graph. Retrieval is vector-similarity plus edge-graph activation. LLM and embedding each use a protocol/base_url/secret/model tuple in the active Profile model-config.json. They may use independent local or remote endpoints; environment variables do not configure models.
 
 Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
 
 ## Environment & running
 
 - Python **3.11+** (venv at `.venv/`). Dependencies: `click`, `requests`, `numpy`, `sqlite-vec`, `mcp`.
-- Configure models with `book init --config model-config.json` or the interactive `book init` wizard. See `model-config.example.json`.
+- Configure models with `book init --config model-config.json` or the interactive `book init` wizard. See [model-config.example.json](model-config.example.json). Import copies the resolved tuples into the active Profile; subsequent edits must target that file or be imported again. Restart existing MCP/watch/daemon processes to load edits.
 - `book config --path` prints the active file path; `book config` redacts secrets. Generation supports OpenAI, Anthropic Messages and Ollama protocols; embedding supports OpenAI and Ollama. Missing embedding fields inherit generation values, and empty secret clears inheritance. Fresh indexes discover dimension automatically.
-- `config.py` auto-loads a project-root `.env` at import (no error if absent; copy `.env.example`). Pre-existing env vars / command-line `VAR=val` take priority over `.env` (`.env` never overwrites them).
+- Both `generation` and `embedding` objects are required. Generation must contain all four string fields; embedding may be `{}` to inherit all four. Changing protocol does not reset inherited URL, secret or model. If generation uses Anthropic, embedding must explicitly select a supported protocol.
+- Model files use schema version 2 with literal secrets, not environment references. `model_config.py` writes files atomically with mode `0600` and masks secrets in public output. The internal `model-secrets.json` preserves credentials needed by serving indexes during rebuilds; it is not a second user configuration source. Never commit either private file.
+- `config.py` auto-loads a project-root `.env` for optional runtime/algorithm settings at import (no error if absent; copy `.env.example`). Pre-existing env vars / command-line `VAR=val` take priority over `.env` (`.env` never overwrites them); neither source configures model endpoints.
 - The venv has no `pip` (created with `uv`). Install editable to get the `book` command (and `storybook` compat alias): `VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .` (re-run if the project dir moves and the `book` shebang goes stale). Without installing, run via `PYTHONPATH=src .venv/bin/python -m storybook.cli <command>`.
 
 ## Commands
@@ -29,7 +31,7 @@ book admin migration discover           # find project-level v1 databases read-o
 book admin migration run PATH --dry-run # zero-write migration plan
 book admin migration run PATH           # backup, convert, verify, atomic cut-over
 book admin migration rollback ID        # atomically point back to a v1 rollback copy
-book doctor [--fix]                     # env health check (Ollama/models/dim/sqlite-vec/vector double-write); --fix repairs double-write inconsistency
+book doctor [--fix]                     # model endpoint/dimension/sqlite-vec health; --fix repairs vector double-write inconsistency
 book run [--session ID]                 # "dream cycle": collect + process all pending sessions (or one)
 book search "<query>" [--top 3]         # vector search + related-story activation
 book status [--performance]             # run status + recent query p50/p95 + cache/fallback ratios
@@ -49,11 +51,11 @@ calling the same business functions; their hints go only to stderr so JSON/MCP s
 
 Note the legacy command is **`import-data`**, not `import` (click auto-hyphenates the `import_data` function). With no flags/path it defaults to `--claude`. The `--claude`, `--sample`, `--cursor`, and `<path>` forms are mutually exclusive.
 
-The pytest suite lives in `tests/` and mocks Ollama by default. `test_logs/*.json` and `hermes_sessions.json` are sample data sources for `import-data`.
+The pytest suite lives in `tests/` and uses mocks or local HTTP test servers, with no external model service dependency. `test_logs/*.json` and `hermes_sessions.json` are sample data sources for `import-data`.
 
 ## Architecture
 
-Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `context.py` owns ContextEnvelope capture, privacy normalization and environment-fit scoring; `cli.py` wires commands; `config.py` holds all paths, model names, and thresholds; `health.py` powers `book doctor` (env + vector double-write consistency self-check, reads via `store`). `setup_manager.py` orchestrates one-click setup/uninstall; `setup_adapters/` owns plugin-registered, node-scoped Claude Code/Cursor/Codex config merges and rollback.
+Module flow (all under `src/storybook/`): `collector` → `store` → `processor` (uses `llm` + `embeddings`) → `search`. `context.py` owns ContextEnvelope capture, privacy normalization and environment-fit scoring; `cli.py` wires commands; `model_config.py` validates/inherits/persists model tuples and builds protocol URLs/headers; `config.py` resolves Profile paths, loads those tuples and holds runtime thresholds. `health.py` powers `book doctor` (model endpoints + vector double-write consistency self-check, reads via `store`). `setup_manager.py` orchestrates tuple probes, dimension discovery, setup/uninstall; `setup_adapters/` owns plugin-registered, node-scoped Claude Code/Cursor/Codex config merges and rollback.
 
 ### Storage layer (`store.py`) — SQLite + sqlite-vec
 Each random-UUID user Profile owns a database generation under `profiles/<profile_id>/`; the default is `db/memory.db`, while safe migrations use `migrations/<migration_id>/v2.db`. The registry stores only that Profile-relative `database_ref`, and switches it atomically after conversion validation. `profiles.py` is the sole registry/path resolver used by CLI, collectors, hooks and MCP; repository paths are not memory boundaries. Three tables (`sessions`, `stories`, `edges`) plus the **`story_vectors` vec0 virtual table** carry path-independent `global_id`, `profile_id`, and `sync_state=local_only`. Each `get_db()` call opens a fresh connection (WAL mode, foreign keys on) and loads the sqlite-vec extension.
@@ -100,10 +102,10 @@ source Sessions, never a last-write-wins field.
 - Paths: `DB_PATH`/`INDEX_DIR`/`CACHE_DIR`/`LOG_DIR` resolve from the active user Profile; `PERFORMANCE_LOG_PATH` follows that Profile's `LOG_DIR`; `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
 - Thresholds/budgets: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_ABSTRACT_MAX_CHARS` (600), plus Graph RAG hop/path/fan-out/time/token budgets in `GRAPH_*`.
 - Weight rules: `WEIGHT_INCREMENT` (0.1), `WEIGHT_MAX` (1.0), `WEIGHT_PARENT_CHILD` (1.0).
-- LLM call options (temp 0.3, `num_ctx` 8192, 120s timeout) are hardcoded in `llm._chat`/`_generate`, except `think` which follows `config.LLM_THINK` (default **off**). `qwythos-hermes` is Qwen3-arch with a thinking mode that makes extraction calls ~9× slower; thinking is unnecessary for keyword/summary/split tasks, so it's off by default.
+- `llm._chat` uses temperature 0.3, a default output budget of 4096 tokens and a default 120s timeout; callers may supply smaller token/time budgets. Structured requests use OpenAI JSON Schema, Anthropic tool calls or Ollama `format`, with local schema validation. The Anthropic payload follows `config.LLM_THINK` (default off).
 
 ## Notes
 
 - This is a git repository; preserve unrelated worktree changes.
-- `docs/TECH_DESIGN.md` is the original design doc; some directory layout and `storybook import` examples predate the implementation (the command is now `import-data`).
+- `docs/TECH_DESIGN.md` retains early design context with updated model configuration and module responsibilities; use README and CLI help for current installation and commands.
 - LLM output parsing is tolerant: it slices between `[`/`]` for keyword JSON and splits on `TITLE:`/`CONTENT:` markers, with string-split fallbacks when the model doesn't follow the format.

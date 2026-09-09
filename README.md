@@ -291,8 +291,9 @@ flowchart LR
 
 - **Python 3.11+**（推荐用 [uv](https://github.com/astral-sh/uv) 建 venv）
 - **LLM 端点**：支持 OpenAI-compatible、Anthropic-compatible 和 Ollama 原生协议；通过 `book init` 配置地址、secret 和模型
-- **Ollama（推荐）**：本地 preset 默认为 `http://localhost:11434` + `qwen3-embedding:0.6b` + 1024 维。旧 模型地址和 model-id 在配置文件中填写
 - **Embedding 端点**：支持 OpenAI-compatible 和 Ollama 原生协议；在配置文件中填写 secret，本地无鉴权服务填空字符串
+- **本地模型（可选）**：使用 Ollama 时先启动服务；示例 embedding 为 `http://localhost:11434` 上的 `qwen3-embedding:0.6b`，首次初始化自动检测维度
+- **依赖**：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
 
 ### 模型配置：一份文件，两个四元组
 
@@ -308,6 +309,10 @@ book init --config model-config.json
 book config --path    # 获取当前 Profile 的配置路径，之后可直接编辑
 book config           # 查看配置；secret 始终遮蔽
 ```
+
+`--config` 会将配置导入当前 Profile，后续运行读取 Profile 中的文件。
+修改导入前的源文件不会自动同步；可重新导入，或直接编辑 `book config --path` 返回的文件。
+已运行的 MCP server、watch/daemon 进程需重启以读取修改。
 
 ```json
 {
@@ -332,6 +337,16 @@ book config           # 查看配置；secret 始终遮蔽
 LLM 支持 `openai / anthropic / ollama`，Embedding 支持 `openai / ollama`。
 协议只决定请求格式，与服务厂商无关。
 
+| 四元组字段 | JSON 字段名 | 填写方式 |
+|------------|-------------|----------|
+| 协议类型 | `protocol` | `openai`、`anthropic` 或 `ollama`，按端点支持的请求协议选择 |
+| baseUrl | `base_url` | HTTP(S) 服务地址；鉴权放在 `secret` 中 |
+| secret | `secret` | 密钥字符串；无需鉴权时填 `""` |
+| model-id | `model` | 服务接受的模型 ID；LLM 与 embedding 分别选择支持对应能力的模型 |
+
+两组对象都需要保留；`"embedding": {}` 会继承完整的 LLM 四元组。
+如果 LLM 使用 `anthropic`，embedding 必须显式选择 `openai` 或 `ollama`，并填写对应地址与模型。
+
 也可以直接运行 `book init` 使用向导：依次填写协议、baseUrl、secret、model-id，
 第二组的四个默认值全部来自第一组；回车保留默认值，secret 输入 `-` 清空。
 已有配置时，第一组默认读取当前 LLM 四元组。向导隐藏 secret 输入并生成同样的配置文件。
@@ -347,17 +362,11 @@ Ollama 原生协议同样支持根地址或 `/api` 地址。
 `book init --config model-config.json --dry-run --json` 可检查配置计划，且不写文件、不调用模型。
 需要自动化时追加 `--yes`；模型字段 flags 也遵循相同继承规则，但不能与 `--config` 同用。
 
-已有 Profile 的 active 向量索引会持久化 provider、base URL、model 与 version
-身份。setup 若检测到目标 embedding space 不兼容，会在任何写入和网络探测前以
+已有 Profile 的 active 向量索引会记录协议适配器、base URL、model、version 和维度。
+`book init` 若检测到目标 embedding 与现有索引不兼容，会在任何写入和网络探测前以
 `SB_MODEL_INDEX_INCOMPATIBLE` 失败；可保持原配置，或先运行
-`book profile create provider-migration --switch` 创建隔离 Profile 后重新
-setup。不同 provider/base URL 即使模型同名，也不会共享 inference/query cache。
-- 依赖：`click`、`requests`、`numpy`、`sqlite-vec`、`mcp`（Agent 接入所需）
-
-```bash
-# 拉模型
-ollama pull qwen3-embedding:0.6b
-```
+`book profile create new-models --switch` 创建隔离 Profile 后重新运行 `book init --config model-config.json`。
+保留现有记忆并更换 embedding 时使用下文的索引重建流程。不同协议或地址即使模型同名，也不会共享 inference/query cache。
 
 ## 安装 / Installation
 
@@ -466,8 +475,9 @@ PYTHONPATH=src .venv/bin/python -m storybook.cli <command>
 ### 一键 setup 与安全卸载
 
 `book init` 会先展示完整改动计划，再创建用户级 Profile/schema、检测并接入
-Claude Code、Cursor、Codex。Ollama 推荐 preset 会检查/下载本地 embedding 模型；自定义 API 不会调用 Ollama 的 tags/pull 接口。最后执行 schema、embedding、
-adapter、recall smoke test。三类 Agent 都复用同一个 `book mcp` stdio server；Claude
+Claude Code、Cursor、Codex。选择 `ollama` 原生协议的每个四元组会在各自地址检查/下载模型；
+`openai` 和 `anthropic` 协议直接探测对应接口。模型准备完成后验证 LLM 生成、embedding、
+schema、adapter 与 recall。三类 Agent 都复用同一个 `book mcp` stdio server；Claude
 Code 还会安装幂等的 `SessionStart` recall hook。无需手工编辑 JSON/TOML。
 
 ```bash
@@ -477,7 +487,7 @@ book init --dry-run                     # 严格零写入（不建目录/DB、�
 book init --json                        # 结构化结果，便于自动化
 book init --agent codex --yes           # 可重复 --agent，覆盖自动检测
 book init --enable-schedule --yes       # 生成用户级 watch service（无需 sudo）
-book init --skip-models --yes           # 离线跳过缺失模型，状态为 degraded
+book init --skip-models --yes           # 跳过缺失 Ollama 模型的下载；仍探测端点
 book init --yes --llm-protocol ollama --llm-base-url http://localhost:11434 \
   --llm-model qwen3:8b --embedding-model qwen3-embedding:0.6b
 
@@ -494,7 +504,12 @@ book admin uninstall --yes --purge-data --confirm-purge  # 非交互双重显式
 
 
 
-Serving index 的身份包含 endpoint、adapter、model、version、dimension 和非敏感的凭据快照引用。修改任一项会进入 `serving_index_mismatch`；默认查询继续使用旧 index 对应的 API 与凭据快照，直到 `embedding-backfill` 完成 shadow generation 并原子切换，避免将不同向量空间混入同一索引。旧版 schema 只支持 Ollama，因此升级时会按既有 `OLLAMA_HOST`/默认地址映射 active identity，不改写 Story 或向量索引；custom API identity 不会被猜测。
+Serving index 的身份包含 endpoint、adapter、model、version、dimension 和非敏感的凭据快照引用。
+配置与当前索引不一致时，诊断返回 `serving_index_mismatch`，查询继续使用当前索引的端点与凭据。
+需要保留记忆并更换 embedding 时，先编辑 Profile 配置中的 embedding 四元组及目标 `embedding_dimension`，
+再运行 `book admin index --version <新的索引版本>`；每次默认处理 100 条 Story，可用相同版本重复运行续跑。
+所有 Story 的新向量就绪后才原子切换 serving index。`model-secrets.json` 由程序维护，
+只用于保留索引的凭据快照；用户配置仍只需编辑 `model-config.json`。
 
 ## 用户级 Profile 与共享存储 / Profiles
 
@@ -554,7 +569,7 @@ book admin migration delete-backup <migration_id> --yes      # 用户显式永�
 ## 测试 / Tests
 
 测试套件覆盖 `store` / `processor` / `search` 三个核心模块的关键路径与边界，
-**完全不依赖真实 DeepSeek/Ollama**——所有 LLM / embedding 调用均被 mock 桩替换，本地一键可重复运行。
+**不依赖外部模型服务**——LLM / embedding 调用使用 mock 或本地 HTTP 测试服务，可在本机重复运行。
 
 ```bash
 # 1. 安装测试依赖（与运行时依赖一并）
@@ -567,7 +582,7 @@ VIRTUAL_ENV=$(pwd)/.venv uv pip install -e ".[test]"
 .venv/bin/pytest --cov=storybook --cov-report=term-missing
 ```
 
-测试不启动 Ollama、不访问 DeepSeek：HTTP 与 embedding 均使用 mock。
+测试覆盖配置文件导入、四元组继承、secret 遮蔽、独立端点的协议与鉴权、维度检测及索引一致性。
 用例要点：
 
 - **store**：Session/Story CRUD、`_edge_pair` 无向边归一、`search_by_vector` 的 `1 - dist²/2`
@@ -641,10 +656,10 @@ book status --performance
 book status --performance --json
 ```
 
-`status --json` 同时返回当前 `profile`、混合 provider `model`、setup 管理的
+`status --json` 同时返回当前 `profile`、独立的 LLM/embedding `model`、setup 管理的
 `adapter`、`sync` 与计数字段。组件全部可用时 `status=ready`；Profile、模型或
 已配置 adapter 不可用时返回 `status=ready_degraded`，并通过稳定的
-`degraded_reasons`（例如 `llm_credentials_missing`、`endpoint_unreachable:embedding`、`authentication_failed:embedding`、`credentials_missing:embedding`、`model_unavailable:embedding`、`response_protocol_incompatible:embedding`、`dimension_mismatch:embedding`、
+`degraded_reasons`（例如 `llm_config_missing`、`endpoint_unreachable:embedding`、`authentication_failed:embedding`、`credentials_missing:embedding`、`model_unavailable:embedding`、`response_protocol_incompatible:embedding`、`dimension_mismatch:embedding`、
 `adapter_unavailable:codex`）解释降级，不把可用的本地数据库误报为整体失败。
 `doctor` / `status` 还会对比 API 实际维度与 active `story_vectors` 维度、model/version；切换未完成时返回 `serving_index_mismatch:embedding`，保留旧索引并要求先做 shadow backfill。Ollama payload 额外暴露 `model_state=warm|cold`。不同维度的 backfill 完整后，activation 在同一事务内重建 vec0 表并切换。
 
@@ -858,7 +873,7 @@ launchctl print gui/$(id -u)/com.storybook.dream  # 查看状态
 book profile show                                # 先查看当前 Profile 日志目录
 ```
 
-plist 触发的是 `<venv>/bin/book run --once`，`StartInterval` 可配置（默认 14400s = 4h），`RunAtLoad=true`（登录时先追补一次离线期间的新会话）。launchd 无 shell 环境，故 `book` 必须装在 venv 里、`.env` 由 `config.py` 自动加载——无需手动 `export`。
+plist 触发的是 `<venv>/bin/book run --once`，`StartInterval` 可配置（默认 14400s = 4h），`RunAtLoad=true`（登录时先追补一次离线期间的新会话）。`book` 必须装在模板指定的 venv 中；调度进程直接读取 Profile 的 `model-config.json`，无需导出模型密钥。可选的运行与算法参数仍由 `config.py` 加载 `.env`。
 
 ### Linux / 其它平台：守护进程
 
@@ -1023,7 +1038,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 
 ## 配置 / Configuration
 
-模型四元组保存在当前 Profile 的 `model-config.json`；运行 `book config --path` 查看路径。运行目录、缓存、检索算法等参数由 `src/storybook/config.py` 管理，环境变量样例见 `.env.example`。
+模型四元组保存在当前 Profile 的 `model-config.json`；运行 `book config --path` 查看路径，格式与导入步骤见上文「模型配置：一份文件，两个四元组」。运行目录、缓存、检索算法等参数由 `src/storybook/config.py` 管理，环境变量样例见 `.env.example`；这些变量不设置模型协议、地址、secret 或 model-id。
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
@@ -1095,7 +1110,7 @@ storybook/
 │   ├── story_v2.py     # Story v2 形成/合并/分裂
 │   ├── memory_events.py # create/update/merge/split/delete 审计事件
 │   ├── identifiers.py  # UUIDv7 全局 ID
-│   ├── model_config.py # 混合 provider model-config
+│   ├── model_config.py # 模型四元组校验、继承、文件持久化与协议请求配置
 │   ├── setup_manager.py / setup_adapters/  # 一键 setup/卸载与 Agent 接入
 │   ├── migration.py    # v1 → v2 安全迁移与回滚
 │   ├── dreamd.py       # 做梦周期自动化（锁 / 监听 / 定时守护 / 日志）
@@ -1107,21 +1122,22 @@ storybook/
 ├── scripts/            # launchd plist 模板 + install_launchd.sh + systemd 单元模板
 ├── docs/TECH_DESIGN.md # 原始设计文档
 ├── docs/AGENT_HISTORY_ADAPTERS.md  # Agent 历史格式支持矩阵
-├── tests/              # pytest 测试套件（store/processor/search/dreamd + 集成，全 mock provider）
+├── tests/              # pytest 测试套件（核心模块 + 集成，mock/本地 HTTP 服务）
 ├── test_logs/          # 示例 JSON 数据
 ├── hermes_sessions.json
 ├── install.sh          # 一键安装器
+├── model-config.example.json # LLM + embedding 四元组示例
 ├── .env.example
 └── pyproject.toml
 ```
 
 ## 说明 / Notes
 
-- **隐私边界**：Profile、数据库与原始证据留在本机；本地 Ollama preset 不发送文本离机，远程 embedding/generation API 会接收各自请求文本并在 setup/status 中披露；Fast 查询不调用生成式 LLM。
-- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，全 mock、不依赖真实 provider（见上文「测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
+- **隐私边界**：Profile、数据库与原始证据留在本机；模型请求发送到各自四元组的 `base_url`，远程端点会接收对应的 generation/embedding 请求文本。是否离机取决于地址，与所选协议无关；Fast 查询不调用生成式 LLM。
+- **测试套件**：`tests/` 下 pytest 用例覆盖 store/processor/search/prime/dreamd 核心路径，使用 mock 与本地 HTTP 测试服务，不依赖外部模型服务（见上文「测试」）。`test_logs/*.json` 与 `hermes_sessions.json` 是 `import-data` 的样例数据源。
 - **MCP server**：`book mcp` 启动独立 stdio 进程，向 Claude Code 等 agent 暴露 `recall`/`get_story`/`stats`/`prime_context`（接入见上文「MCP 接入」）。
 - **晨间简报**：`book prime`（SessionStart hook）或 `prime_context` MCP 工具在会话启动时主动召回相关记忆注入上下文，复用 `search` 召回；相关度不足 / 无匹配 / embedding API 不可用时静默不注入（见上文「会话启动注入」）。
-- `docs/TECH_DESIGN.md` 是最初的设计文档，其中的目录布局与命令示例早于当前实现（命令为 `import-data`；`tests/`、`scripts/` 与 launchd plist 已在后续迭代落地，见上文「测试」与「做梦周期自动化」）。
+- `docs/TECH_DESIGN.md` 保留早期设计背景，模型配置与主要模块已按当前实现更新；完整命令与安装步骤以本 README 为准。
 - LLM 输出解析是宽松的：关键词 JSON 在 `[`/`]` 间切片，摘要按 `TITLE:`/`CONTENT:` 标记切分，模型不遵循格式时有字符串切分兜底。
 
 ## License

@@ -1,14 +1,18 @@
 # Local-first Coding 记忆系统 MVP — 技术方案
 
-## 一、环境基线（已确认）
+> 本文保留早期设计背景，模型配置与主要模块说明已同步当前实现。
+> 安装和完整命令见 [README](../README.md)，模型文件见 [配置示例](../model-config.example.json)。
+
+## 一、环境基线
 
 | 组件 | 现状 |
 |------|------|
 | OS | macOS (Apple Silicon) |
 | Python | 3.9.6 (系统) / 3.14 (Homebrew)；用 uv 创建 3.11 venv |
-| Ollama | ✅ 已安装运行 |
-| LLM 模型 | DeepSeek API `deepseek-v4-flash`（Anthropic-compatible Messages API） |
-| Embedding 模型 | `qwen3-embedding:0.6b` (1024维, 639MB) |
+| 模型配置 | 当前 Profile 的 `model-config.json`；LLM 与 embedding 独立四元组 |
+| 本地模型服务 | 可选 Ollama，配置其实际地址；服务不必与 LLM 共用 |
+| LLM 协议 | `openai` / `anthropic` / `ollama`；模型 ID 由所接服务决定 |
+| Embedding 协议 | `openai` / `ollama`；示例为本地 `qwen3-embedding:0.6b`，首次初始化探测维度 |
 | SQLite | ✅ 系统自带 |
 | Cursor | ❌ 未安装（MVP用模拟数据，后续装Cursor后自动适配） |
 
@@ -54,8 +58,8 @@
 | 层 | 选型 | 理由 |
 |----|------|------|
 | **存储** | SQLite + `sqlite-vec` | 单文件、零运维；sqlite-vec 是 sqlite-ivm 作者新项目，2024年最热的 SQLite 向量扩展，GitHub 4k+ stars |
-| **LLM** | DeepSeek `deepseek-v4-flash` | 生成式加工低延迟；失败保持本地 fallback，默认关闭 thinking |
-| **Embedding** | Ollama `qwen3-embedding:0.6b` | 本地已部署，1024维，中英文表现优秀 |
+| **LLM** | 按配置的 OpenAI / Anthropic / Ollama 协议调用 | 地址、secret、model-id 独立配置；结构化结果本地校验，失败保留业务 fallback |
+| **Embedding** | 按配置的 OpenAI / Ollama 协议调用 | 可搭配本地 embedding 与第三方 LLM；维度由响应探测并与索引校验 |
 | **CLI框架** | `click` | Python CLI 事实标准，比 argparse 好用，比 typer 轻量 |
 | **定时调度** | macOS `launchd` (plist) | 原生、可靠、不依赖额外进程；也提供 Python 内置 `schedule` 作为备选 |
 | **日志** | Python `logging` | 标准库够用 |
@@ -78,9 +82,46 @@
 - **numpy 余弦相似度**：把所有 story 向量加载到内存 numpy 数组，暴力计算余弦相似度。千级 story 完全没问题，延迟 <10ms。
 - 这个方案零依赖、零编译风险，作为 fallback 非常可靠。
 
+### 2.5 模型配置：文件与四元组
+
+模型配置的唯一用户入口是当前 Profile 的 `model-config.json`，不读取模型环境变量，
+也不保留旧 provider/preset 配置格式。文件包含 `schema_version: 2`、`generation` 和 `embedding`，
+每组只有四个字段：
+
+| 字段 | 语义 |
+|------|------|
+| `protocol` | 请求协议：LLM 支持 `openai`、`anthropic`、`ollama`；embedding 支持 `openai`、`ollama` |
+| `base_url` | HTTP(S) 服务地址；OpenAI/Anthropic 接受根地址或 `/v1`，Ollama 接受根地址或 `/api` |
+| `secret` | 文件内的密钥字符串；空字符串表示不发送鉴权密钥 |
+| `model` | 端点接受的 model-id，与服务厂商无关 |
+
+`generation` 必须完整填写。`embedding` 对象必须存在，但省略的字段全部继承 `generation`；
+显式 `"secret": ""` 清空继承的密钥。更换协议不会自动重置地址、密钥或模型。
+这使同一服务只需覆盖 embedding 模型名，也允许第三方 LLM 与本地 Ollama 完全独立配置。
+继承后的配置仍需满足所选协议及模型能力；Anthropic 没有 embedding 接口，必须显式覆盖协议。
+
+`book init` 向导按协议、baseUrl、secret、model-id 的顺序配置两组；第二组默认值来自第一组。
+`book init --config <file>` 导入文件，解析并展开继承后写入当前 Profile，后续进程只读取该 Profile 文件。
+`book config --path` 输出实际路径，`book config` 输出遮蔽 secret 的配置。编辑后重启已运行的 MCP/守护进程。
+`book init --config <file> --dry-run --json` 只校验与生成计划，不写文件、不请求模型。
+
+初始化分别探测两个端点。原生 Ollama 按各自地址检查并按需下载模型；
+OpenAI/Anthropic 直接调用对应协议接口。首次建库自动检测 embedding 维度，写入顶层
+`embedding_dimension`；它是索引维度约束，不属于四元组。若手动指定，响应必须与其一致。
+有现成向量索引时，初始化会先检查目标配置与索引是否一致，避免将不同模型空间混写。
+
+`model_config.py` 负责类型与协议校验、继承、URL/鉴权头构造及原子文件写入；
+`config.py` 将当前 Profile 的配置提供给 `llm.py`、`embeddings.py` 和健康检查。
+用户不配置厂商；内部适配器标识仅由协议派生。配置文件权限为 `0600`，公开诊断遮蔽 secret。
+程序维护的 `model-secrets.json` 保存 serving index 所需凭据快照，不是第二份用户配置。
+修改目标 embedding 后，查询仍使用当前索引的端点与凭据，直到 `book admin index --version <新版本>`
+完成新向量的增量重建并原子切换。Profile 私密文件不纳入版本控制。
+
 ## 三、数据模型设计
 
 > Story v2（FLO-89）与 local-only 事件模型（FLO-91）更新：以下 schema 示例保留核心列用于阅读；运行时 `_SCHEMA` 还包含 Profile/ContextEnvelope 字段。Story 的持久边界不再是 400 字，完整 detail/source 不截断；abstract 是独立预算字段。新实体与事件使用 UUIDv7 全局 ID。
+
+下文 `1024` 是示例模型的维度；运行时 vec0 表按实际索引维度创建，不要求所有 embedding 模型输出 1024 维。
 
 ### 3.1 SQLite Schema
 
@@ -336,44 +377,47 @@ def should_split(merged_story: dict, llm_judge: str) -> bool:
 ### 5.1 目录结构
 
 ```
-coding-memory/
+storybook/
 ├── pyproject.toml
 ├── README.md
 ├── .env.example
+├── model-config.example.json  # 模型四元组示例（不含真实密钥）
 ├── src/
-│   └── coding_memory/
+│   └── storybook/
 │       ├── __init__.py
-│       ├── config.py          # 配置管理
+│       ├── config.py          # Profile 路径、模型文件加载与运行参数
+│       ├── model_config.py    # 四元组校验、继承、持久化与协议请求配置
+│       ├── setup_manager.py   # 初始化、模型探测与 Agent 接入
 │       ├── store.py           # SQLite存储层
-│       ├── embeddings.py      # Ollama embedding封装
-│       ├── llm.py             # DeepSeek Messages API 封装 (摘要/关键词/分裂)
+│       ├── embeddings.py      # OpenAI / Ollama embedding 与索引重建
+│       ├── llm.py             # OpenAI / Anthropic / Ollama 生成与结构化输出
 │       ├── collector.py       # Cursor日志采集
 │       ├── processor.py       # 「做梦」核心流程
 │       ├── search.py          # 检索激活
 │       └── cli.py             # CLI入口
 ├── scripts/
-│   └── com.hermes.coding-memory.plist  # launchd定时任务
-├── data/                      # SQLite数据库存放
-│   └── memory.db
+│   └── com.storybook.dream.plist  # launchd定时任务
+├── data/                      # benchmark/评测资源；运行数据库位于用户 Profile
 └── tests/
     ├── test_store.py
     ├── test_processor.py
-    └── test_data/             # 模拟Cursor会话日志
-        └── sample_sessions.json
+    └── test_model_providers.py # 文件配置、协议、独立端点与初始化探测
 ```
 
 ### 5.2 模块职责
 
 | 模块 | 职责 | 核心接口 |
 |------|------|---------|
-| `config.py` | 配置管理 | `DB_PATH`, DeepSeek LLM 配置, `OLLAMA_HOST`, `EMBED_MODEL`, 阈值常量 |
+| `config.py` | 当前 Profile 的配置加载与运行参数 | `DB_PATH`、`MODEL_CONFIG_PATH`、`MODEL_CONFIG`、阈值常量 |
+| `model_config.py` | 四元组校验、继承与文件持久化 | `ModelEndpoint`、`ModelConfig`、`load()`、`save()`、`request_url()`、`request_headers()` |
+| `setup_manager.py` | 初始化与端点验证 | `SetupManager.plan()`、`execute()`；模型能力/维度探测与 Agent 接入 |
 | `store.py` | 存储CRUD | `init_db()`, `add_session()`, `get_pending_sessions()`, `add_story()`, `update_story()`, `add_edge()`, `update_edge_weight()`, `search_vectors()` |
 | `embeddings.py` | 语义向量 | `embed(text) -> List[float]`, `cosine_similarity(v1, v2) -> float` |
 | `llm.py` | LLM处理 | `extract_keywords(text) -> List[str]`, `summarize_session(session) -> str`, `merge_stories(old, new) -> str`, `judge_split(merged) -> bool`, `split_story(merged) -> List[dict]` |
 | `collector.py` | 日志采集 | `collect_cursor_sessions(path) -> List[dict]`, `import_session(session_dict)` |
 | `processor.py` | 做梦加工 | `process_session(session_id)`, `process_all_pending()`, `run_dream_cycle()` |
 | `search.py` | 检索激活 | `search(query) -> dict`, `get_related_stories(story_id) -> List[dict]` |
-| `cli.py` | CLI入口 | `cm import <path>`, `cm process`, `cm search <query>`, `cm stats` |
+| `cli.py` | CLI入口 | `book init --config <file>`、`book config`、`book run`、`book search <query>`、`book status` |
 
 ## 六、关键技术实现细节
 
@@ -392,7 +436,7 @@ coding-memory/
 会话内容：
 {session_content}
 
-通过强制命名 tool call 按 JSON Schema 返回 `{stories: [...]}`；旧网关 JSON 文本仅作兼容 fallback。
+按配置协议返回 `{stories: [...]}`：OpenAI JSON Schema、Anthropic 命名 tool call 或 Ollama format，并在本地校验结构。
 ```
 
 **关键词提取 Prompt：**
