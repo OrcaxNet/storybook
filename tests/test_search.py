@@ -378,7 +378,8 @@ class TestLexicalFallback:
         )
         embeddings.mark_model_used()
         monkeypatch.setattr(config, "QUERY_WARM_TIMEOUT_SECONDS", 0.02)
-        monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 0.05)
+        # 本用例验证 embedding 超时；正常词法查询不应受 CI 的毫秒级调度抖动影响。
+        monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 2.0)
         entered = threading.Event()
         release = threading.Event()
         finished = threading.Event()
@@ -390,7 +391,7 @@ class TestLexicalFallback:
             if calls == 1:
                 entered.set()
                 try:
-                    release.wait(timeout=2.0)
+                    release.wait(timeout=10.0)
                 finally:
                     finished.set()
             return basis(0)
@@ -410,6 +411,8 @@ class TestLexicalFallback:
         assert finished.wait(timeout=1.0)
 
         # 已超时 worker 的迟到结果不能写入查询缓存或污染后续查询。
+        # 此阶段验证恢复与缓存隔离，不再注入 20ms 的超时预算。
+        monkeypatch.setattr(config, "QUERY_WARM_TIMEOUT_SECONDS", 2.0)
         recovered = search_module.search("timeout fallback")
         assert calls == 2
         assert recovered["degraded"] is False
@@ -431,7 +434,7 @@ class TestLexicalFallback:
             if calls == 1:
                 entered.set()
                 try:
-                    release.wait(timeout=2.0)
+                    release.wait(timeout=10.0)
                 finally:
                     finished.set()
                 return []
@@ -451,6 +454,8 @@ class TestLexicalFallback:
             release.set()
         assert finished.wait(timeout=1.0)
 
+        # 超时已在同步点阻塞阶段验证；给正常恢复查询留出调度预算。
+        monkeypatch.setattr(config, "QUERY_FALLBACK_TIMEOUT_SECONDS", 2.0)
         recovered = search_module.search("q")
         assert calls == 2
         assert recovered["fallback_status"] == "ok"
