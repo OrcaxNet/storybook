@@ -840,7 +840,9 @@ book --verbose search "如何调试数据库连接" 2>&1 | grep 'stage='
 
 Agent history 为 local-first：单来源损坏会在 summary 标记 `degraded`，但不阻断其他来源。MCP 接入与 history ingestion 是两个独立状态。支持矩阵、schema/version 证据及隐私边界见 [Agent History Adapter compatibility](docs/AGENT_HISTORY_ADAPTERS.md)。
 
-Codex JSONL 按 **append-only 增量源**处理：热路径只读取固定上限的文件身份/guard 证据和 checkpoint cursor 后新增的完整记录，复杂度为 `O(delta + C)`，不会为验证全部历史而每轮重读整个文件。文件被原子替换、inode/device 改变、尺寸缩短，或 guard 覆盖的边界发生变化时，会安全回退全量解析。对于同 inode 且继续增长、只改写 guard 未读取的历史中部字节，Storybook 不承诺自动发现；这不属于 supported 来源契约。
+Codex 同时扫描 `$CODEX_HOME/sessions` 与 `archived_sessions`，归档移动不会重复创建会话；`CODEX_HOME` 默认 `~/.codex`，支持 `~` 展开。采集会过滤已知的环境、插件和 AGENTS.md 注入前缀，保留前缀后的真实请求；助手进度说明保留在正文中，但不会覆盖最终结论。适配器升级后会自动重读已有日志，使新解析规则生效。
+
+Codex JSONL 按 **append-only 增量源**处理：每个来源一次性读取 checkpoint 元数据，避免逐文件建立 SQLite 查询连接；热路径只读取固定上限的文件身份/guard 证据和 checkpoint cursor 后新增的完整记录，复杂度为 `O(delta + C)`，不会为验证全部历史而每轮重读整个文件。文件被原子替换、inode/device 改变、尺寸缩短，或 guard 覆盖的边界发生变化时，会安全回退全量解析。对于同 inode 且继续增长、只改写 guard 未读取的历史中部字节，Storybook 不承诺自动发现；这不属于 supported 来源契约。
 
 若上游工具或用户改写了既有历史，使用以下命令删除该来源的 checkpoint；下一轮 import/dream 会完整重建 checkpoint，其他来源不受影响：
 

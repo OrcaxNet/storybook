@@ -526,3 +526,145 @@ def test_source_failure_does_not_block_other_sources(monkeypatch):
     assert out["status"] == "degraded"
     assert [item["source"] for item in out["sources"]] == ["codex", "gemini"]
     assert out["sources"][1]["status"] == "unavailable"
+
+
+def test_codex_archived_sessions_detected_and_move_does_not_duplicate(tmp_path):
+    root = tmp_path / ".codex"
+    path = root / "sessions/one.jsonl"
+    _jsonl(path, _codex_rows("one", "/work"))
+    assert manager.import_source("codex", adapter=CodexAdapter(root))["imported"] == 1
+    archived = root / "archived_sessions/one.jsonl"
+    archived.parent.mkdir()
+    path.rename(archived)
+    path.parent.rmdir()
+    adapter = CodexAdapter(root)
+    assert adapter.detect()["available"]
+    assert adapter.discover() == [archived]
+    result = manager.import_source("codex", adapter=adapter)
+    assert (result["imported"], result["updated"], result["skipped"]) == (0, 0, 1)
+
+
+def test_codex_ignores_injected_preambles_and_preserves_final_conclusion(tmp_path):
+    root = tmp_path / ".codex"
+    path = root / "sessions/one.jsonl"
+    rows = _codex_rows("one", "/work")
+    injected = [
+        "<recommended_plugins>plugin list</recommended_plugins>\n<environment_context>private path</environment_context>",
+        "# AGENTS.md instructions for /private/project\n\n<INSTRUCTIONS>rules</INSTRUCTIONS>",
+    ]
+    rows[1:1] = [{"type": "response_item", "payload": {
+        "type": "message", "role": "user", "content": text,
+    }} for text in injected]
+    rows[-1]["payload"]["phase"] = "final_answer"
+    rows.append({"type": "response_item", "payload": {
+        "type": "message", "role": "assistant", "phase": "commentary",
+        "content": "Checking a follow-up task",
+    }})
+    rows.append({"type": "response_item", "payload": {
+        "type": "message", "role": "assistant", "channel": "analysis",
+        "content": "Private reasoning",
+    }})
+    _jsonl(path, rows)
+    session = CodexAdapter(root).parse(path).sessions[0]
+    assert session.problem_desc == "Fix the database race"
+    assert session.conclusion == "Added a transaction and tests."
+    assert "Checking a follow-up task" in session.raw_content
+    for noise in ("plugin list", "private path", "AGENTS.md", "Private reasoning"):
+        assert noise not in session.raw_content
+    assert manager.import_source("codex", adapter=CodexAdapter(root))["imported"] == 1
+    with path.open("a") as handle:
+        handle.write(json.dumps({"type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "phase": "commentary",
+            "content": "Still checking",
+        }}) + "\n")
+    assert manager.import_source("codex", adapter=CodexAdapter(root))["updated"] == 1
+    db = store.get_db()
+    try:
+        row = db.execute("SELECT conclusion FROM sessions WHERE source = 'codex'").fetchone()
+        assert row["conclusion"] == "Added a transaction and tests."
+    finally:
+        db.close()
+
+
+def test_codex_preserves_prompt_after_environment_block(tmp_path):
+    path = tmp_path / "one.jsonl"
+    _jsonl(path, _codex_rows("one", "/work", "<environment_context>context</environment_context>\n\nFix this bug"))
+    assert CodexAdapter(tmp_path).parse(path).sessions[0].problem_desc == "Fix this bug"
+
+
+def test_codex_home_expands_tilde_and_trims_environment(monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", "  ~/.alternate-codex  ")
+    assert CodexAdapter().root == Path.home() / ".alternate-codex"
+
+
+def test_codex_scan_batches_checkpoint_reads(tmp_path, monkeypatch):
+    root = tmp_path / ".codex"
+    for index in range(10):
+        _jsonl(root / f"sessions/{index}.jsonl", _codex_rows(str(index), "/work"))
+    manager.import_source("codex", adapter=CodexAdapter(root))
+    monkeypatch.setattr(store, "get_source_checkpoint", lambda *a: pytest.fail("per-file checkpoint query"))
+    adapter = CodexAdapter(root)
+    monkeypatch.setattr(adapter, "parse", lambda *a: pytest.fail("unchanged rollout parsed"))
+    result = manager.import_source("codex", adapter=adapter)
+    assert (result["scanned"], result["skipped"]) == (0, 10)
+
+
+def test_codex_upgrade_reparses_existing_checkpoint(tmp_path, monkeypatch):
+    root = tmp_path / ".codex"
+    path = root / "sessions/one.jsonl"
+    _jsonl(path, _codex_rows("one", "/work"))
+    adapter = CodexAdapter(root)
+    monkeypatch.setattr(adapter, "version", "1.0/codex-rollout-0.145")
+    assert manager.import_source("codex", adapter=adapter)["imported"] == 1
+    current = CodexAdapter(root)
+    result = manager.import_source("codex", adapter=current)
+    assert (result["scanned"], result["imported"], result["skipped"]) == (1, 0, 1)
+    assert store.list_source_checkpoints("codex")[0]["adapter_version"] == current.version
+
+
+def test_codex_unreadable_archive_reports_permission_error(tmp_path):
+    root = tmp_path / ".codex"
+    archived = root / "archived_sessions"
+    _jsonl(archived / "one.jsonl", _codex_rows("one", "/work"))
+    archived.chmod(0)
+    try:
+        result = manager.import_source("codex", adapter=CodexAdapter(root))
+        assert result["status"] == "degraded"
+        assert result["errors"][0]["code"] == "SB_SOURCE_PERMISSION_DENIED"
+    finally:
+        archived.chmod(0o755)
+
+
+def test_codex_agent_message_can_supply_delegated_task(tmp_path):
+    path = tmp_path / "one.jsonl"
+    rows = _codex_rows("delegated", "/work")
+    rows[1]["payload"] = {
+        "type": "agent_message", "author": "/root", "recipient": "/root/worker",
+        "content": [{"type": "input_text", "text": "Check the database race"}],
+    }
+    _jsonl(path, rows)
+    result = CodexAdapter(tmp_path).parse(path)
+    assert result.invalid_records == 0
+    assert result.sessions[0].problem_desc == "Check the database race"
+    assert "[agent] Check the database race" in result.sessions[0].raw_content
+    assert result.sessions[0].conclusion == "Added a transaction and tests."
+
+
+def test_codex_empty_rollout_skips_cleanly_and_imports_later_prompt(tmp_path, monkeypatch):
+    root = tmp_path / ".codex"
+    path = root / "sessions/one.jsonl"
+    rows = _codex_rows("empty", "/work")
+    _jsonl(path, rows[:1] + [{"type": "response_item", "payload": {
+        "type": "message", "role": "user", "content": "<environment_context>context</environment_context>",
+    }}])
+    first = manager.import_source("codex", adapter=CodexAdapter(root))
+    assert (first["status"], first["imported"], first["invalid"], first["skipped"]) == ("ok", 0, 0, 1)
+    adapter = CodexAdapter(root)
+    monkeypatch.setattr(adapter, "parse", lambda *a: pytest.fail("unchanged empty rollout reparsed"))
+    second = manager.import_source("codex", adapter=adapter)
+    assert (second["status"], second["scanned"], second["skipped"]) == ("ok", 0, 1)
+    with path.open("a") as handle:
+        for row in rows[1:]:
+            handle.write(json.dumps(row) + "\n")
+    third = manager.import_source("codex", adapter=CodexAdapter(root))
+    assert (third["status"], third["scanned"], third["imported"], third["invalid"]) == ("ok", 1, 1, 0)

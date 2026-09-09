@@ -13,7 +13,7 @@ is not stable enough to import automatically.
 | Agent | Platforms / default local evidence | Schema / workspace / cursor | Privacy-sensitive fields | Fixture/version evidence | Status |
 |---|---|---|---|---|---|
 | Claude Code | macOS/Linux `~/.claude/projects/*/*.jsonl` | JSONL `user`/`assistant`; cwd metadata; complete-record fingerprint | cwd, session ID, tool payloads | Existing collector fixtures and regression suite | supported |
-| Codex CLI/app | macOS/Linux `$CODEX_HOME/sessions/**/*.jsonl` (`CODEX_HOME` defaults to `~/.codex`) | `session_meta`, `response_item`, `event_msg`; cwd; append-only complete-line cursor + bounded file identity/guard | auth/tool arguments, cwd, external session ID | Codex CLI 0.145 local schema probe; `tests/test_history_adapters.py` | supported |
+| Codex CLI/app | macOS/Linux `$CODEX_HOME/{sessions,archived_sessions}/**/*.jsonl` (`CODEX_HOME` defaults to `~/.codex`; `~` is expanded) | `session_meta`, `response_item`, `event_msg`; cwd; append-only complete-line cursor + bounded file identity/guard | auth/tool arguments, cwd, external session ID | Codex CLI 0.145 and desktop rollout schema probes; `tests/test_history_adapters.py` | supported |
 | Cursor | macOS workspaceStorage `*/state.vscdb` | read-only `ItemTable`; workspace metadata; DB fingerprint | workspace URI, opaque cache IDs | Existing Cursor fixtures migrated to adapter contract | supported |
 | Gemini CLI | macOS/Linux `~/.gemini/tmp/*/chats/session-*.json` | 0.38+ `sessionId` + `messages`; project-scoped; file fingerprint | session ID, project hash, tool content | [official session management docs](https://github.com/google-gemini/gemini-cli/blob/main/docs/reference/commands.md); redacted fixture test | supported |
 | Cline | VS Code/VSCodium globalStorage `saoudrizwan.claude-dev/tasks/*/api_conversation_history.json` | MessageParam array; task ID; file fingerprint | environment details, tool blocks, provider secrets | [official Cline repository](https://github.com/cline/cline); redacted fixture test | supported |
@@ -36,6 +36,22 @@ blocking valid records or other sources. Unknown schemas return stable
 `SB_SOURCE_*` codes and are never guessed into Sessions.
 
 ## Append-only checkpoint contract
+
+Codex scans active and archived rollouts. Moving a rollout into the archive
+preserves its Session identity. Known injected environment/plugin/AGENTS.md
+preambles are excluded from user prompts; a request following a preamble is
+preserved. Assistant commentary remains in the transcript, while only final or
+legacy unphased assistant messages update the conclusion. Analysis-channel
+messages are excluded. Adapter version changes trigger a full reparse so these
+rules also apply to previously imported rollouts.
+
+Delegated `agent_message` tasks are retained with an `[agent]` role marker and
+provide the task description when no user request exists. Initialized or aborted
+rollouts without a task are checkpointed and skipped without a corruption warning;
+if a task is appended later, they are fully parsed before their first import.
+
+Each source scan loads its checkpoints in one metadata query, avoiding a
+separate SQLite connection for each unchanged rollout.
 
 Codex rollout JSONL is supported as an append-only source. Its steady-state
 import path reads a fixed upper bound of file identity/guard evidence plus the

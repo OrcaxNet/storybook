@@ -107,17 +107,18 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
 
     summary["files"] = len(files)
     session_source = getattr(item, "session_source", item.name)
+    # One metadata query per source, including scans with thousands of rollouts.
+    checkpoints = {row["file_key"]: row for row in store.list_source_checkpoints(name)}
     for path in files:
         file_key = private_file_key(name, path)
         try:
-            checkpoint = store.get_source_checkpoint(name, file_key)
+            checkpoint = checkpoints.get(file_key)
             stat = path.stat()
             incremental = getattr(item, "parse_incremental", None)
             if (
                 checkpoint
                 and callable(incremental)
                 and checkpoint["adapter_version"] == item.version
-                and checkpoint["session_row_id"] is not None
                 and stat.st_size >= checkpoint["cursor"]
             ):
                 if (
@@ -130,7 +131,7 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
                     summary["skipped"] += 1
                     _restore_checkpoint_diagnostic(summary, checkpoint, file_key)
                     continue
-                if stat.st_size > checkpoint["cursor"]:
+                if stat.st_size > checkpoint["cursor"] and checkpoint["session_row_id"] is not None:
                     try:
                         parsed_append = incremental(
                             path,
@@ -189,8 +190,8 @@ def import_source(name: str, *, adapter: HistoryAdapter | None = None) -> dict:
             parsed = item.parse(path)
             summary["scanned"] += 1
             summary["invalid"] += parsed.invalid_records
-            if not parsed.sessions:
-                summary["invalid"] += 1 if not parsed.invalid_records else 0
+            if not parsed.sessions and not parsed.invalid_records and not parsed.diagnostics:
+                summary["skipped"] += 1
             session_row_id = None
             for session in parsed.sessions:
                 session_row_id, action = store.upsert_external_session(
