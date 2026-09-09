@@ -1,45 +1,50 @@
-"""Versioned, profile-local model provider configuration.
-
-The file deliberately stores only the *name* of a credential environment
-variable.  Secret values are resolved at request time and never serialized.
-"""
+"""Profile-local model configuration: one protocol/baseUrl/secret/model tuple per role."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import re
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Mapping
 from urllib.parse import urlsplit, urlunsplit
 
-
-SCHEMA_VERSION = 1
-PROVIDERS = frozenset({"ollama", "api", "anthropic"})
-PROTOCOLS = frozenset({"ollama", "openai", "anthropic"})
-_PROTOCOL_BY_PROVIDER = {
-    "ollama": "ollama",
-    "api": "openai",
-    "anthropic": "anthropic",
-}
+SCHEMA_VERSION = 2
+PROTOCOLS = ("openai", "anthropic", "ollama")
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_LLM_MODEL = "qwen3:8b"
 DEFAULT_EMBED_MODEL = "qwen3-embedding:0.6b"
-ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-class ModelConfigError(RuntimeError):
-    """Invalid or unsafe model configuration."""
+class ModelConfigError(ValueError):
+    """Invalid model configuration; messages must never contain secrets."""
 
 
 @dataclass(frozen=True)
 class ModelEndpoint:
-    provider: str
+    protocol: str
     base_url: str
+    secret: str = field(repr=False)
     model: str
-    credential_env: str | None = None
-    protocol: str | None = None
+
+    @property
+    def provider(self) -> str:
+        """Internal storage/adapter identifier, derived solely from the protocol."""
+        return "api" if self.protocol == "openai" else self.protocol
+
+    @property
+    def credential_ref(self) -> str:
+        """Opaque identity for a serving index's credential snapshot, never an env var."""
+        return "file_" + hashlib.sha256(self.secret.encode()).hexdigest() if self.secret else ""
+
+    def public_dict(self) -> dict:
+        return {
+            "protocol": self.protocol,
+            "base_url": safe_url(self.base_url),
+            "secret": "********" if self.secret else "",
+            "model": self.model,
+            "credential_status": "configured" if self.secret else "not_required",
+        }
 
 
 @dataclass(frozen=True)
@@ -47,59 +52,47 @@ class ModelConfig:
     schema_version: int
     generation: ModelEndpoint
     embedding: ModelEndpoint
+    embedding_dimension: int | None = None
     source: str = "profile"
 
     def persisted_dict(self) -> dict:
         payload = asdict(self)
-        payload.pop("source", None)
+        payload.pop("source")
+        if self.embedding_dimension is None:
+            payload.pop("embedding_dimension")
         return payload
 
-    def public_dict(self, environ: Mapping[str, str] | None = None) -> dict:
-        env = os.environ if environ is None else environ
+    def public_dict(self) -> dict:
         return {
             "schema_version": self.schema_version,
             "source": self.source,
-            "generation": _public_endpoint(self.generation, env),
-            "embedding": _public_endpoint(self.embedding, env),
+            "generation": self.generation.public_dict(),
+            "embedding": self.embedding.public_dict(),
+            "embedding_dimension": self.embedding_dimension,
         }
-
-
-def _public_endpoint(endpoint: ModelEndpoint, environ: Mapping[str, str]) -> dict:
-    return {
-        "provider": endpoint.provider,
-        "protocol": (
-            endpoint.protocol
-            if endpoint.protocol is not None
-            else _PROTOCOL_BY_PROVIDER.get(endpoint.provider)
-        ),
-        "base_url": safe_url(endpoint.base_url),
-        "model": endpoint.model,
-        "credential_env": endpoint.credential_env,
-        "credential_status": (
-            "not_required"
-            if endpoint.provider == "ollama"
-            else "configured"
-            if endpoint.credential_env and bool(environ.get(endpoint.credential_env))
-            else "missing"
-        ),
-    }
 
 
 def validate_url(value: str) -> str:
     value = value.strip().rstrip("/")
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ModelConfigError("base URL 必须是有效的 http(s) URL")
+    try:
+        parsed = urlsplit(value)
+        valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+        parsed.port  # Validate malformed ports before issuing any request.
+    except ValueError:
+        raise ModelConfigError("baseUrl 必须是有效的 http(s) URL") from None
+    if not valid:
+        raise ModelConfigError("baseUrl 必须是有效的 http(s) URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise ModelConfigError("base URL 不得包含凭据、query 或 fragment")
+        raise ModelConfigError("baseUrl 不得包含凭据、query 或 fragment")
     return value
 
 
 def safe_url(value: str) -> str:
-    """Return a URL safe for diagnostics, even for a legacy unsafe value."""
     try:
         parsed = urlsplit(value)
         host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
         if parsed.port:
             host = f"{host}:{parsed.port}"
         return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
@@ -107,194 +100,136 @@ def safe_url(value: str) -> str:
         return "<redacted-url>"
 
 
-def endpoint(
-    provider: str,
-    base_url: str,
-    model: str,
-    credential_env: str | None,
-    protocol: str | None = None,
-    *,
-    label: str = "",
-) -> ModelEndpoint:
-    """Build a validated endpoint with an explicit wire ``protocol``.
-
-    ``protocol`` is one of ``ollama | openai | anthropic`` and must agree with
-    ``provider`` (``ollama | api | anthropic``).  When omitted it is inferred
-    from ``provider``, keeping v1 files (which carry no ``protocol``) readable
-    without migration.  ``label`` prefixes error messages so field-level
-    diagnostics can point at LLM vs Embedding.
-    """
-
-    prefix = f"{label} " if label else ""
-    provider = (provider or "").strip().lower()
-    if provider not in PROVIDERS:
-        raise ModelConfigError(
-            f"{prefix}provider 不支持: {provider!r}（可用 ollama / api / anthropic）"
-        )
-    if protocol is not None:
-        protocol = str(protocol).strip().lower()
-        if protocol not in PROTOCOLS:
-            raise ModelConfigError(
-                f"{prefix}protocol 不支持: {protocol!r}（可用 ollama / openai / anthropic）"
-            )
-        if protocol != _PROTOCOL_BY_PROVIDER[provider]:
-            raise ModelConfigError(
-                f"{prefix}protocol {protocol!r} 与 provider {provider!r} 不一致"
-            )
-    resolved_protocol = _PROTOCOL_BY_PROVIDER[provider]
-    model = (model or "").strip()
-    if not model:
-        raise ModelConfigError(f"{prefix}model 不能为空")
-    env_name = (credential_env or "").strip() or None
-    if provider == "ollama":
-        # 本地端点不持久化凭据：留空或任意输入都视为无凭据。
-        env_name = None
-    elif env_name is not None and not ENV_NAME_RE.fullmatch(env_name):
-        raise ModelConfigError(
-            f"{prefix}credential env-name {env_name!r} 不是合法环境变量名"
-            f"（需匹配 {ENV_NAME_RE.pattern}）"
-        )
-    return ModelEndpoint(provider, validate_url(base_url), model, env_name, resolved_protocol)
+def request_url(base_url: str, protocol: str, resource: str) -> str:
+    root = base_url.rstrip("/")
+    suffix = "api" if protocol == "ollama" else "v1"
+    if not root.endswith(f"/{suffix}"):
+        root = f"{root}/{suffix}"
+    return f"{root}/{resource}"
 
 
-def _provider_from_protocol(protocol: str | None) -> str | None:
-    """Map a CLI wire protocol (openai/anthropic/ollama) to a config provider."""
+def request_headers(protocol: str, secret: str) -> dict[str, str]:
+    if protocol == "anthropic":
+        headers = {"anthropic-version": "2023-06-01", "content-type": "application/json"}
+        if secret:
+            headers["x-api-key"] = secret
+        return headers
+    return {"Authorization": f"Bearer {secret}"} if secret else {}
 
-    if protocol is None:
-        return None
-    protocol = str(protocol).strip().lower()
-    for provider, mapped in _PROTOCOL_BY_PROVIDER.items():
-        if mapped == protocol:
-            return provider
-    return None
+
+def endpoint(protocol: str, base_url: str, secret: str, model: str, *, label="") -> ModelEndpoint:
+    for name, value in (("protocol", protocol), ("base_url", base_url), ("secret", secret), ("model", model)):
+        if not isinstance(value, str):
+            raise ModelConfigError(f"{label}.{name} 必须是字符串")
+    protocol = protocol.strip().lower()
+    if protocol not in PROTOCOLS:
+        raise ModelConfigError(f"{label}.protocol 必须是 openai / anthropic / ollama")
+    if not model.strip():
+        raise ModelConfigError(f"{label}.model 不能为空")
+    return ModelEndpoint(protocol, validate_url(base_url), "" if secret == "-" else secret.strip(), model.strip())
 
 
 def build(
-    *,
-    provider: str | None = None,
-    base_url: str | None = None,
-    llm_model: str | None = None,
-    embedding_model: str | None = None,
-    api_key_env: str | None = None,
-    llm_protocol: str | None = None,
-    llm_base_url: str | None = None,
-    llm_credential_env: str | None = None,
-    embedding_protocol: str | None = None,
-    embedding_base_url: str | None = None,
-    embedding_credential_env: str | None = None,
+    *, llm_protocol=None, llm_base_url=None, llm_secret=None, llm_model=None,
+    embedding_protocol=None, embedding_base_url=None, embedding_secret=None, embedding_model=None,
 ) -> ModelConfig:
-    """Build a dual-endpoint config from independent generation/embedding args.
-
-    ``provider`` / ``base_url`` / ``api_key_env`` remain the legacy shorthand
-    applied to both endpoints; any ``llm_*`` / ``embedding_*`` override takes
-    precedence.  Embedding base URL and credential default to the LLM values
-    (inheritance), matching the interactive onboarding contract.
-    """
-
-    gen_provider = _provider_from_protocol(llm_protocol) or provider or "ollama"
-    gen_url = llm_base_url or base_url or DEFAULT_OLLAMA_URL
-    gen_env = (
-        llm_credential_env
-        if llm_credential_env is not None
-        else api_key_env
+    generation = endpoint(
+        llm_protocol if llm_protocol is not None else "ollama",
+        llm_base_url if llm_base_url is not None else DEFAULT_OLLAMA_URL,
+        llm_secret if llm_secret is not None else "",
+        llm_model if llm_model is not None else DEFAULT_LLM_MODEL, label="LLM",
     )
-    emb_provider = (
-        _provider_from_protocol(embedding_protocol)
-        or provider
-        or gen_provider
+    embedding = endpoint(
+        embedding_protocol if embedding_protocol is not None else generation.protocol,
+        embedding_base_url if embedding_base_url is not None else generation.base_url,
+        embedding_secret if embedding_secret is not None else generation.secret,
+        embedding_model if embedding_model is not None else generation.model, label="Embedding",
     )
-    emb_url = embedding_base_url or llm_base_url or base_url or DEFAULT_OLLAMA_URL
-    emb_env = (
-        embedding_credential_env
-        if embedding_credential_env is not None
-        else (llm_credential_env or api_key_env)
-    )
-    return ModelConfig(
-        SCHEMA_VERSION,
-        endpoint(
-            gen_provider, gen_url, llm_model or DEFAULT_LLM_MODEL, gen_env,
-            protocol=llm_protocol, label="LLM",
-        ),
-        endpoint(
-            emb_provider, emb_url, embedding_model or DEFAULT_EMBED_MODEL, emb_env,
-            protocol=embedding_protocol, label="Embedding",
-        ),
-    )
+    if embedding.protocol == "anthropic":
+        raise ModelConfigError("Embedding 不支持 anthropic 协议，请选择 openai 或 ollama")
+    return ModelConfig(SCHEMA_VERSION, generation, embedding)
 
 
-def _decode_endpoint(raw: object, field: str) -> ModelEndpoint:
-    if not isinstance(raw, dict):
-        raise ModelConfigError(f"{field} 必须是 object")
-    allowed = {"provider", "base_url", "model", "credential_env", "protocol"}
-    if set(raw) - allowed:
-        raise ModelConfigError(f"{field} 含未知字段")
-    return endpoint(
-        str(raw.get("provider", "")), str(raw.get("base_url", "")),
-        str(raw.get("model", "")), raw.get("credential_env"),
-        protocol=raw.get("protocol"), label=field,
-    )
+def defaults() -> ModelConfig:
+    value = build(embedding_model=DEFAULT_EMBED_MODEL)
+    return ModelConfig(SCHEMA_VERSION, value.generation, value.embedding, source="defaults")
 
 
 def load(path: Path) -> ModelConfig:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ModelConfigError(f"无法读取 model config: {exc}") from exc
-    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA_VERSION:
-        raise ModelConfigError("不支持的 model config schema_version")
-    if set(raw) - {"schema_version", "generation", "embedding"}:
-        raise ModelConfigError("model config 含未知字段")
-    return ModelConfig(
-        SCHEMA_VERSION,
-        _decode_endpoint(raw.get("generation"), "generation"),
-        _decode_endpoint(raw.get("embedding"), "embedding"),
-    )
+    except (OSError, UnicodeError, ValueError):
+        raise ModelConfigError("无法读取模型配置文件，请检查路径与 JSON 格式") from None
+    if not isinstance(raw, dict) or set(raw) - {"schema_version", "generation", "embedding", "embedding_dimension"}:
+        raise ModelConfigError("模型配置必须包含 generation 和 embedding 两组四元组")
+    if raw.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION:
+        raise ModelConfigError(f"schema_version 必须是 {SCHEMA_VERSION}")
+    values = {}
+    for kind in ("generation", "embedding"):
+        item = raw.get(kind)
+        if not isinstance(item, dict) or set(item) - {"protocol", "base_url", "secret", "model"}:
+            raise ModelConfigError(f"{kind} 仅接受 protocol、base_url、secret、model")
+        inherited = values.get("generation", {})
+        values[kind] = {**inherited, **item}
+        if set(values[kind]) != {"protocol", "base_url", "secret", "model"}:
+            raise ModelConfigError(f"{kind} 需完整填写 protocol、base_url、secret、model")
+    generation = endpoint(**values["generation"], label="generation")
+    embedding = endpoint(**values["embedding"], label="embedding")
+    if embedding.protocol == "anthropic":
+        raise ModelConfigError("Embedding 不支持 anthropic 协议，请选择 openai 或 ollama")
+    dimension = raw.get("embedding_dimension")
+    if dimension is not None and (type(dimension) is not int or dimension < 1):
+        raise ModelConfigError("embedding_dimension 必须是正整数，或省略以自动检测")
+    return ModelConfig(SCHEMA_VERSION, generation, embedding, dimension)
 
 
-def legacy(environ: Mapping[str, str]) -> ModelConfig:
-    """Read-only compatibility: old env vars win only without profile config."""
-    ollama_url = environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_URL)
-    embed_model = environ.get("STORYBOOK_EMBED_MODEL", DEFAULT_EMBED_MODEL)
-    api_url = environ.get("ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic")
-    llm_model = environ.get(
-        "STORYBOOK_LLM_MODEL",
-        environ.get("ANTHROPIC_DEFAULT_HAIKU_MODEL", "deepseek-v4-flash"),
-    )
-    credential = (
-        "ANTHROPIC_AUTH_TOKEN"
-        if environ.get("ANTHROPIC_AUTH_TOKEN")
-        else "DEEPSEEK_KEY"
-    )
-    # deepseek_anthropic remains runtime-only and is never accepted in new files.
-    return ModelConfig(
-        SCHEMA_VERSION,
-        ModelEndpoint(
-            "deepseek_anthropic", safe_url(api_url).rstrip("/"), llm_model,
-            credential, protocol="anthropic",
-        ),
-        endpoint("ollama", ollama_url, embed_model, None),
-        source="legacy_env",
-    )
-
-
-def resolve(path: Path, environ: Mapping[str, str] | None = None) -> ModelConfig:
-    env = os.environ if environ is None else environ
-    return load(path) if path.is_file() else legacy(env)
+def resolve(path: Path) -> ModelConfig:
+    return load(path) if path.is_file() else defaults()
 
 
 def save(path: Path, value: ModelConfig) -> None:
-    """Atomically persist a secret-free config with private permissions."""
+    # Serving indexes retain their own credential snapshot when a target tuple
+    # is edited for a rebuild. Users only edit model-config.json.
+    secrets = {item.credential_ref: item.secret for item in (value.generation, value.embedding) if item.secret}
+    if secrets:
+        _save_json(path.with_name("model-secrets.json"), {**_read_secrets(path), **secrets})
+    _save_json(path, value.persisted_dict())
+
+
+def _read_secrets(config_path: Path) -> dict[str, str]:
+    path = config_path.with_name("model-secrets.json")
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in raw.items()):
+            raise ValueError
+        return raw
+    except (OSError, ValueError):
+        raise ModelConfigError("无法读取索引凭据快照") from None
+
+
+def credential_value(reference: str, *, path: Path) -> str | None:
+    if not reference:
+        return None
+    if path.is_file():
+        value = load(path)
+        for item in (value.generation, value.embedding):
+            if item.credential_ref == reference:
+                return item.secret
+    return _read_secrets(path).get(reference)
+
+
+def _save_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value.persisted_dict(), handle, ensure_ascii=False, indent=2)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-        if os.name != "nt":
-            path.chmod(0o600)
     finally:
         tmp.unlink(missing_ok=True)

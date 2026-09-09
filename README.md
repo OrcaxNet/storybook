@@ -61,7 +61,7 @@ curl -fsSLO https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh
 less install.sh
 sh install.sh
 
-# 2. Pick Profile / model provider / agent adapter
+# 2. Pick Profile / model endpoint tuples / agent adapter
 book init
 
 # 3. Run the dream cycle, then search your memory
@@ -104,7 +104,7 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、Co
 
 检索时，Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。Auto 仅在 zero/low-confidence、复合、跨语言或强环境歧义时进入独立预算的 Query Transformation/HyDE 第二阶段；Deep 必须由调用方显式选择。每条结果返回来源路径与分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
 
-系统采用**混合 provider**：生成式 LLM 通过 DeepSeek Anthropic-compatible Messages API；embedding 顶层统一为 `type=api`，默认使用本地 Ollama 推荐 preset，也可改用 OpenAI-compatible API。Fast 查询不调用生成式 LLM。选择远程 embedding API 时，待向量化的 Story/query 文本会离开本机。
+模型统一按 **(协议类型, baseUrl, secret, model-id)** 配置，LLM 与 embedding 各自独立，可组合第三方 LLM 与本地 Ollama embedding。Fast 查询不调用生成式 LLM。选择远程 embedding API 时，待向量化的 Story/query 文本会离开本机。
 
 ## 特性 / Features
 
@@ -146,7 +146,7 @@ flowchart TB
     end
 
     subgraph AI["AI 服务 Providers"]
-        LLM["LLM 生成<br/>DeepSeek Anthropic-compatible"]
+        LLM["LLM 生成<br/>可配置协议端点"]
         EMB["Embedding 向量<br/>Ollama 本地 · OpenAI-compatible"]
     end
 
@@ -183,7 +183,7 @@ flowchart TB
 | **记忆图** | `graph.py` | 多类型边、有界扩散、环/hub/重复抑制、supersedes 替换 |
 | **检索** | `search.py` | Fast（vector + lexical + graph + rerank）/ Auto（门控变换）/ Deep（显式高预算），降级与诊断 |
 | **自适应** | `adaptive.py` | 模式解析、查询规划、门控、变换融合、本地 reranker 与熔断 |
-| **生成 LLM** | `llm.py` | DeepSeek Anthropic-compatible Messages API，强制命名 tool call + 本地类型校验 |
+| **生成 LLM** | `llm.py` | OpenAI / Anthropic / Ollama 协议，结构化响应 + 本地类型校验 |
 | **向量** | `embeddings.py` | 统一 embedding API（Ollama / OpenAI-compatible），维度校验与模型状态 |
 | **反馈** | `feedback.py` | `access_count` / `co_recall` 边权异步队列，单事务写回 |
 | **启动注入** | `prime.py` | 会话启动主动召回并生成 ≤2k token 简报，静默降级 |
@@ -260,7 +260,7 @@ flowchart TD
 
 Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。**Fast 不调用生成式 LLM**；`graph_enabled=false` 可关闭图扩散。`--scope project` 使用 ContextEnvelope 中隐私安全的 repo/workspace 身份做硬过滤，只返回当前项目来源记忆；`profile` 保持用户级全库召回。
 
-Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambiguous_ranking`、`long_compound_query`、`cross_language`、`environment_ambiguity` 等稳定原因决定是否调用一次 DeepSeek LLM，生成 rewrite、multi-query 或 HyDE 辅助表示。第二阶段有独立 deadline，超时后原 Fast 结果立即作为 fallback 返回。Deep 显式启用三种 transformation、更高 Graph 预算及 5s 总预算。
+Auto 先完整执行 Fast，再依据 `zero_results`、`low_confidence`、`ambiguous_ranking`、`long_compound_query`、`cross_language`、`environment_ambiguity` 等稳定原因决定是否调用一次配置的 LLM，生成 rewrite、multi-query 或 HyDE 辅助表示。第二阶段有独立 deadline，超时后原 Fast 结果立即作为 fallback 返回。Deep 显式启用三种 transformation、更高 Graph 预算及 5s 总预算。
 
 本地 reranker 只处理有界 top-N，具有独立超时、连续失败熔断与冷却恢复；故障时返回 fusion/graph 排名并标明 `reranker_timeout` / `reranker_unavailable` / `reranker_circuit_open`，不会伪装成"无记忆"。
 
@@ -290,52 +290,62 @@ flowchart LR
 ## 环境要求 / Requirements
 
 - **Python 3.11+**（推荐用 [uv](https://github.com/astral-sh/uv) 建 venv）
-- **DeepSeek API 凭据**：优先 `ANTHROPIC_AUTH_TOKEN`，兼容 `DEEPSEEK_KEY`；默认读取 `~/.chrc/dpsk.sh`
-- **Ollama（推荐）**：本地 preset 默认为 `http://localhost:11434` + `qwen3-embedding:0.6b` + 1024 维。旧 `OLLAMA_HOST` / `STORYBOOK_EMBED_MODEL` 会自动映射，无需重建现有索引
-- **自定义 API（可选）**：设置 `STORYBOOK_EMBED_ADAPTER=openai_compatible`、base URL、model、dimension；凭据只通过 `STORYBOOK_EMBED_API_KEY_ENV` 引用环境变量
+- **LLM 端点**：支持 OpenAI-compatible、Anthropic-compatible 和 Ollama 原生协议；通过 `book init` 配置地址、secret 和模型
+- **Ollama（推荐）**：本地 preset 默认为 `http://localhost:11434` + `qwen3-embedding:0.6b` + 1024 维。旧 模型地址和 model-id 在配置文件中填写
+- **Embedding 端点**：支持 OpenAI-compatible 和 Ollama 原生协议；在配置文件中填写 secret，本地无鉴权服务填空字符串
 
-### 模型 Provider onboarding
+### 模型配置：一份文件，两个四元组
 
-`book` 是 canonical 命令，`storybook` 在兼容期保留旧入口。新安装会在 active Profile 内写入版本化的
-`model-config.json`。**generation（LLM）与 embedding 是两个独立端点**，各自具备
-协议 `ollama | openai | anthropic`、base URL、model 与可选的 credential 环境变量名；
-文件只保存 credential 环境变量名，绝不保存密钥。base URL 提示会标注协议类型与 `/v1`
-说明（openai 兼容需含 `/v1`、anthropic 走 `/v1/messages`、ollama 原生无需 `/v1`），
-且不强制“全局 provider 单选”。本地/Ollama 端点的 secret 可留空，视为无凭据。
+模型配置的唯一入口是当前 Profile 的 `model-config.json`，LLM 与 Embedding 各自使用
+**(protocol, base_url, secret, model)** 四元组。模型地址、密钥和模型名不再从环境变量读取，
+也不需要选择 Ollama、API、DeepSeek 等厂商分类。
+
+先复制仓库的 [model-config.example.json](model-config.example.json)，填好 secret 后导入：
 
 ```bash
-# 本地 Ollama（双端点均 Ollama）：探测服务，按需拉取 generation/embedding 模型
-book init --llm-protocol ollama --llm-base-url http://localhost:11434 \
-  --llm-model qwen3:8b \
-  --embedding-protocol ollama --embedding-base-url http://localhost:11434 \
-  --embedding-model qwen3-embedding:0.6b
-
-# 混合场景：LLM=OpenAI-compatible（如 DeepSeek，/v1/chat/completions）+
-#            Embedding=本地 Ollama（/api/embeddings），端点完全独立
-export STORYBOOK_API_KEY='...'
-book init --llm-protocol openai --llm-base-url https://api.deepseek.com \
-  --llm-model deepseek-v4-flash --llm-api-key-env STORYBOOK_API_KEY \
-  --embedding-protocol ollama --embedding-base-url http://localhost:11434 \
-  --embedding-model bge-m3
-
-# Anthropic-compatible LLM（/v1/messages）
-export ANTHROPIC_AUTH_TOKEN='...'
-book init --llm-protocol anthropic --llm-base-url https://api.deepseek.com/anthropic \
-  --llm-model deepseek-v4-flash --llm-api-key-env ANTHROPIC_AUTH_TOKEN \
-  --embedding-protocol ollama --embedding-model qwen3-embedding:0.6b
+cp model-config.example.json model-config.json
+book init --config model-config.json
+book config --path    # 获取当前 Profile 的配置路径，之后可直接编辑
+book config           # 查看配置；secret 始终遮蔽
 ```
 
-交互式 `book init` 按「LLM baseUrl → model → secret」→「Embedding baseUrl（默认=LLM）→
-model → secret（默认=LLM）」顺序提示；embedding 取值可覆盖。非交互 flags 中，
-`--provider / --base-url / --api-key-env` 是“同时作用于两个端点”的旧 shorthand，
-`--llm-* / --embedding-*` 按端点独立覆盖。
+```json
+{
+  "schema_version": 2,
+  "generation": {
+    "protocol": "openai",
+    "base_url": "https://newapi.deepwisdom.ai",
+    "secret": "your-secret",
+    "model": "claude-fable-5"
+  },
+  "embedding": {
+    "protocol": "ollama",
+    "base_url": "http://localhost:11434",
+    "secret": "",
+    "model": "qwen3-embedding:0.6b"
+  }
+}
+```
 
-外部 embedding 必须返回当前 Profile 配置的 `STORYBOOK_EMBED_DIM` 维度，否则
-setup/doctor 会报告 dimension mismatch。base URL 中的 userinfo、query 和 fragment
-会被拒绝，doctor/status/JSON 输出不会包含 credential 值或 Authorization header。
-未生成 Profile 配置的旧安装继续按“Profile 配置 > 旧环境变量 > 默认值”的优先级
-只读解析 `ANTHROPIC_*`、`DEEPSEEK_KEY`、`OLLAMA_HOST` 与
-`STORYBOOK_EMBED_MODEL`，无需迁移现有数据。
+`generation` 填写完整四元组；`embedding` 省略的字段默认继承上一组，因此使用同一服务时
+只需写 `"embedding": {"model": "your-embedding-model"}`。`"secret": ""` 显式清空密钥。
+LLM 支持 `openai / anthropic / ollama`，Embedding 支持 `openai / ollama`。
+协议只决定请求格式，与服务厂商无关。
+
+也可以直接运行 `book init` 使用向导：依次填写协议、baseUrl、secret、model-id，
+第二组的四个默认值全部来自第一组；回车保留默认值，secret 输入 `-` 清空。
+已有配置时，第一组默认读取当前 LLM 四元组。向导隐藏 secret 输入并生成同样的配置文件。
+初始化写出的文件权限为 `0600`，CLI/MCP 等后续进程直接读取文件；计划、日志和 JSON 诊断不输出 secret。
+
+baseUrl 可以填写服务根地址或以 `/v1` 结尾的 API 地址，程序只拼接一次；
+Ollama 原生协议同样支持根地址或 `/api` 地址。
+[Ollama 提供 OpenAI-compatible 接口](https://docs.ollama.com/api/openai-compatibility)，
+因此本地 embedding 也可选择 `openai` + `http://localhost:11434/v1`，secret 留空。
+
+首次创建索引时自动检测 embedding 维度，并写入配置顶层的 `embedding_dimension`。
+已有索引继续校验维度和模型空间，避免混入不兼容向量。
+`book init --config model-config.json --dry-run --json` 可检查配置计划，且不写文件、不调用模型。
+需要自动化时追加 `--yes`；模型字段 flags 也遵循相同继承规则，但不能与 `--config` 同用。
 
 已有 Profile 的 active 向量索引会持久化 provider、base URL、model 与 version
 身份。setup 若检测到目标 embedding space 不兼容，会在任何写入和网络探测前以
@@ -367,11 +377,8 @@ book status
 book search "what should I remember about this task?"
 ```
 
-非交互环境可使用 `book init --agent codex --yes --json` 配合双端点模型 flags
-（`--llm-protocol/--llm-base-url/--llm-api-key-env` 与
-`--embedding-protocol/--embedding-base-url/--embedding-api-key-env`，旧
-`--provider/--base-url/--api-key-env` 仍可同时作用于两个端点）；API 密钥只从
-指定的凭据环境变量读取，Profile 只保存变量名。
+非交互环境可使用 `book init --config model-config.json --agent codex --yes --json`。
+后续模型调用读取当前 Profile 的配置文件，不依赖 shell 环境或额外导出的 API key。
 `book setup` 是一个 minor release 内的隐藏兼容 alias。旧 `storybook init` 继续只做
 数据库初始化，低层 canonical 入口为 `book admin init-db`。
 
@@ -471,12 +478,8 @@ book init --json                        # 结构化结果，便于自动化
 book init --agent codex --yes           # 可重复 --agent，覆盖自动检测
 book init --enable-schedule --yes       # 生成用户级 watch service（无需 sudo）
 book init --skip-models --yes           # 离线跳过缺失模型，状态为 degraded
-book init --yes --embedding-preset ollama
-book init --yes --embedding-preset custom \
-  --embedding-base-url https://embedding.example/v1 \
-  --embedding-model your-model --embedding-dimension 1024 \
-  --embedding-version your-model-v1 \
-  --embedding-api-key-env PRIVATE_EMBED_API_KEY
+book init --yes --llm-protocol ollama --llm-base-url http://localhost:11434 \
+  --llm-model qwen3:8b --embedding-model qwen3-embedding:0.6b
 
 book admin uninstall                    # 恢复 setup 写入的节点，默认保留全部记忆
 book admin uninstall --dry-run
@@ -489,9 +492,9 @@ book admin uninstall --yes --purge-data --confirm-purge  # 非交互双重显式
 和设置；若节点在安装后被人工修改，会报告 drift 并保留恢复状态，避免覆盖用户改动。
 旧项目级 `data/memory.db` 只会在计划/结果中提示，不会由 setup 擅自迁移或删除。
 
-`--embedding-preset ollama` 自动填入本地地址、推荐模型、1024 维和 Ollama adapter。`custom` 需显式提供 base URL、model 和 dimension；只持久符合 `[A-Za-z_][A-Za-z0-9_]*` 的凭据环境变量名，疑似明文凭据会在任何写入前被拒绝。选择会保存在用户级 setup state，之后的 CLI/MCP 进程自动复用，而显式环境变量仍优先。非 loopback endpoint 始终显示“文本将离开本机”警告。
 
-Serving index 的身份包含 endpoint、adapter、model、version、dimension 和非敏感的 credential-env 引用。修改任一项会进入 `serving_index_mismatch`；默认查询继续使用旧 index 对应的 API 与凭据引用，直到 `embedding-backfill` 完成 shadow generation 并原子切换，避免将不同向量空间混入同一索引。旧版 schema 只支持 Ollama，因此升级时会按既有 `OLLAMA_HOST`/默认地址映射 active identity，不改写 Story 或向量索引；custom API identity 不会被猜测。
+
+Serving index 的身份包含 endpoint、adapter、model、version、dimension 和非敏感的凭据快照引用。修改任一项会进入 `serving_index_mismatch`；默认查询继续使用旧 index 对应的 API 与凭据快照，直到 `embedding-backfill` 完成 shadow generation 并原子切换，避免将不同向量空间混入同一索引。旧版 schema 只支持 Ollama，因此升级时会按既有 `OLLAMA_HOST`/默认地址映射 active identity，不改写 Story 或向量索引；custom API identity 不会被猜测。
 
 ## 用户级 Profile 与共享存储 / Profiles
 
@@ -932,7 +935,7 @@ claude mcp add storybook -- /绝对路径/storybook/.venv/bin/book mcp
 
 ### 说明
 
-- server、CLI、Claude/Cursor collector 和 Codex 等 MCP 客户端都经 Profile registry 共享同一数据目录（`.env` 自动加载、`OLLAMA_HOST` 等环境变量同样生效）。
+- server、CLI、Claude/Cursor collector 和 Codex 等 MCP 客户端都经 Profile registry 共享同一数据目录（模型统一读取当前 Profile 的配置文件）。
 - `recall` 复用 CLI `search` 的全部语义；命中记忆的 `access_count` 自增、共同召回边权提权会进入后台反馈队列，不阻塞查询响应。
 - `recall` 优先使用配置的 embedding API 生成查询向量；API 不可用或超时时返回显式 degraded 状态和 FTS/关键词可用结果，不抛出伪装成“无匹配”的环境错误。`get_story` / `stats` 不依赖 embedding API。
 - `prime_context` 同样复用 `search` 的召回与副作用（每次晨间简报即一次"回忆"，会自增 `access_count` / 提权边）；但它**静默不抛错**——embedding API 不可用时返回 `injected=false` + `note`（非异常），因为晨间简报须非侵入。详见下文。
@@ -1020,25 +1023,12 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 
 ## 配置 / Configuration
 
-所有路径、模型名、阈值都集中在 `src/storybook/config.py`。环境变量样例见 `.env.example`。生成式 LLM 配置按“进程环境变量 > `STORYBOOK_LLM_ENV_FILE` > 项目 `.env` > 默认值”解析；文件只读取简单 `export KEY=value`/`KEY=value` 文本，绝不 `source` 或执行。未指定文件时默认发现 `~/.chrc/dpsk.sh`，不存在则静默跳过，适用于 launchd 等无 shell 环境。
+模型四元组保存在当前 Profile 的 `model-config.json`；运行 `book config --path` 查看路径。运行目录、缓存、检索算法等参数由 `src/storybook/config.py` 管理，环境变量样例见 `.env.example`。
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `STORYBOOK_PROFILE` | registry 当前项 | 仅当前进程选择 Profile（UUID 或显示名），不改 registry |
 | `STORYBOOK_HOME` | 平台用户目录 | 显式收拢/隔离 registry、数据、缓存与日志 |
-| `STORYBOOK_EMBED_PRESET` | `ollama` | embedding 预设；Ollama 是推荐的本地 preset |
-| `STORYBOOK_EMBED_ADAPTER` | `ollama` | 内部请求协议：`ollama` / `openai_compatible` |
-| `STORYBOOK_EMBED_BASE_URL` | `OLLAMA_HOST` 或 `http://localhost:11434` | embedding API base URL |
-| `OLLAMA_HOST` | `http://localhost:11434` | 旧配置兼容别名；映射为 API base URL |
-| `STORYBOOK_EMBED_API_KEY_ENV` | 无 | 凭据所在的环境变量名；密钥不持久化/输出 |
-| `STORYBOOK_LLM_ENV_FILE` | `~/.chrc/dpsk.sh` | DeepSeek shell-env 配置文件（纯文本解析） |
-| `ANTHROPIC_BASE_URL` | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic-compatible Base URL |
-| `ANTHROPIC_AUTH_TOKEN` / `DEEPSEEK_KEY` | 无 | API key 与兼容回退变量；不会写入日志/status |
-| `STORYBOOK_LLM_MODEL` | `deepseek-v4-flash` | 生成模型；其次读取 `ANTHROPIC_DEFAULT_HAIKU_MODEL` |
-| `STORYBOOK_EMBED_MODEL` | `qwen3-embedding:0.6b` | embedding 模型；输出维度必须与 `STORYBOOK_EMBED_DIM` 一致 |
-| `STORYBOOK_EMBED_DIM` | `1024` | API 响应必须匹配的向量维度 |
-| `STORYBOOK_EMBED_VERSION` | `story-v2-default-v1` | 活跃表示的不可变版本标识 |
-| `STORYBOOK_EMBED_REPRESENTATION` | `default` | 默认 `title + abstract + applicability` |
 | `STORYBOOK_INFERENCE_CACHE_ENABLED` | `1` | Profile 私有 LLM/embedding 输入哈希缓存；`0` 禁用 |
 | `STORYBOOK_PROCESS_WORKERS` | `4` | 批量加工并行推理准备线程数；SQLite 持久化仍顺序执行 |
 | `STORYBOOK_ABSTRACT_MAX_CHARS` | `600` | abstract 预算；不影响 detail/source 持久化 |
@@ -1056,7 +1046,6 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `STORYBOOK_GRAPH_MAX_HOPS` / `MAX_PATHS` / `FAN_OUT` | `2` / `64` / `8` | 图扩散结构预算 |
 | `STORYBOOK_GRAPH_TIME_BUDGET_MS` | `100` | 图扩散墙钟预算，用尽时返回 `truncated=true` |
 | `STORYBOOK_GRAPH_TOKEN_BUDGET` | `1600` | 图扩散候选摘要与路径预算 |
-| `STORYBOOK_LLM_THINK` | `0` | DeepSeek thinking：`0`=关，`1`=显式开启 |
 | `STORYBOOK_DREAM_INTERVAL` | `14400` | `dream` 守护进程 / launchd 定时间隔（秒），默认 4 小时 |
 | `STORYBOOK_WATCH_POLL_INTERVAL` | `60` | `process --watch` 轮询已启用 Agent history 来源的间隔（秒） |
 
@@ -1077,7 +1066,7 @@ prime_context(cwd="/path/to/project", first_prompt="用户的首条提问", top_
 | `PRIME_TOKEN_BUDGET` | 2000 | 晨间简报 token 预算上限（≤2k，避免污染上下文） |
 | `PRIME_CONTENT_EXCERPT_CHARS` | 140 | 晨间简报中每条 Story 摘要最大字符数 |
 
-记忆形成 LLM 使用 temp 0.3、调用方既有 `max_tokens` 上限与 120s 超时；`extract_keywords`、Story v2 formation、`summarize_session`、`merge_stories`、`judge_split`、`split_story` 与 query transformation 均通过 DeepSeek Anthropic-compatible 的强制命名 tool call + `input_schema` 返回结构化对象，并在本地再次校验类型。旧网关的 JSON 文本仍可兼容解析；401/402/429/5xx、超时、schema 不匹配或空内容均保持原有业务 fallback。
+记忆形成 LLM 使用 temp 0.3、调用方既有 `max_tokens` 上限与 120s 超时；`extract_keywords`、Story v2 formation、`summarize_session`、`merge_stories`、`judge_split`、`split_story` 与 query transformation 均通过配置的协议返回结构化对象（OpenAI JSON Schema、Anthropic tool call 或 Ollama format），并在本地再次校验类型。旧网关的 JSON 文本仍可兼容解析；401/402/429/5xx、超时、schema 不匹配或空内容均保持原有业务 fallback。
 
 ## 项目结构 / Project Structure
 
@@ -1092,7 +1081,7 @@ storybook/
 │   ├── history_adapters/  # 各 Agent 历史格式适配器（Claude/Cursor/Codex/Gemini/Cline）
 │   ├── store.py        # SQLite + sqlite-vec 存储层
 │   ├── processor.py    # 做梦周期（dream cycle）
-│   ├── llm.py          # DeepSeek Anthropic-compatible Messages API
+│   ├── llm.py          # OpenAI / Anthropic / Ollama 协议
 │   ├── embeddings.py   # 统一 embedding API 与 Ollama/OpenAI-compatible adapter
 │   ├── search.py       # 版本化缓存 + 向量/词法降级 + 关联激活
 │   ├── adaptive.py     # Fast/Auto/Deep 模式、门控、变换融合、本地 reranker

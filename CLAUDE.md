@@ -4,16 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-An offline "coding memory" system (project name: **Storybook**) that ingests AI-coding session logs (Claude Code session logs, JSON files, or a built-in simulator), then runs a **"dream cycle"** that consolidates each session into a structured memory unit (a *Story*) and links Stories into a weighted association graph. Retrieval is vector-similarity plus edge-graph activation. All LLM/embedding work runs through a **local Ollama** instance — the system is fully offline.
+An offline "coding memory" system (project name: **Storybook**) that ingests AI-coding session logs (Claude Code session logs, JSON files, or a built-in simulator), then runs a **"dream cycle"** that consolidates each session into a structured memory unit (a *Story*) and links Stories into a weighted association graph. Retrieval is vector-similarity plus edge-graph activation. LLM and embedding each use a protocol/base_url/secret/model tuple in the active Profile model-config.json. They may use independent local or remote endpoints; environment variables do not configure models.
 
 Source comments, docstrings, and LLM prompts are bilingual Chinese/English.
 
 ## Environment & running
 
 - Python **3.11+** (venv at `.venv/`). Dependencies: `click`, `requests`, `numpy`, `sqlite-vec`, `mcp`.
-- **Ollama must be running** at `http://localhost:11434` (override with `OLLAMA_HOST`) with two models pulled:
-  - LLM: `qwythos-hermes:latest` (override `STORYBOOK_LLM_MODEL`)
-  - Embedding: `qwen3-embedding:0.6b`, **1024-dim** (override `STORYBOOK_EMBED_MODEL`). `EMBED_DIM` in config must match.
+- Configure models with `book init --config model-config.json` or the interactive `book init` wizard. See `model-config.example.json`.
+- `book config --path` prints the active file path; `book config` redacts secrets. Generation supports OpenAI, Anthropic Messages and Ollama protocols; embedding supports OpenAI and Ollama. Missing embedding fields inherit generation values, and empty secret clears inheritance. Fresh indexes discover dimension automatically.
 - `config.py` auto-loads a project-root `.env` at import (no error if absent; copy `.env.example`). Pre-existing env vars / command-line `VAR=val` take priority over `.env` (`.env` never overwrites them).
 - The venv has no `pip` (created with `uv`). Install editable to get the `book` command (and `storybook` compat alias): `VIRTUAL_ENV=$(pwd)/.venv uv pip install -e .` (re-run if the project dir moves and the `book` shebang goes stale). Without installing, run via `PYTHONPATH=src .venv/bin/python -m storybook.cli <command>`.
 
@@ -101,7 +100,7 @@ source Sessions, never a last-write-wins field.
 - Paths: `DB_PATH`/`INDEX_DIR`/`CACHE_DIR`/`LOG_DIR` resolve from the active user Profile; `PERFORMANCE_LOG_PATH` follows that Profile's `LOG_DIR`; `CLAUDE_PROJECTS_PATH` (`~/.claude/projects`, primary source), `CURSOR_STORAGE_PATH` (backup).
 - Thresholds/budgets: `SIM_THRESHOLD_HIGH` (0.85), `SIM_THRESHOLD_UPDATE_ONLY` (0.92), `SIM_THRESHOLD_LOW` (0.75), `SIM_THRESHOLD_SEARCH` (0.50), `TOP_K_RETRIEVAL` (5), `TOP_K_SEARCH` (3), `STORY_ABSTRACT_MAX_CHARS` (600), plus Graph RAG hop/path/fan-out/time/token budgets in `GRAPH_*`.
 - Weight rules: `WEIGHT_INCREMENT` (0.1), `WEIGHT_MAX` (1.0), `WEIGHT_PARENT_CHILD` (1.0).
-- LLM call options (temp 0.3, `num_ctx` 8192, 120s timeout) are hardcoded in `llm._chat`/`_generate`, except `think` which follows `config.LLM_THINK` (`STORYBOOK_LLM_THINK` env, default **off**). `qwythos-hermes` is Qwen3-arch with a thinking mode that makes extraction calls ~9× slower; thinking is unnecessary for keyword/summary/split tasks, so it's off by default. Set `STORYBOOK_LLM_THINK=1` only if retrieval accuracy drops.
+- LLM call options (temp 0.3, `num_ctx` 8192, 120s timeout) are hardcoded in `llm._chat`/`_generate`, except `think` which follows `config.LLM_THINK` (default **off**). `qwythos-hermes` is Qwen3-arch with a thinking mode that makes extraction calls ~9× slower; thinking is unnecessary for keyword/summary/split tasks, so it's off by default.
 
 ## Notes
 

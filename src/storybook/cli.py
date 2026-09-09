@@ -132,7 +132,7 @@ def cli(ctx, verbose):
     """🧠 Storybook - 离线 Coding 记忆系统
 
     \b
-    高频任务:  init / doctor / run / search / status / version / mcp
+    高频任务:  init / config / doctor / run / search / status / version / mcp
     分组:       memory / source / profile / admin
     """
     setup_logging(verbose)
@@ -214,11 +214,15 @@ def _print_setup_plan(plan: dict) -> None:
         for target in adapter["targets"]:
             click.echo(f"            {target}")
     embedding = plan["embedding"]
-    label = "Ollama (recommended)" if embedding["preset"] == "ollama" else "Custom API"
-    click.echo(
-        f"  Embedding API: {label}; adapter={embedding['adapter']}; "
-        f"model={embedding['model']}; dimension={embedding['dimension']}"
-    )
+    for kind, item in plan.get("model_config", {}).items():
+        if kind not in {"generation", "embedding"}:
+            continue
+        secret_status = item["credential_status"]
+        click.echo(
+            f"  {kind}: ({item['protocol']}, {item['base_url']}, "
+            f"secret={secret_status}, {item['model']})"
+        )
+    click.echo(f"  Embedding dimension: {embedding['dimension']}")
     if embedding["remote_text_disclosure"]:
         click.echo("            Warning: embedding text is sent to the configured endpoint")
     click.echo(f"  Models    {', '.join(plan['models'])}")
@@ -229,320 +233,123 @@ def _print_setup_plan(plan: dict) -> None:
         click.echo("            run: book admin migration run <path> --dry-run")
 
 
+def _model_options(command):
+    options = [
+        click.option("--config", "model_config_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+                     help="从 JSON 配置文件导入模型四元组"),
+        click.option("--llm-protocol", type=click.Choice(model_config.PROTOCOLS), help="LLM 协议类型"),
+        click.option("--llm-base-url", help="LLM baseUrl（根地址或 /v1、/api 地址）"),
+        click.option("--llm-secret", help="LLM secret；建议使用配置文件或向导隐藏输入"),
+        click.option("--llm-model", "--llm-model-id", help="LLM model-id"),
+        click.option("--embedding-protocol", type=click.Choice(["openai", "ollama"]), help="Embedding 协议，默认继承 LLM"),
+        click.option("--embedding-base-url", help="Embedding baseUrl，默认继承 LLM"),
+        click.option("--embedding-secret", help="Embedding secret，默认继承；空值或 - 清空"),
+        click.option("--embedding-model", "--embedding-model-id", help="Embedding model-id，默认继承 LLM"),
+    ]
+    for option in reversed(options):
+        command = option(command)
+    return command
+
+
 @cli.command(name="setup", hidden=True)
-@click.option("--yes", "assume_yes", is_flag=True, help="接受计划并非交互执行")
-@click.option("--dry-run", is_flag=True, help="只输出计划；零文件、数据库和网络写入")
-@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
-@click.option(
-    "--agent",
-    "agents",
-    multiple=True,
-    type=click.Choice(["claude", "cursor", "codex"]),
-    help="只配置指定 Agent；可重复。默认自动检测",
-)
-@click.option(
-    "--embedding-preset",
-    type=click.Choice(["ollama", "custom"]),
-    help="选择 Ollama（推荐）或自定义 OpenAI-compatible API",
-)
-@click.option("--embedding-base-url", help="embedding API base URL")
-@click.option("--embedding-model", help="embedding 模型名")
-@click.option("--embedding-dimension", type=click.IntRange(min=1), help="向量维度")
-@click.option("--embedding-version", help="不可变 embedding 版本；切换模型/维度时应使用新值")
-@click.option(
-    "--embedding-api-key-env",
-    help="凭据所在的环境变量名（不接受明文凭据）",
-)
-@click.option(
-    "--provider",
-    type=click.Choice(["ollama", "api", "anthropic"]),
-    help="模型 provider（旧 shorthand，同时作用于 generation 与 embedding 两个端点）",
-)
-@click.option("--base-url", help="provider 根 URL（旧 shorthand，同时作用于两个端点）")
-@click.option("--llm-model", help="generation 模型名")
-@click.option("--api-key-env", help="API key 环境变量名（旧 shorthand，同时作用于两个端点）")
-@click.option(
-    "--llm-protocol",
-    type=click.Choice(["ollama", "openai", "anthropic"]),
-    help="generation 端点协议（openai=OpenAI 兼容需 /v1；anthropic 走 /v1/messages）",
-)
-@click.option("--llm-base-url", help="generation 端点 base URL")
-@click.option("--llm-api-key-env", help="generation 端点凭据环境变量名")
-@click.option(
-    "--embedding-protocol",
-    type=click.Choice(["ollama", "openai", "anthropic"]),
-    help="embedding 端点协议（默认 ollama）",
-)
-@click.option("--enable-schedule", is_flag=True, help="配置用户级 watch schedule")
-@click.option("--skip-models", "--skip-download", is_flag=True,
-              help="不下载缺失 Ollama 模型并进入 degraded")
-def setup_command(
-    assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
-    embedding_model, api_key_env, embedding_preset, embedding_base_url,
-    embedding_dimension, embedding_version, embedding_api_key_env,
-    llm_protocol, llm_base_url, llm_api_key_env, embedding_protocol,
-    enable_schedule, skip_models,
-):
-    """兼容 alias；canonical onboarding 命令为 ``book init``。"""
+@click.option("--yes", "assume_yes", is_flag=True)
+@click.option("--dry-run", is_flag=True)
+@click.option("--json", "as_json", is_flag=True)
+@click.option("--agent", "agents", multiple=True, type=click.Choice(["claude", "cursor", "codex"]))
+@_model_options
+@click.option("--enable-schedule", is_flag=True)
+@click.option("--skip-models", "--skip-download", is_flag=True)
+def setup_command(**options):
+    """模型与 Agent 初始化。"""
     _legacy_alias_hint("init")
-
-    return _run_onboarding(
-        assume_yes=assume_yes,
-        dry_run=dry_run,
-        as_json=as_json,
-        agents=agents,
-        provider=provider,
-        base_url=base_url,
-        llm_model=llm_model,
-        embedding_model=embedding_model,
-        api_key_env=api_key_env,
-        embedding_preset=embedding_preset,
-        embedding_base_url=embedding_base_url,
-        embedding_dimension=embedding_dimension,
-        embedding_version=embedding_version,
-        embedding_api_key_env=embedding_api_key_env,
-        llm_protocol=llm_protocol,
-        llm_base_url=llm_base_url,
-        llm_api_key_env=llm_api_key_env,
-        embedding_protocol=embedding_protocol,
-        enable_schedule=enable_schedule,
-        skip_models=skip_models,
-        full_onboarding=False,
-    )
+    return _run_onboarding(**options, full_onboarding=False)
 
 
-def _base_url_hint(protocol: str, *, kind: str) -> str:
-    """协议标注 + /v1 说明的 baseUrl 提示文案（AC3）。"""
-
-    if protocol == "ollama":
-        return f"{kind} base URL（ollama 原生 http://host:11434，无需 /v1）"
-    if protocol == "anthropic":
-        return (
-            f"{kind} base URL（anthropic：Anthropic-compatible 走 /v1/messages，"
-            "如 https://api.deepseek.com/anthropic）"
-        )
-    return (
-        f"{kind} base URL（openai：OpenAI-compatible 需含 /v1，"
-        "如 http://localhost:11434/v1）"
-    )
-
-
-def _prompt_model_endpoints(
-    *, llm_protocol, llm_base_url, llm_model, llm_api_key_env,
-    embedding_protocol, embedding_base_url, embedding_model, embedding_api_key_env,
-    provider: str | None = None,
-) -> tuple:
-    """双端点交互提示：LLM → Embedding，embedding baseUrl/secret 默认继承 LLM。
-
-    只对仍未给定的字段提示；已由 flags 提供的字段跳过。secret 留空视为无凭据
-    （本地/Ollama 端点不会因空 secret 报错，AC2）。
-    """
-
-    # 旧 shorthand `--provider` 提供协议默认值：api→openai、anthropic→anthropic。
-    default_llm_protocol = {
-        "api": "openai", "anthropic": "anthropic", "ollama": "ollama",
-    }.get(provider or "", "openai")
-    if llm_protocol is None:
-        llm_protocol = click.prompt(
-            "LLM protocol (openai, anthropic, ollama)",
-            type=click.Choice(["openai", "anthropic", "ollama"]),
-            default=default_llm_protocol,
-        )
-    if llm_base_url is None:
-        llm_base_url = click.prompt(
-            _base_url_hint(llm_protocol, kind="LLM"),
-            default=(
-                None if llm_protocol != "ollama" else model_config.DEFAULT_OLLAMA_URL
-            ),
-        )
-    if llm_model is None:
-        llm_model = click.prompt(
-            "LLM model",
-            default=(
-                None if llm_protocol != "ollama" else model_config.DEFAULT_LLM_MODEL
-            ),
-        )
-    if llm_api_key_env is None:
-        llm_api_key_env = click.prompt(
-            "LLM secret env-name (留空表示无凭据，如本地 Ollama)",
-            default="",
-        ).strip() or None
-    if embedding_protocol is None:
-        embedding_protocol = click.prompt(
-            "Embedding protocol (openai, anthropic, ollama)",
-            type=click.Choice(["openai", "anthropic", "ollama"]),
-            default=llm_protocol,
-        )
-    if embedding_base_url is None:
-        embedding_base_url = click.prompt(
-            _base_url_hint(embedding_protocol, kind="Embedding"),
-            default=llm_base_url,
-        )
-    if embedding_model is None:
-        embedding_model = click.prompt(
-            "Embedding model",
-            default=(
-                None
-                if embedding_protocol != "ollama"
-                else model_config.DEFAULT_EMBED_MODEL
-            ),
-        )
-    if embedding_api_key_env is None:
-        embedding_api_key_env = click.prompt(
-            "Embedding secret env-name (默认同 LLM secret，留空表示无凭据)",
-            default=llm_api_key_env or "",
-        ).strip() or None
-    return (
-        llm_protocol, llm_base_url, llm_model, llm_api_key_env,
-        embedding_protocol, embedding_base_url, embedding_model,
-        embedding_api_key_env,
-    )
+def _prompt_model_endpoints(**options) -> model_config.ModelConfig:
+    current = config.MODEL_CONFIG.generation if config.MODEL_CONFIG.source == "profile" else None
+    click.echo("模型配置：(协议类型, baseUrl, secret, model-id)。下一组回车继承，secret 输入 - 清空。")
+    endpoints = []
+    for role, label in (("llm", "LLM"), ("embedding", "Embedding")):
+        previous = endpoints[-1] if endpoints else current
+        default_protocol = previous.protocol if previous else "openai"
+        choices = model_config.PROTOCOLS if role == "llm" else ("openai", "ollama")
+        if default_protocol not in choices:
+            click.echo("Anthropic 协议没有 embedding 接口，请选择 Embedding 支持的协议。")
+            default_protocol = "openai"
+        protocol = options.get(f"{role}_protocol")
+        if protocol is None:
+            protocol = click.prompt(f"{label} protocol", type=click.Choice(choices), default=default_protocol)
+        base_url = options.get(f"{role}_base_url")
+        if base_url is None:
+            default_url = previous.base_url if previous else (
+                model_config.DEFAULT_OLLAMA_URL if protocol == "ollama" else None
+            )
+            while True:
+                base_url = click.prompt(f"{label} baseUrl", default=default_url)
+                try:
+                    base_url = model_config.validate_url(base_url)
+                    break
+                except model_config.ModelConfigError as exc:
+                    click.echo(str(exc), err=True)
+        secret = options.get(f"{role}_secret")
+        if secret is None:
+            answer = click.prompt(
+                f"{label} secret（回车继承或留空，- 清空）", default="",
+                show_default=False, hide_input=True,
+            )
+            secret = answer if answer else (previous.secret if previous else "")
+        model = options.get(f"{role}_model")
+        if model is None:
+            model = click.prompt(
+                f"{label} model-id", default=previous.model if previous else (
+                    model_config.DEFAULT_LLM_MODEL if protocol == "ollama" else None
+                ),
+            )
+        endpoints.append(model_config.endpoint(protocol, base_url, secret, model, label=label))
+    return model_config.ModelConfig(model_config.SCHEMA_VERSION, *endpoints)
 
 
 def _run_onboarding(
-    *, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
-    embedding_model, api_key_env, embedding_preset, embedding_base_url,
-    embedding_dimension, embedding_version, embedding_api_key_env,
-    llm_protocol, llm_base_url, llm_api_key_env, embedding_protocol,
-    enable_schedule, skip_models, full_onboarding,
+    *, assume_yes=False, dry_run=False, as_json=False, agents=(),
+    enable_schedule=False, skip_models=False, full_onboarding=True,
+    model_config_file=None, llm_protocol=None, llm_base_url=None, llm_secret=None,
+    llm_model=None, embedding_protocol=None, embedding_base_url=None,
+    embedding_secret=None, embedding_model=None,
 ):
-    """Shared, rerunnable implementation for ``book init`` and setup alias."""
-
-    # 双端点模型配置面（model-config）与 embedding-preset 配置面（setup-state）
-    # 是替代接口：LLM/共享 shorthand flags 只能用于 model-config 面。
-    if embedding_preset and any(
-        value is not None
-        for value in (
-            provider, base_url, llm_model, api_key_env, llm_protocol,
-            llm_base_url, llm_api_key_env, embedding_protocol,
-        )
-    ):
-        raise click.UsageError(
-            "--embedding-preset 与 LLM/共享模型端点 flags 是替代的配置面，不能同用"
-        )
-    if not embedding_preset and any(
-        value is not None for value in (embedding_dimension, embedding_version)
-    ):
-        raise click.UsageError(
-            "embedding dimension/version 选项需与 --embedding-preset 同用"
-        )
-    if embedding_preset:
-        try:
-            config.apply_embedding_config(
-                preset=embedding_preset,
-                base_url=embedding_base_url,
-                model=embedding_model,
-                dimension=embedding_dimension,
-                version=embedding_version,
-                api_key_env=embedding_api_key_env,
-            )
-        except ValueError as exc:
-            raise click.UsageError(str(exc)) from exc
-
+    """Configure one file, validate endpoints, then initialize the Profile."""
+    options = {
+        "llm_protocol": llm_protocol, "llm_base_url": llm_base_url,
+        "llm_secret": llm_secret, "llm_model": llm_model,
+        "embedding_protocol": embedding_protocol, "embedding_base_url": embedding_base_url,
+        "embedding_secret": embedding_secret, "embedding_model": embedding_model,
+    }
+    if model_config_file and any(value is not None for value in options.values()):
+        raise click.UsageError("--config 与模型字段参数不能同用，请直接编辑配置文件")
     manager = SetupManager()
     agents = tuple(agents) if agents else None
-    model_options_supplied = not embedding_preset and any(
-        value is not None
-        for value in (
-            provider, base_url, llm_model, api_key_env, llm_protocol,
-            llm_base_url, llm_api_key_env, embedding_protocol,
-            embedding_model, embedding_base_url, embedding_api_key_env,
-        )
-    )
-    interactive = (
-        not assume_yes
-        and not as_json
-        and click.get_text_stream("stdin").isatty()
-    )
+    interactive = not assume_yes and not as_json and click.get_text_stream("stdin").isatty()
     if interactive and full_onboarding:
         active_profile = config.PROFILE_REGISTRY.peek_active_profile()
-        if active_profile is None:
-            click.echo("Profile: create default (local-only)")
+        click.echo(f"Profile: {active_profile.display_name if active_profile else 'create default'}")
+    try:
+        if model_config_file:
+            selected_model_config = model_config.load(model_config_file)
+        elif interactive:
+            selected_model_config = _prompt_model_endpoints(**options)
+        elif any(value is not None for value in options.values()):
+            selected_model_config = model_config.build(**options)
         else:
-            click.echo(
-                f"Profile: reuse {active_profile.display_name} ({active_profile.id})"
-            )
-    if interactive and not embedding_preset:
-        # 双端点交互：LLM → Embedding；baseUrl/secret 默认继承 LLM，均可覆盖。
-        (llm_protocol, llm_base_url, llm_model, llm_api_key_env,
-         embedding_protocol, embedding_base_url, embedding_model,
-         embedding_api_key_env) = _prompt_model_endpoints(
-            llm_protocol=llm_protocol, llm_base_url=llm_base_url,
-            llm_model=llm_model, llm_api_key_env=llm_api_key_env,
-            embedding_protocol=embedding_protocol,
-            embedding_base_url=embedding_base_url,
-            embedding_model=embedding_model,
-            embedding_api_key_env=embedding_api_key_env,
-            provider=provider,
-        )
-        model_options_supplied = True
-    selected_model_config = None
-    if model_options_supplied:
-        # 非交互下远程 provider 必须有 base URL（交互模式由必填提示保证）。
-        gen_provider = model_config._provider_from_protocol(llm_protocol) or provider or "ollama"
-        if gen_provider in {"api", "anthropic"} and not (llm_base_url or base_url):
-            _emit_setup_error(
-                SetupError(
-                    "SB_MODEL_BASE_URL_REQUIRED",
-                    "api/anthropic LLM provider 需要 --llm-base-url 或 --base-url",
-                ),
-                as_json=as_json,
-            )
-            return
-        emb_provider = (
-            model_config._provider_from_protocol(embedding_protocol)
-            or provider
-            or gen_provider
-        )
-        if (
-            emb_provider in {"api", "anthropic"}
-            and not (embedding_base_url or llm_base_url or base_url)
-        ):
-            _emit_setup_error(
-                SetupError(
-                    "SB_MODEL_BASE_URL_REQUIRED",
-                    "api/anthropic embedding provider 需要 --embedding-base-url 或 --base-url",
-                ),
-                as_json=as_json,
-            )
-            return
-        try:
-            selected_model_config = model_config.build(
-                provider=provider,
-                base_url=base_url,
-                llm_model=llm_model,
-                embedding_model=embedding_model,
-                api_key_env=api_key_env
-                or ("STORYBOOK_API_KEY" if provider == "api" else None),
-                llm_protocol=llm_protocol,
-                llm_base_url=llm_base_url,
-                llm_credential_env=llm_api_key_env,
-                embedding_protocol=embedding_protocol,
-                embedding_base_url=embedding_base_url,
-                embedding_credential_env=embedding_api_key_env,
-            )
-        except model_config.ModelConfigError as exc:
-            _emit_setup_error(
-                SetupError("SB_MODEL_CONFIG_INVALID", str(exc)), as_json=as_json
-            )
-            return
+            selected_model_config = config.MODEL_CONFIG
+    except model_config.ModelConfigError as exc:
+        _emit_setup_error(SetupError("SB_MODEL_CONFIG_INVALID", str(exc)), as_json=as_json)
+        return
     if interactive and full_onboarding and not agents:
         agent_answer = click.prompt(
             "Agent adapters (auto, skip, back, or comma-separated names)",
             default="auto",
         ).strip()
         if agent_answer.lower() == "back":
-            return _run_onboarding(
-                assume_yes=False, dry_run=False, as_json=False, agents=None,
-                provider=None, base_url=None, llm_model=None,
-                embedding_model=None, api_key_env=None, embedding_preset=None,
-                embedding_base_url=None, embedding_dimension=None,
-                embedding_version=None, embedding_api_key_env=None,
-                llm_protocol=None, llm_base_url=None, llm_api_key_env=None,
-                embedding_protocol=None,
-                enable_schedule=False,
-                skip_models=skip_models, full_onboarding=True,
-            )
+            return _run_onboarding(skip_models=skip_models)
         if agent_answer.lower() == "skip":
             agents = ()
         elif agent_answer.lower() != "auto":
@@ -567,17 +374,7 @@ def _run_onboarding(
             default="skip",
         )
         if schedule_answer == "back":
-            return _run_onboarding(
-                assume_yes=False, dry_run=False, as_json=False, agents=None,
-                provider=None, base_url=None, llm_model=None,
-                embedding_model=None, api_key_env=None, embedding_preset=None,
-                embedding_base_url=None, embedding_dimension=None,
-                embedding_version=None, embedding_api_key_env=None,
-                llm_protocol=None, llm_base_url=None, llm_api_key_env=None,
-                embedding_protocol=None,
-                enable_schedule=False,
-                skip_models=skip_models, full_onboarding=True,
-            )
+            return _run_onboarding(skip_models=skip_models)
         enable_schedule = schedule_answer == "enable"
     try:
         plan = manager.plan(
@@ -587,9 +384,10 @@ def _run_onboarding(
         _emit_setup_error(exc, as_json=as_json)
         return
 
+    plan["model_config_path"] = str(Path(plan["profile"].get("data_root", config.PROFILE_PATHS.root)) / "model-config.json")
     plan["model_config"] = (
         selected_model_config or config.MODEL_CONFIG
-    ).public_dict(os.environ)
+    ).public_dict()
     if selected_model_config is not None:
         plan["models"] = list(dict.fromkeys((
             selected_model_config.generation.model,
@@ -613,29 +411,6 @@ def _run_onboarding(
     if not assume_yes and not as_json:
         click.confirm("Apply this plan?", abort=True)
 
-    temporary_secrets: list[tuple[str, object]] = []
-    secret_marker = object()
-    if interactive and selected_model_config is not None:
-        prompted_envs: set[str] = set()
-        for kind, endpoint in (
-            ("LLM", selected_model_config.generation),
-            ("Embedding", selected_model_config.embedding),
-        ):
-            env_name = endpoint.credential_env
-            if (
-                endpoint.provider != "ollama"
-                and env_name
-                and not manager.environ.get(env_name)
-                and env_name not in prompted_envs
-            ):
-                temporary_secret = click.prompt(
-                    f"{kind} API key (used for this run only)", hide_input=True
-                )
-                previous = manager.environ.get(env_name, secret_marker)
-                manager.environ[env_name] = temporary_secret
-                temporary_secrets.append((env_name, previous))
-                prompted_envs.add(env_name)
-
     def progress(event: dict) -> None:
         if as_json:
             return
@@ -649,23 +424,13 @@ def _run_onboarding(
         click.echo(f"  Model     {model}: {status}{suffix}")
 
     try:
-        try:
-            result = manager.execute(
-                requested_agents=agents,
-                download_models=not skip_models,
-                progress=progress,
-                provider_config=selected_model_config,
-                enable_schedule=enable_schedule,
-            )
-        except SetupError as exc:
-            _emit_setup_error(exc, as_json=as_json)
-            return
-    finally:
-        for env_name, previous in temporary_secrets:
-            if previous is secret_marker:
-                manager.environ.pop(env_name, None)
-            else:
-                manager.environ[env_name] = previous
+        result = manager.execute(
+            requested_agents=agents, download_models=not skip_models, progress=progress,
+            provider_config=selected_model_config, enable_schedule=enable_schedule,
+        )
+    except SetupError as exc:
+        _emit_setup_error(exc, as_json=as_json)
+        return
 
     recall = next(
         (item for item in result["smoke_tests"] if item["name"] == "recall"), None
@@ -681,6 +446,7 @@ def _run_onboarding(
     click.echo(f"\nSetup status: {result['status']}")
     click.echo(f"  Profile   {result['profile']['id']}")
     click.echo(f"  Database  {result['profile']['database']}")
+    click.echo(f"  Config    {config.MODEL_CONFIG_PATH}")
     for smoke in result["smoke_tests"]:
         click.echo(
             f"  {'PASS' if smoke['ok'] else 'FAIL'}      {smoke['name']}: {smoke['detail']}"
@@ -1057,93 +823,31 @@ def _legacy_init_db() -> None:
 
 @cli.command(name="init")
 @click.option("--yes", "assume_yes", is_flag=True, help="接受计划并非交互执行")
-@click.option("--dry-run", is_flag=True, help="只输出计划；零写入")
-@click.option("--json", "as_json", is_flag=True, help="输出稳定 JSON 结构")
-@click.option(
-    "--agent", "agents", multiple=True,
-    type=click.Choice(["claude", "cursor", "codex"]),
-    help="只配置指定 Agent；可重复",
-)
-@click.option(
-    "--provider",
-    type=click.Choice(["ollama", "api", "anthropic"]),
-    help="模型 provider（旧 shorthand，同时作用于 generation 与 embedding 两个端点）",
-)
-@click.option("--base-url", help="provider 根 URL（旧 shorthand，同时作用于两个端点）")
-@click.option("--llm-model", help="generation 模型名")
-@click.option("--embedding-model", help="embedding 模型名")
-@click.option("--api-key-env", help="API key 环境变量名（旧 shorthand，同时作用于两个端点）")
-@click.option(
-    "--llm-protocol",
-    type=click.Choice(["ollama", "openai", "anthropic"]),
-    help="generation 端点协议（openai=OpenAI 兼容需 /v1；anthropic 走 /v1/messages）",
-)
-@click.option("--llm-base-url", help="generation 端点 base URL")
-@click.option("--llm-api-key-env", help="generation 端点凭据环境变量名")
-@click.option(
-    "--embedding-protocol",
-    type=click.Choice(["ollama", "openai", "anthropic"]),
-    help="embedding 端点协议（默认 ollama）",
-)
-@click.option(
-    "--embedding-preset",
-    type=click.Choice(["ollama", "custom"]),
-    help="选择 Ollama（推荐）或自定义 OpenAI-compatible API",
-)
-@click.option("--embedding-base-url", help="embedding API base URL")
-@click.option("--embedding-dimension", type=click.IntRange(min=1), help="向量维度")
-@click.option("--embedding-version", help="不可变 embedding 版本")
-@click.option("--embedding-api-key-env", help="embedding 凭据环境变量名")
+@click.option("--dry-run", is_flag=True, help="只输出计划；零文件与网络写入")
+@click.option("--json", "as_json", is_flag=True, help="输出 JSON，secret 自动遮蔽")
+@click.option("--agent", "agents", multiple=True, type=click.Choice(["claude", "cursor", "codex"]), help="只配置指定 Agent")
+@_model_options
 @click.option("--enable-schedule", is_flag=True, help="配置用户级 watch schedule")
-@click.option("--skip-models", "--skip-download", is_flag=True, help="跳过模型下载")
+@click.option("--skip-models", "--skip-download", is_flag=True, help="跳过缺失 Ollama 模型的下载")
 @click.pass_context
-def init_command(
-    ctx, assume_yes, dry_run, as_json, agents, provider, base_url, llm_model,
-    embedding_model, api_key_env, embedding_preset, embedding_base_url,
-    embedding_dimension, embedding_version, embedding_api_key_env,
-    llm_protocol, llm_base_url, llm_api_key_env, embedding_protocol,
-    enable_schedule, skip_models,
-):
-    """Canonical ``book init`` onboarding; legacy ``storybook init`` initializes DB."""
-
-    executable = Path(ctx.find_root().info_name or "").name
-    if executable != "book":
-        supplied = (
-            assume_yes or dry_run or as_json or agents or provider or base_url
-            or llm_model or embedding_model or api_key_env or embedding_preset
-            or embedding_base_url or embedding_dimension or embedding_version
-            or embedding_api_key_env or llm_protocol or llm_base_url
-            or llm_api_key_env or embedding_protocol or enable_schedule or skip_models
-        )
-        if supplied:
-            raise click.UsageError(
-                "legacy `storybook init` only initializes the database; use `book init`"
-            )
+def init_command(ctx, **options):
+    """配置模型四元组并保存到当前 Profile 的 model-config.json。"""
+    if Path(ctx.find_root().info_name or "").name != "book":
+        if any(options.values()):
+            raise click.UsageError("请使用 book init 配置模型，或 book admin init-db 初始化数据库")
         _legacy_init_db()
         return
-    return _run_onboarding(
-        assume_yes=assume_yes,
-        dry_run=dry_run,
-        as_json=as_json,
-        agents=agents,
-        provider=provider,
-        base_url=base_url,
-        llm_model=llm_model,
-        embedding_model=embedding_model,
-        api_key_env=api_key_env,
-        embedding_preset=embedding_preset,
-        embedding_base_url=embedding_base_url,
-        embedding_dimension=embedding_dimension,
-        embedding_version=embedding_version,
-        embedding_api_key_env=embedding_api_key_env,
-        llm_protocol=llm_protocol,
-        llm_base_url=llm_base_url,
-        llm_api_key_env=llm_api_key_env,
-        embedding_protocol=embedding_protocol,
-        enable_schedule=enable_schedule,
-        skip_models=skip_models,
-        full_onboarding=True,
-    )
+    return _run_onboarding(**options)
+
+
+@cli.command(name="config")
+@click.option("--path", "path_only", is_flag=True, help="只输出配置文件路径")
+def model_config_command(path_only):
+    """查看模型配置（secret 遮蔽）或获取文件路径。"""
+    if path_only:
+        click.echo(str(config.MODEL_CONFIG_PATH))
+    else:
+        click.echo(json.dumps({"path": str(config.MODEL_CONFIG_PATH), **config.MODEL_CONFIG.public_dict()}, ensure_ascii=False, indent=2))
 
 
 @admin_group.command(name="init-db")

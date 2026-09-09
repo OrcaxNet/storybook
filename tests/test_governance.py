@@ -482,6 +482,7 @@ def test_same_remote_matches_across_different_clones(tmp_path):
 
 
 def test_llm_and_embedding_cache_skip_duplicate_provider_calls(monkeypatch):
+    monkeypatch.setattr(config, "LLM_PROVIDER", "anthropic")
     calls = {"llm": 0, "embedding": 0}
     monkeypatch.setattr(config, "LLM_API_KEY", "test-key")
 

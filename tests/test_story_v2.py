@@ -558,7 +558,8 @@ def test_main_custom_api_identity_migrates_without_recall_or_cache_drift(
     monkeypatch.setattr(config, "EMBED_VERSION", active["active_version"])
     monkeypatch.setattr(config, "EMBED_DIM", len(basis(0)))
     monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "EXISTING_EMBED_TOKEN")
-    monkeypatch.setenv("EXISTING_EMBED_TOKEN", "migration-secret")
+    from storybook import model_config
+    model_config._save_json(config.MODEL_CONFIG_PATH.with_name("model-secrets.json"), {"EXISTING_EMBED_TOKEN": "migration-secret"})
     monkeypatch.setattr(
         embeddings.requests, "post",
         lambda *args, **kwargs: pytest.fail("init migration must be zero-network"),
@@ -618,7 +619,8 @@ def test_main_custom_api_drift_keeps_active_credential_unknown(monkeypatch):
     monkeypatch.setattr(config, "EMBED_VERSION", active["active_version"])
     monkeypatch.setattr(config, "EMBED_DIM", len(basis(0)))
     monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "TARGET_TOKEN")
-    monkeypatch.setenv("TARGET_TOKEN", "target-secret")
+    from storybook import model_config
+    model_config._save_json(config.MODEL_CONFIG_PATH.with_name("model-secrets.json"), {"TARGET_TOKEN": "target-secret"})
     monkeypatch.setattr(
         embeddings.requests, "post",
         lambda *args, **kwargs: pytest.fail("unknown active credential must not request"),

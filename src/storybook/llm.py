@@ -1,5 +1,5 @@
 """
-LLM 处理层 — 封装 DeepSeek Anthropic-compatible Messages API
+LLM 处理层 — 适配 OpenAI、Anthropic Messages 与 Ollama 协议
 提供：摘要生成、关键词提取、分裂判断、Story 拆分、合并
 """
 import json
@@ -10,6 +10,7 @@ import requests
 
 from . import config
 from . import inference_cache
+from . import model_config
 from . import story_v2
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ def _chat(
     num_predict: int | None = None,
     response_schema: dict | None = None,
 ) -> Optional[str | dict]:
-    """Call DeepSeek's Anthropic-compatible API.
+    """Call the configured protocol endpoint.
 
     When ``response_schema`` is provided, the request forces one tool call and
     returns its already-decoded ``input`` object.  DeepSeek's Anthropic
@@ -46,13 +47,6 @@ def _chat(
     if isinstance(cached, (str, dict)):
         return cached
 
-    if config.LLM_PROVIDER != "ollama" and not config.LLM_API_KEY:
-        logger.error(
-            "LLM request failed provider=%s category=credentials_missing",
-            config.LLM_PROVIDER,
-        )
-        return None
-
     max_tokens = 4096 if num_predict is None else max(32, int(num_predict))
     messages = []
     if system:
@@ -67,8 +61,8 @@ def _chat(
         }
         if response_schema is not None:
             payload["format"] = response_schema
-        url = f"{config.LLM_BASE_URL.rstrip('/')}/api/chat"
-        headers = {}
+        url = model_config.request_url(config.LLM_BASE_URL, "ollama", "chat")
+        headers = model_config.request_headers("ollama", config.LLM_API_KEY)
     elif config.LLM_PROVIDER == "api":
         payload = {
             "model": config.LLM_MODEL,
@@ -81,8 +75,8 @@ def _chat(
                 "type": "json_schema",
                 "json_schema": {"name": "storybook_output", "schema": response_schema},
             }
-        url = f"{config.LLM_BASE_URL.rstrip('/')}/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
+        url = model_config.request_url(config.LLM_BASE_URL, "openai", "chat/completions")
+        headers = model_config.request_headers("openai", config.LLM_API_KEY)
     else:
         payload = {
             "model": config.LLM_MODEL,
@@ -102,12 +96,8 @@ def _chat(
             payload["tool_choice"] = {
                 "type": "tool", "name": "submit_structured_output",
             }
-        url = f"{config.LLM_BASE_URL.rstrip('/')}/v1/messages"
-        headers = {
-            "x-api-key": config.LLM_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
+        url = model_config.request_url(config.LLM_BASE_URL, "anthropic", "messages")
+        headers = model_config.request_headers("anthropic", config.LLM_API_KEY)
 
     try:
         resp = requests.post(url, headers=headers, json=payload,

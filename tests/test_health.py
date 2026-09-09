@@ -41,6 +41,7 @@ def test_doctor_accepts_deepseek_config_and_only_checks_ollama_embedding(
     monkeypatch, tmp_path, capsys
 ):
     _ready_local_dependencies(monkeypatch, tmp_path)
+    monkeypatch.setattr(config, "LLM_PROVIDER", "anthropic")
     monkeypatch.setattr(config, "LLM_API_KEY", "never-print-this-secret")
     monkeypatch.setattr(
         health.requests,
@@ -54,18 +55,18 @@ def test_doctor_accepts_deepseek_config_and_only_checks_ollama_embedding(
 
     output = capsys.readouterr().out
     assert "LLM 配置" in output
-    assert "provider=deepseek_anthropic" in output
+    assert "provider=anthropic" in output
     assert "Ollama warm/cold" in output
     assert "model_state=cold" in output
     assert "ollama pull deepseek-v4-flash" not in output
     assert "never-print-this-secret" not in output
 
 
-def test_doctor_reports_missing_llm_credentials_without_network_or_secret(
+def test_doctor_reports_missing_llm_configuration_without_network(
     monkeypatch, tmp_path, capsys
 ):
     _ready_local_dependencies(monkeypatch, tmp_path)
-    monkeypatch.setattr(config, "LLM_API_KEY", None)
+    monkeypatch.setattr(config, "LLM_BASE_URL", "")
     monkeypatch.setattr(
         health.requests,
         "post",
@@ -77,8 +78,8 @@ def test_doctor_reports_missing_llm_credentials_without_network_or_secret(
     assert health.run_doctor() is False
 
     output = capsys.readouterr().out
-    assert "reason=llm_credentials_missing" in output
-    assert "ANTHROPIC_AUTH_TOKEN" in output
+    assert "reason=llm_config_missing" in output
+    assert "book init" in output
     assert "ollama pull deepseek-v4-flash" not in output
 
 

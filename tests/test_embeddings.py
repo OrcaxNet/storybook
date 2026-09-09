@@ -106,7 +106,7 @@ def test_explicit_shadow_model_remains_available_during_config_switch(monkeypatc
 
 
 def test_endpoint_switch_uses_active_credentials_until_atomic_activation(monkeypatch):
-    from storybook import store
+    from storybook import store, model_config
 
     story_id = store.add_story("credential routing", "content", [], basis(0))
     db = store.get_db(load_vector_extension=False)
@@ -125,8 +125,7 @@ def test_endpoint_switch_uses_active_credentials_until_atomic_activation(monkeyp
     monkeypatch.setattr(config, "EMBED_BASE_URL", "https://endpoint-b.example/v1")
     monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
     monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "TOKEN_B")
-    monkeypatch.setenv("TOKEN_A", "alpha-token")
-    monkeypatch.setenv("TOKEN_B", "beta-token")
+    model_config._save_json(config.MODEL_CONFIG_PATH.with_name("model-secrets.json"), {"TOKEN_A": "alpha-token", "TOKEN_B": "beta-token"})
     requests_seen = []
 
     class Response(_Response):
@@ -213,7 +212,8 @@ def test_openai_compatible_api_uses_no_ollama_endpoint_or_parameters(monkeypatch
     assert "headers" not in captured
 
 
-def test_api_credential_is_read_from_named_environment_variable(monkeypatch):
+def test_api_credential_is_read_from_model_file(monkeypatch):
+    from storybook import model_config
     captured = {}
 
     class Response(_Response):
@@ -221,8 +221,9 @@ def test_api_credential_is_read_from_named_environment_variable(monkeypatch):
             return {"data": [{"embedding": basis(0)}]}
 
     monkeypatch.setattr(config, "EMBED_ADAPTER", "openai_compatible")
-    monkeypatch.setattr(config, "EMBED_API_KEY_ENV", "PRIVATE_EMBED_TOKEN")
-    monkeypatch.setenv("PRIVATE_EMBED_TOKEN", "never-log-this")
+    value = model_config.build(llm_secret="never-log-this")
+    model_config.save(config.MODEL_CONFIG_PATH, value)
+    monkeypatch.setattr(config, "EMBED_API_KEY_ENV", value.embedding.credential_ref)
     monkeypatch.setattr(
         embeddings.requests,
         "post",

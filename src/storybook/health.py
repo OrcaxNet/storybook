@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import click
 import requests
 
-from . import config
+from . import config, model_config
 from . import embeddings
 from . import store
 
@@ -36,7 +36,10 @@ class CheckResult:
 def _check_ollama_reachable() -> tuple[bool, dict | None, str]:
     """GET {OLLAMA_HOST}/api/tags。返回 (可达, tags JSON, 错误信息)。"""
     try:
-        resp = requests.get(f"{config.EMBED_BASE_URL}/api/tags", timeout=5)
+        resp = requests.get(
+            model_config.request_url(config.EMBED_BASE_URL, "ollama", "tags"),
+            headers=model_config.request_headers("ollama", config.EMBED_API_KEY), timeout=5,
+        )
         resp.raise_for_status()
         return True, resp.json(), ""
     except Exception as e:
@@ -153,7 +156,7 @@ def run_doctor(fix: bool = False) -> bool:
             if not endpoint_ok else ""))
 
     # [2] 云端生成式 LLM 只做无费用的配置就绪检查，不发送生成请求，也不依赖 Ollama。
-    if config.LLM_API_KEY:
+    if config.LLM_BASE_URL and config.LLM_MODEL:
         results.append(CheckResult(
             "LLM 配置",
             True,
@@ -163,9 +166,8 @@ def run_doctor(fix: bool = False) -> bool:
             "LLM 配置",
             False,
             detail=(f"provider={config.LLM_PROVIDER}，model={config.LLM_MODEL}，"
-                    "reason=llm_credentials_missing"),
-            suggestion=("设置 ANTHROPIC_AUTH_TOKEN（或 DEEPSEEK_KEY），"
-                        "也可通过 STORYBOOK_LLM_ENV_FILE 指定配置文件")))
+                    "reason=llm_config_missing"),
+            suggestion="运行 book init 配置 LLM 四元组"))
 
     # [3] Embedding 模型已拉取
     if not endpoint_ok:

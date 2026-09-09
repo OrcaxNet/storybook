@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "generation": {
+    "protocol": "openai",
+    "base_url": "https://newapi.deepwisdom.ai",
+    "secret": "replace-with-your-secret",
+    "model": "claude-fable-5"
+  },
+  "embedding": {
+    "protocol": "ollama",
+    "base_url": "http://localhost:11434",
+    "secret": "",
+    "model": "qwen3-embedding:0.6b"
+  }
+}

@@ -11,6 +11,13 @@ import requests
 from storybook import config, llm
 
 
+@pytest.fixture(autouse=True)
+def configured_anthropic_endpoint(monkeypatch):
+    monkeypatch.setattr(config, "LLM_PROVIDER", "anthropic")
+    monkeypatch.setattr(config, "LLM_BASE_URL", "https://api.deepseek.com/anthropic")
+    monkeypatch.setattr(config, "LLM_MODEL", "deepseek-v4-flash")
+
+
 class _Response:
     def __init__(self, payload=None, *, status=200, json_error=False):
         self._payload = payload
@@ -257,60 +264,9 @@ def test_timeout_returns_none(monkeypatch):
     assert llm._chat("q", timeout_seconds=0.2) is None
 
 
-def test_missing_credentials_skips_request(monkeypatch):
-    monkeypatch.setattr(config, "LLM_API_KEY", None)
-    monkeypatch.setattr(
-        llm.requests,
-        "post",
-        lambda *a, **k: pytest.fail("request must not be sent"),
-    )
-    assert llm._chat("q") is None
-
-
-def test_config_precedence_aliases_and_tilde_expansion(tmp_path: Path):
-    home = tmp_path / "home"
-    llm_file = home / ".chrc" / "dpsk.sh"
-    llm_file.parent.mkdir(parents=True)
-    llm_file.write_text(
-        "export ANTHROPIC_AUTH_TOKEN=file-auth\n"
-        "ANTHROPIC_BASE_URL=https://file.example/anthropic\n"
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL=file-model\n",
-        encoding="utf-8",
-    )
-    project = tmp_path / ".env"
-    project.write_text(
-        "ANTHROPIC_AUTH_TOKEN=project-auth\n"
-        "STORYBOOK_LLM_MODEL=project-model\n",
-        encoding="utf-8",
-    )
-
-    resolved = config.resolve_llm_config(
-        process_env={
-            "STORYBOOK_LLM_ENV_FILE": "~/.chrc/dpsk.sh",
-            "DEEPSEEK_KEY": "process-fallback",
-            "STORYBOOK_LLM_MODEL": "process-model",
-        },
-        project_env_path=project,
-        home=home,
-    )
-
-    assert resolved["env_file"] == str(llm_file)
-    assert resolved["api_key"] == "process-fallback"
-    assert resolved["model"] == "process-model"
-    assert resolved["base_url"] == "https://file.example/anthropic"
-
-
-def test_config_missing_file_and_project_fallback(tmp_path: Path):
-    project = tmp_path / ".env"
-    project.write_text(
-        "DEEPSEEK_KEY=project-key\nANTHROPIC_DEFAULT_HAIKU_MODEL=project-model\n",
-        encoding="utf-8",
-    )
-    resolved = config.resolve_llm_config(
-        process_env={"STORYBOOK_LLM_ENV_FILE": "~/missing.sh"},
-        project_env_path=project,
-        home=tmp_path,
-    )
-    assert resolved["api_key"] == "project-key"
-    assert resolved["model"] == "project-model"
-    assert resolved["think"] is False
+def test_empty_secret_sends_no_authentication_header(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(config, "LLM_API_KEY", "")
+    monkeypatch.setattr(llm.requests, "post", lambda url, **kwargs: captured.update(kwargs) or _Response({"content": [{"type": "text", "text": "OK"}]}))
+    assert llm._chat("hello") == "OK"
+    assert "x-api-key" not in captured["headers"]

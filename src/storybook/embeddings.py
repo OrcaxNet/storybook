@@ -10,6 +10,7 @@ import requests
 
 from . import config
 from . import inference_cache
+from . import model_config
 
 logger = logging.getLogger(__name__)
 
@@ -65,27 +66,23 @@ def _request_embedding(
     credential_env = config.EMBED_API_KEY_ENV if api_key_env is None else api_key_env
     headers: dict[str, str] = {}
     if credential_env:
-        credential = os.getenv(credential_env)
+        credential = model_config.credential_value(credential_env, path=config.MODEL_CONFIG_PATH)
         if not credential:
             raise EmbeddingAPIError(
                 "credentials_missing",
-                f"credential environment variable {credential_env} is missing",
+                "the active index credential snapshot is missing",
             )
         headers["Authorization"] = f"Bearer {credential}"
     elif api_key_value:
         headers["Authorization"] = f"Bearer {api_key_value}"
 
     if request_adapter == "ollama":
-        url = f"{request_base_url}/api/embeddings"
+        url = model_config.request_url(request_base_url, "ollama", "embeddings")
         payload = {"model": model, "prompt": text}
         if keep_alive is not None:
             payload["keep_alive"] = keep_alive
     else:
-        api_root = (
-            request_base_url if request_base_url.endswith("/v1")
-            else f"{request_base_url}/v1"
-        )
-        url = f"{api_root}/embeddings"
+        url = model_config.request_url(request_base_url, "openai", "embeddings")
         payload = {"model": model, "input": text}
 
     try:

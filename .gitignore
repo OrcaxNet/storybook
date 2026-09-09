@@ -20,6 +20,8 @@ venv/
 # Local env
 .env
 .env.local
+model-config.json
+model-secrets.json
 
 # Runtime data (contains personal session memory — do not commit)
 data/*.db
