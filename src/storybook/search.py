@@ -534,7 +534,7 @@ def search(
         f"enabled={rerank_trace.get('enabled')} status={rerank_trace.get('status')} "
         f"top={[(m['story_id'], round(float(m.get('score', m.get('similarity', 0.0))), 4)) for m in matches[:top_k]]}",
     )
-    matches = matches[:top_k]
+    matches = _apply_adoption_prior(matches)[:top_k]
     top_matches = _attach_related(matches)
     _sb_trace(
         request_id, "final",
@@ -931,7 +931,7 @@ def _run_lexical_fallback(
         f"enabled={rerank_trace.get('enabled')} status={rerank_trace.get('status')} "
         f"top={[(m['story_id'], round(float(m.get('score', m.get('similarity', 0.0))), 4)) for m in matches[:top_k]]}",
     )
-    matches = matches[:top_k]
+    matches = _apply_adoption_prior(matches)[:top_k]
     top_matches = _attach_related(matches)
     _sb_trace(
         request_id, "final",
@@ -1234,6 +1234,53 @@ def _empty_graph_trace(
         "elapsed_ms": 0.0,
         "budgets": {},
     }
+
+
+def _apply_adoption_prior(matches: list[dict]) -> list[dict]:
+    """用做梦周期的采纳判定对候选做有界次序调节。
+
+    Beta(1,1) 平滑：prior = (used + 1) / (judged + 2)，未判定为 0.5（中性）。
+    ``score += ADOPTION_SCORE_WEIGHT * (prior - 0.5) * 2 - penalty * misleading_rate``，
+    语义相似度仍是主信号；判定样本少时偏移自然很小。
+    """
+
+    weight = config.ADOPTION_SCORE_WEIGHT
+    penalty = config.ADOPTION_MISLEADING_PENALTY
+    if not matches or (weight <= 0 and penalty <= 0):
+        return matches
+    try:
+        stats = store.get_adoption_stats([m["story_id"] for m in matches])
+    except Exception:  # noqa: BLE001 -- 先验是旁路信号，失败保持原排序
+        return matches
+    if not stats:
+        return matches
+    adjusted = []
+    for position, match in enumerate(matches):
+        item = match
+        stat = stats.get(int(match["story_id"]))
+        if stat and stat["judged"]:
+            prior = (stat["used"] + 1) / (stat["judged"] + 2)
+            misleading_rate = stat["misleading"] / stat["judged"]
+            delta = weight * (prior - 0.5) * 2 - penalty * misleading_rate
+            base = float(match.get("score", match.get("similarity", 0.0)))
+            item = dict(match)
+            item["score"] = round(max(0.0, min(1.0, base + delta)), 8)
+            components = dict(item.get("score_components") or {})
+            components.update({
+                "adoption_prior": round(prior, 4),
+                "adoption_judged": stat["judged"],
+                "adoption_delta": round(delta, 6),
+                "final_score": item["score"],
+            })
+            item["score_components"] = components
+        adjusted.append((item, position))
+    if all(item is matches[pos] for item, pos in adjusted):
+        return matches  # 无已判定条目：完全保留原排序（含环境分桶语义）
+    adjusted.sort(
+        key=lambda pair: (float(pair[0].get("score", pair[0].get("similarity", 0.0))), -pair[1]),
+        reverse=True,
+    )
+    return [item for item, _ in adjusted]
 
 
 def _attach_related(matches: list[dict]) -> list[dict]:

@@ -586,6 +586,20 @@ def test_codex_ignores_injected_preambles_and_preserves_final_conclusion(tmp_pat
         db.close()
 
 
+def test_codex_strips_pathless_agents_md_and_browser_context(tmp_path):
+    path = tmp_path / "one.jsonl"
+    prompt = (
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>Storybook 记忆检索 rules</INSTRUCTIONS>\n"
+        '<in-app-browser-context url="http://x">page dump</in-app-browser-context>\n'
+        "## My request:\nFix the flaky test"
+    )
+    _jsonl(path, _codex_rows("one", "/work", prompt))
+    session = CodexAdapter(tmp_path).parse(path).sessions[0]
+    assert session.problem_desc == "Fix the flaky test"
+    for noise in ("AGENTS.md", "INSTRUCTIONS", "page dump", "My request"):
+        assert noise not in session.raw_content
+
+
 def test_codex_preserves_prompt_after_environment_block(tmp_path):
     path = tmp_path / "one.jsonl"
     _jsonl(path, _codex_rows("one", "/work", "<environment_context>context</environment_context>\n\nFix this bug"))

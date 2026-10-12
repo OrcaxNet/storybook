@@ -37,6 +37,8 @@ book run [--session ID]                 # "dream cycle": collect + process all p
 book search "<query>" [--top 3]         # vector search + related-story activation
 book status [--performance]             # run status + recent query p50/p95 + cache/fallback ratios
 book memory list | book memory show <id> | book memory forget
+book memory feedback [--json]           # recall funnel: exposure → click → adoption
+book memory clean-keywords [--apply]    # drop injected-instruction keyword noise
 book source list|enable|disable|reset   # manage local Agent history sources
 book admin benchmark --model-state warm # isolated 10k Story performance/quality baseline
 book admin index --version <v>          # incremental embedding shadow rebuild + atomic switch
@@ -96,7 +98,7 @@ environment conflicts. Story environment history is a collection derived from al
 source Sessions, never a last-write-wins field.
 
 ### Memory Graph
-`edges` uses `UNIQUE(source_id, target_id, edge_type)` and supports `semantic`, `temporal`, `causal`, `same_environment`, `parent_child`, `co_recall`, and `supersedes`. Temporal (old→new), causal (cause→effect), parent-child (parent→child), and supersedes (new→old) are directed; the rest canonicalize undirected endpoints. Every edge carries JSON provenance, version, observations, reinforcement timestamps, and a soft-delete timestamp. Legacy `sibling` rows remain readable, while new split siblings are standard semantic edges with `relationship=sibling` provenance. Recall feedback is queued and non-blocking, creates/reinforces capped `co_recall` edges, and supports half-life decay.
+`edges` uses `UNIQUE(source_id, target_id, edge_type)` and supports `semantic`, `temporal`, `causal`, `same_environment`, `parent_child`, `co_recall`, and `supersedes`. Temporal (old→new), causal (cause→effect), parent-child (parent→child), and supersedes (new→old) are directed; the rest canonicalize undirected endpoints. Every edge carries JSON provenance, version, observations, reinforcement timestamps, and a soft-delete timestamp. Legacy `sibling` rows remain readable, while new split siblings are standard semantic edges with `relationship=sibling` provenance. Recall feedback is queued and non-blocking. Exposure only bumps `access_count` (set `STORYBOOK_RECALL_EXPOSURE_REINFORCE=1` for the v0.2 co-exposure edge reinforcement). MCP `recall`/`prime_context` and the `book prime` hook log `recall_events`/`recall_exposures`; `get_story` marks clicks. During the dream cycle `adoption.py` matches a Session to its recalls by time window + workspace fingerprint, asks the LLM for used/ignored/misleading verdicts, reinforces `co_recall` edges on co-adoption, and `search._apply_adoption_prior` adds a bounded Beta-smoothed adoption prior (`ADOPTION_SCORE_WEIGHT`). `book memory feedback` reports the funnel; `book memory clean-keywords` removes injected-instruction keyword noise with re-embedding.
 
 ## Configuration knobs (`config.py`)
 

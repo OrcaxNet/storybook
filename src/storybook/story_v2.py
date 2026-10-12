@@ -45,6 +45,39 @@ def _string_list(value: Any) -> list[str]:
     return result
 
 
+# 注入指令 / Agent 工具元数据产生的关键词噪声：它们与经历内容无关，却会让 Story
+# 与任意"记忆检索"相关查询误匹配。Keywords originating from injected agent
+# instructions or memory-tool plumbing rather than from the experience itself.
+_NOISE_KEYWORDS = frozenset(k.casefold() for k in (
+    "#", "AGENTS.md", "CLAUDE.md", "instructions", "<INSTRUCTIONS>",
+    "</INSTRUCTIONS>", "environment_context", "Storybook MCP", "用户级记忆库",
+    "记忆检索", "检索不可用", "记忆检索不可用", "跳过记忆检索", "摘要不足",
+    "injected=false", "count=0", "injected=false / count=0", "story_id",
+    "book doctor", "retrieval_mode=\"fast\"", "retrieval_mode=fast", "top_k=3",
+))
+_NOISE_KEYWORD_PREFIXES = (
+    "storybook.", "mcp__storybook__", "prime_context", "get_story",
+)
+
+
+def is_noise_keyword(keyword: str) -> bool:
+    """True for instruction/tool-plumbing keywords that carry no experience."""
+
+    text = keyword.strip()
+    if not text or len(text) <= 1:
+        return True
+    folded = text.casefold()
+    if folded in _NOISE_KEYWORDS:
+        return True
+    return folded.startswith(_NOISE_KEYWORD_PREFIXES)
+
+
+def clean_keywords(keywords: Any) -> list[str]:
+    """Deduplicate keywords and drop injected-instruction noise, keeping order."""
+
+    return [k for k in _string_list(keywords) if not is_noise_keyword(k)]
+
+
 def normalize_sources(
     sources: Any = None, source_session_ids: list[int] | None = None
 ) -> list[dict]:
@@ -206,7 +239,7 @@ def normalize_story_payload(
         _text(raw.get("abstract")) or _abstract_fallback(detail, content)
     )
     sources = normalize_sources(raw.get("sources"), source_session_ids)
-    keywords = _string_list(raw.get("keywords"))
+    keywords = clean_keywords(raw.get("keywords"))
     return {
         "title": title,
         "abstract": abstract,

@@ -101,6 +101,12 @@ class TestAssociationActivation:
 # ═══════════════════════════════════════════════
 
 class TestCommonRecallBoost:
+    """v0.2 曝光即强化语义；v0.3 起需显式开启 RECALL_EXPOSURE_REINFORCE。"""
+
+    @pytest.fixture(autouse=True)
+    def _legacy_reinforce(self, monkeypatch):
+        monkeypatch.setattr(config, "RECALL_EXPOSURE_REINFORCE", True)
+
     def test_each_co_recalled_pair_boosted_once(self, fake_embedder):
         """共同被召回的 story 两两提权，每对每次 search 仅 +WEIGHT_INCREMENT 一次。"""
         a = _seed("A", with_cos(0, 0.90))

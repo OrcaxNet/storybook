@@ -30,6 +30,7 @@ import re
 from . import config
 from . import search as search_module
 from . import context as context_module
+from . import feedback as feedback_module
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +230,7 @@ def prime_context(
     *,
     tool_type: str = "other",
     integration_mode: str = "manual",
+    telemetry_origin: str | None = None,
 ) -> dict:
     """主动召回并生成"晨间简报"。
 
@@ -304,7 +306,23 @@ def prime_context(
         )
         return base
 
+    def _record(injected_matches: list[dict]) -> None:
+        # 埋点记录 Agent 真正看到的条目（过门槛、未被预算裁掉），而非 search 候选。
+        if telemetry_origin is None or not result.get("request_id"):
+            return
+        feedback_module.enqueue_recall_event(
+            request_id=result["request_id"],
+            origin=telemetry_origin,
+            query=query,
+            matches=injected_matches,
+            workspace_path_hash=(current_context.get("workspace") or {}).get(
+                "path_fingerprint"
+            ),
+            result_state="injected" if injected_matches else "not_injected",
+        )
+
     if result.get("degraded") and not result.get("top_matches"):
+        _record([])
         reason = result.get("degraded_reason") or "embedding_unavailable"
         base["note"] = (
             f"召回已降级（{reason}），关键词 fallback 未命中；"
@@ -318,6 +336,7 @@ def prime_context(
         if m["similarity"] >= config.PRIME_MIN_SIMILARITY
     ]
     if not candidates:
+        _record([])
         # 相关度不足：静默不注入，无 note（这是正常情况，非异常）
         if result.get("degraded"):
             base["note"] = (
@@ -329,6 +348,7 @@ def prime_context(
     candidates.sort(key=lambda m: m["similarity"], reverse=True)
 
     briefing, matches, truncated = _build_briefing(candidates, token_budget)
+    _record(matches)
     if not matches:
         # 候选都因 token 预算被丢弃（极端小预算）
         base["truncated"] = truncated

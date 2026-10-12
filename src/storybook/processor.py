@@ -16,6 +16,7 @@ from . import store
 from . import embeddings
 from . import llm
 from . import story_v2
+from . import adoption
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ def _prepare_session(session) -> dict | None:
     )
 
     # ── Step 1: LLM 提取关键词，并按独立结论形成 Story v2 ──
-    keywords = llm.extract_keywords(raw_content)
+    keywords = story_v2.clean_keywords(llm.extract_keywords(raw_content))
     if not keywords:
         # fallback: 用 problem_desc 做关键词
         keywords = session["problem_desc"].split()[:5]
@@ -103,7 +104,23 @@ def _prepare_session(session) -> dict | None:
             story_vec = lookup_vec
         prepared.append((candidate, candidate_keywords, story_vec))
 
-    return {"session": session, "lookup_vec": lookup_vec, "stories": prepared}
+    return {
+        "session": session,
+        "lookup_vec": lookup_vec,
+        "stories": prepared,
+        # 召回采纳判定只读埋点 + 调模型，写入留到串行持久化阶段。
+        "adoption": _prepare_adoption(session),
+    }
+
+
+def _prepare_adoption(session) -> dict | None:
+    if not config.ADOPTION_JUDGE_ENABLED:
+        return None
+    try:
+        return adoption.prepare_judgment(session)
+    except Exception:  # noqa: BLE001 -- 反馈旁路不能让 Session 失败
+        logger.warning("  采纳判定准备失败，跳过")
+        return None
 
 
 def _persist_prepared_session(preparation: dict) -> Optional[int]:
@@ -149,7 +166,12 @@ def _persist_prepared_session(preparation: dict) -> Optional[int]:
         store.update_session_status(session_id, "failed")
         return None
 
-    # ── Step 3: 标记会话已处理 ──
+    # ── Step 3: 写回召回采纳判定（旁路，失败不影响 Story） ──
+    judged = adoption.apply_judgment(session_id, preparation.get("adoption"))
+    if judged:
+        logger.info("  采纳判定: %d 条曝光", judged)
+
+    # ── Step 4: 标记会话已处理 ──
     store.update_session_status(session_id, "processed")
     logger.info("✅ 会话 #%d 处理完成 → stories %s", session_id, story_ids)
 
@@ -214,7 +236,9 @@ def _update_existing(old_story: dict, session, keywords: list[str],
                      story_vec: list[float], all_matches: list[dict]) -> int:
     """仅补充细节：合并关键词、更新向量、强化关联权重"""
     # 合并关键词（去重）
-    merged_kw = list(set(old_story.get("keywords", []) + keywords))
+    merged_kw = story_v2.clean_keywords(
+        sorted(set(old_story.get("keywords", []) + keywords))
+    )
 
     new_vec = embeddings.embed(story_v2.embedding_input(
         {**old_story, "keywords": merged_kw}, _active_representation()
@@ -343,7 +367,9 @@ def _merge_into_existing(old_story: dict, session, keywords: list[str],
             old_story, session, merged_text, keywords, story_vec, all_matches
         )
     else:
-        merged_kw = list(set(old_story.get("keywords", []) + keywords))
+        merged_kw = story_v2.clean_keywords(
+            sorted(set(old_story.get("keywords", []) + keywords))
+        )
         old_sources = old_story.get("source_session_ids", [])
         if session["id"] not in old_sources:
             old_sources.append(session["id"])
@@ -393,7 +419,7 @@ def _split_and_store(old_story: dict, session, merged_text: str,
     # 否则父 story 的关键词（如中文"火山引擎 API"）会随分裂丢失，子 story 只剩触发会话的关键词，
     # 削弱跨语言/跨表述召回。
     parent_kw = old_story.get("keywords", []) or []
-    merged_kw = list(dict.fromkeys(parent_kw + keywords))
+    merged_kw = story_v2.clean_keywords(parent_kw + keywords)
 
     parent_id = old_story["id"]
     child_ids = []
@@ -464,6 +490,33 @@ def _split_and_store(old_story: dict, session, merged_text: str,
 
     logger.info("  分裂完成: %d 个子 story (parent=#%d)", len(child_ids), parent_id)
     return child_ids[0] if child_ids else parent_id
+
+
+def clean_keywords(*, apply: bool = False) -> dict:
+    """清理 Story 中的注入指令噪声关键词；apply 时重算向量并经 update_story 写回。"""
+
+    plan = store.plan_keyword_cleanup()
+    plan["applied"] = 0
+    if not apply:
+        return plan
+    for change in plan["changes"]:
+        story = store.get_story(change["story_id"])
+        if not story:
+            continue
+        vec = embeddings.embed(story_v2.embedding_input(
+            {**story, "keywords": change["keywords"]}, _active_representation()
+        ))
+        if vec is None:
+            # 向量不可用时不写关键词，避免 BLOB/vec0 与内容哈希失配。
+            continue
+        store.update_story(
+            change["story_id"], keywords=change["keywords"], embedding=vec,
+            sources=story.get("sources", []),
+            source_session_ids=story.get("source_session_ids", []),
+            event_type="update",
+        )
+        plan["applied"] += 1
+    return plan
 
 
 def process_all_pending(verbose: bool = True) -> dict:

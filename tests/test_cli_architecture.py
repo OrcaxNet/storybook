@@ -86,7 +86,7 @@ def test_storybook_help_also_hides_legacy_commands():
 
 def test_memory_group_subcommands():
     group = cli.commands["memory"]
-    assert set(group.commands) == {"list", "show", "forget"}
+    assert set(group.commands) == {"list", "show", "forget", "feedback", "clean-keywords"}
     assert all(not getattr(c, "hidden", False) for c in group.commands.values())
 
 

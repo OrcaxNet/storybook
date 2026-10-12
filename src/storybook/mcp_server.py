@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 
-from . import embeddings, store  # embeddings 提供预热；DB 初始化由 _ensure_db 显式触发
+from . import embeddings, feedback, store  # embeddings 提供预热；DB 初始化由 _ensure_db 显式触发
 from . import prime as prime_module
 from . import search as search_module
 
@@ -56,7 +56,7 @@ def _prewarm_embedding() -> None:
 #  结果裁剪：对 agent 友好（精简、含相似度）
 # ═══════════════════════════════════════════════
 
-def _trim_related(related: list[dict]) -> list[dict]:
+def _trim_related(related: list[dict], *, verbose: bool = True) -> list[dict]:
     """精简关联 story：保留 id/标题/权重/边类型，去掉全文 content 与 embedding。
 
     关联记忆是次要信息，agent 需要详情可再调 ``get_story``，避免一次 recall 塞入
@@ -70,15 +70,55 @@ def _trim_related(related: list[dict]) -> list[dict]:
             "title": r.get("title"),
             "weight": r.get("weight", 0),
             "edge_type": r.get("edge_type", "semantic"),
-            "directed": bool(r.get("directed")),
-            "direction": r.get("direction", r.get("edge_direction", "undirected")),
-            "provenance": r.get("provenance", r.get("edge_provenance", {})),
-            "version": r.get("version", r.get("edge_version", 1)),
         })
+        if verbose:
+            trimmed[-1].update({
+                "directed": bool(r.get("directed")),
+                "direction": r.get("direction", r.get("edge_direction", "undirected")),
+                "provenance": r.get("provenance", r.get("edge_provenance", {})),
+                "version": r.get("version", r.get("edge_version", 1)),
+            })
     return trimmed
 
 
-def _build_recall_result(result: dict) -> dict:
+def _compact_environment(env: dict | None) -> dict | None:
+    """把完整 ContextEnvelope 压缩为判断适用性所需的少量字段。
+
+    完整 envelope 含 provenance/哈希等 30+ 字段，每条召回结果重复多份会让一次
+    recall 占用数千 token；Agent 只需要"在哪个工具/项目/系统/运行时下发生"。
+    """
+    if not isinstance(env, dict):
+        return None
+    tool = env.get("tool") or {}
+    workspace = env.get("workspace") or {}
+    device = env.get("device") or {}
+    runtime = env.get("runtime") or {}
+    compact = {
+        "tool": tool.get("type"),
+        "tool_version": tool.get("version"),
+        "project": workspace.get("project_label"),
+        "branch": workspace.get("branch"),
+        "os": device.get("os_family"),
+        "runtime": runtime.get("kind"),
+        "captured_at": env.get("captured_at"),
+    }
+    return {k: v for k, v in compact.items() if v not in (None, "", "unknown")}
+
+
+def _compact_environments(envs: list | None, limit: int = 3) -> list[dict]:
+    seen: list[dict] = []
+    for env in envs or []:
+        compact = _compact_environment(env)
+        if compact is None:
+            continue
+        key = {k: v for k, v in compact.items() if k != "captured_at"}
+        if any({k: v for k, v in s.items() if k != "captured_at"} == key for s in seen):
+            continue
+        seen.append(compact)
+    return seen[-limit:]
+
+
+def _build_recall_result(result: dict, *, verbose: bool = False) -> dict:
     """把 ``search.search`` 的返回裁剪为对 agent 友好的结构。
 
     与 CLI ``search`` 数据结构一致（query / matches 含 story_id/title/content/
@@ -98,18 +138,27 @@ def _build_recall_result(result: dict) -> dict:
             "score": m.get("score", m["similarity"]),
             "fusion_score": m.get("fusion_score", m.get("score", m["similarity"])),
             "environment_score": m.get("environment_score", 0.0),
-            "environment": m.get("environment"),
-            "environments": m.get("environments", []),
+            "environment": (
+                m.get("environment") if verbose
+                else _compact_environment(m.get("environment"))
+            ),
+            "environments": (
+                m.get("environments", []) if verbose
+                else _compact_environments(m.get("environments"))
+            ),
             "applicability": m.get("applicability", {}),
             "warnings": m.get("warnings", []),
             "retrieval_source": m.get("retrieval_source", "vector"),
             "seed_story_id": m.get("seed_story_id", m["story_id"]),
-            "graph_path": m.get("graph_path", []),
-            "score_components": m.get("score_components", {}),
-            "source_paths": m.get("source_paths", []),
-            "related": _trim_related(m.get("related", [])),
+            "related": _trim_related(m.get("related", []), verbose=verbose),
         })
-    return {
+        if verbose:
+            matches[-1].update({
+                "graph_path": m.get("graph_path", []),
+                "score_components": m.get("score_components", {}),
+                "source_paths": m.get("source_paths", []),
+            })
+    out = {
         "query": result.get("query"),
         "count": len(matches),
         "matches": matches,
@@ -123,18 +172,23 @@ def _build_recall_result(result: dict) -> dict:
         "fallback_status": result.get("fallback_status"),
         "cache_hit": bool(result.get("cache_hit")),
         "index_version": result.get("index_version"),
-        "latency_ms": result.get("latency_ms", {}),
         "scope": result.get("scope", "profile"),
         "strict_filtered": result.get("strict_filtered", 0),
         "graph_enabled": bool(result.get("graph_enabled")),
         "truncated": bool(result.get("truncated")),
         "truncated_reasons": result.get("truncated_reasons", []),
-        "graph_trace": result.get("graph_trace", {}),
         "transform_used": result.get("transform_used", []),
-        "query_plan": result.get("query_plan", {}),
-        "transform_trace": result.get("transform_trace", {}),
-        "rerank_trace": result.get("rerank_trace", {}),
     }
+    if verbose:
+        # 诊断字段：默认不返回，避免占用 Agent 主任务上下文。
+        out.update({
+            "latency_ms": result.get("latency_ms", {}),
+            "graph_trace": result.get("graph_trace", {}),
+            "query_plan": result.get("query_plan", {}),
+            "transform_trace": result.get("transform_trace", {}),
+            "rerank_trace": result.get("rerank_trace", {}),
+        })
+    return out
 
 
 # ═══════════════════════════════════════════════
@@ -150,6 +204,8 @@ def recall_memories(
     retrieval_mode: str = "fast",
     transform_enabled: bool | None = None,
     rerank_enabled: bool | None = None,
+    verbose: bool = False,
+    telemetry_origin: str | None = None,
 ) -> dict:
     """召回与查询相关的记忆（向量检索 + 关联激活）。
 
@@ -174,10 +230,22 @@ def recall_memories(
         transform_enabled=transform_enabled,
         rerank_enabled=rerank_enabled,
     )
-    return _build_recall_result(result)
+    if telemetry_origin and result.get("request_id"):
+        workspace = ((result.get("context") or {}).get("workspace") or {})
+        feedback.enqueue_recall_event(
+            request_id=result["request_id"],
+            origin=telemetry_origin,
+            query=query,
+            matches=result.get("top_matches", []),
+            workspace_path_hash=workspace.get("path_fingerprint"),
+            result_state=result.get("result_state"),
+        )
+    return _build_recall_result(result, verbose=verbose)
 
 
-def get_story_detail(story_id: int) -> dict:
+def get_story_detail(
+    story_id: int, *, verbose: bool = False, record_click: bool = False
+) -> dict:
     """查看单条记忆详情（含关联记忆）。
 
     复用 ``store.get_story`` + ``store.get_related_stories``。输出剥离 embedding
@@ -187,6 +255,8 @@ def get_story_detail(story_id: int) -> dict:
     if not story:
         raise ValueError(f"Story #{story_id} 不存在")
 
+    if record_click:
+        feedback.enqueue_story_click(story["id"])
     related = store.get_related_stories(story_id, limit=10)
     return {
         "story_id": story["id"],
@@ -203,12 +273,21 @@ def get_story_detail(story_id: int) -> dict:
         "embedding_content_hash": story.get("embedding_content_hash"),
         "parent_id": story.get("parent_id"),
         "source_session_ids": story.get("source_session_ids", []),
-        "environments": story.get("environments", []),
+        "environments": (
+            story.get("environments", []) if verbose
+            else _compact_environments(story.get("environments"), limit=5)
+        ),
         "applicability": story.get("applicability", {}),
         "created_at": story.get("created_at"),
         "updated_at": story.get("updated_at"),
-        "revisions": store.get_story_revisions(story_id),
-        "related": _trim_related(related),
+        # 每个修订都带完整快照，默认只给版本链，避免一条详情膨胀为全部历史。
+        "revisions": [
+            revision if verbose else {
+                k: revision.get(k) for k in ("version", "event_type", "created_at")
+            }
+            for revision in store.get_story_revisions(story_id)
+        ],
+        "related": _trim_related(related, verbose=verbose),
     }
 
 
@@ -234,7 +313,8 @@ def get_stats_overview() -> dict:
 
 
 def prime_context_memories(cwd: str = "", first_prompt: str = "",
-                           top_k: int = 5) -> dict:
+                           top_k: int = 5,
+                           telemetry_origin: str | None = None) -> dict:
     """会话启动主动注入（晨间简报）。直接转调 ``prime.prime_context``。
 
     单独包一层仅为与 ``recall_memories`` / ``get_story_detail`` / ``get_stats_overview``
@@ -248,6 +328,7 @@ def prime_context_memories(cwd: str = "", first_prompt: str = "",
         top_k=top_k,
         tool_type="other",
         integration_mode="mcp",
+        telemetry_origin=telemetry_origin,
     )
 
 
@@ -274,6 +355,7 @@ def create_server():
         retrieval_mode: str = "fast",
         transform_enabled: bool | None = None,
         rerank_enabled: bool | None = None,
+        verbose: bool = False,
     ) -> dict:
         """召回与当前任务/问题相关的记忆（向量检索 + 关联激活）。
 
@@ -291,6 +373,7 @@ def create_server():
             retrieval_mode: fast（无生成式 LLM）、auto（按门控进入第二阶段）或 deep（显式深度召回）。
             transform_enabled: 可选总开关；false 时 auto/deep 只返回 fast fallback。
             rerank_enabled: 可选本地 reranker 开关；故障时保留融合结果。
+            verbose: 返回完整环境、图路径与检索诊断（排查用；默认精简）。
         """
         return recall_memories(
             query,
@@ -301,10 +384,12 @@ def create_server():
             retrieval_mode=retrieval_mode,
             transform_enabled=transform_enabled,
             rerank_enabled=rerank_enabled,
+            verbose=verbose,
+            telemetry_origin="mcp_recall",
         )
 
     @mcp.tool()
-    def get_story(story_id: int) -> dict:
+    def get_story(story_id: int, verbose: bool = False) -> dict:
         """查看单条记忆的完整详情（含关联记忆）。
 
         当 recall 返回的某条记忆需要展开看全文/关联时调用。story_id 来自 recall
@@ -312,8 +397,9 @@ def create_server():
 
         Args:
             story_id: 记忆编号。
+            verbose: 返回完整环境与修订快照（默认精简）。
         """
-        return get_story_detail(story_id)
+        return get_story_detail(story_id, verbose=verbose, record_click=True)
 
     @mcp.tool()
     def stats() -> dict:
@@ -331,14 +417,20 @@ def create_server():
         在新会话开始、读到用户首条提问后调用，实现"下意识回忆"过往相似经历。
         返回 ``injected=True`` 时 ``briefing`` 为可直接呈现给用户的简报（≤2k token）；
         ``injected=False`` 表示无相关记忆或环境不可用（不报错，静默不注入，``note`` 给出原因）。
-        命中记忆会自增 access_count 并提权关联边（与 recall 同源副作用）。
+        命中记忆会自增 access_count（与 recall 同源副作用）。
 
         Args:
             cwd: 当前项目目录（agent 的工作目录）。为空且 first_prompt 也为空时静默不注入。
             first_prompt: 用户的首条提问/任务描述（可选；无则仅用 cwd 派生查询）。
             top_k: 最多考虑的候选记忆数，默认 5（再按 token 预算裁剪）。
         """
-        return prime_context_memories(cwd=cwd, first_prompt=first_prompt, top_k=top_k)
+        out = prime_context_memories(
+            cwd=cwd, first_prompt=first_prompt, top_k=top_k,
+            telemetry_origin="mcp_prime",
+        )
+        # 完整 ContextEnvelope 对 Agent 无用；只保留精简环境，降低每次会话开头的 token。
+        out["context"] = _compact_environment(out.get("context"))
+        return out
 
     return mcp
 

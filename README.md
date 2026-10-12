@@ -20,7 +20,7 @@ At recall time, Storybook runs a **hybrid, Graph-RAG retrieval pipeline**:
 2. **Auto path** — only under explainable gates (zero/low confidence, ambiguity, compound, cross-language, or environment-ambiguous queries) does it spend a separate, bounded budget on **Query Transformation**: rewrite, multi-query, or HyDE.
 3. **Deep path** — explicitly opt-in, high-budget recall with all transformations and higher graph budgets.
 
-Every result returns its source paths and score components; co-recall feedback continuously reinforces (and half-life decays) the graph edges. All storage, profiles, and raw evidence stay on your machine by default: embeddings default to **local Ollama**, and remote embedding/generation APIs are only used when you choose them, with clear disclosure that text leaves your machine.
+Every result returns its source paths and score components. A feedback flywheel logs each agent-facing recall locally, then the dream cycle judges offline whether the agent actually *used* each recalled Story; adoption feeds a bounded ranking prior and co-adoption `co_recall` edges, without asking the working agent to rate anything. All storage, profiles, and raw evidence stay on your machine by default: embeddings default to **local Ollama**, and remote embedding/generation APIs are only used when you choose them, with clear disclosure that text leaves your machine.
 
 ### The problem it solves
 
@@ -102,7 +102,7 @@ book status
 
 Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、Codex CLI、Gemini CLI、Cline、JSON 文件或内置模拟器），对每条会话跑一遍 **做梦周期（dream cycle）**：按“独立可复用结论 + 环境适用性”形成一个或多个 Story v2。每条 Story 保存 `title + abstract + structured detail + sources`；detail 与证据不硬截断，只有用于检索/展示的 abstract 有预算，并与已有记忆按相似度**合并 / 更新 / 新建**。
 
-检索时，Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。Auto 仅在 zero/low-confidence、复合、跨语言或强环境歧义时进入独立预算的 Query Transformation/HyDE 第二阶段；Deep 必须由调用方显式选择。每条结果返回来源路径与分数组成；共同召回反馈会强化并衰减独立 `co_recall` 边。
+检索时，Fast 常态并行使用向量与 FTS/关键词排名，经加权 RRF、环境软信号和本地有界 reranker 融合，再以直接命中为 seed 在 hop、path、fan-out、墙钟时间和 token 预算内扩散 Memory Graph。Auto 仅在 zero/low-confidence、复合、跨语言或强环境歧义时进入独立预算的 Query Transformation/HyDE 第二阶段；Deep 必须由调用方显式选择。每条结果返回来源路径与分数组成。召回反馈飞轮在本地记录每次 Agent 侧召回（曝光 → get_story 点击），做梦周期再离线判定该会话是否真正采纳了这些记忆；采纳率作为有界排名先验，并由“共同采纳”强化 `co_recall` 边，全程不打断 Agent 主任务。
 
 模型统一按 **(协议类型, baseUrl, secret, model-id)** 配置，LLM 与 embedding 各自独立，可组合第三方 LLM 与本地 Ollama embedding。Fast 查询不调用生成式 LLM。选择远程 embedding API 时，待向量化的 Story/query 文本会离开本机。
 
@@ -112,7 +112,8 @@ Storybook 采集 AI 编程会话日志（Claude Code 会话、Cursor 日志、Co
 - 🔗 **可解释 Memory Graph**：`semantic` / `temporal` / `causal` / `same_environment` / `parent_child` / `co_recall` / `supersedes` 多类型边，有明确方向、provenance、版本与软删除规则
 - 📐 **可演进双索引**：当前 `story_vectors` 持续服务，模型/版本切换先增量写 shadow，完整后原子切换；失败可续跑
 - 🔍 **自适应 Hybrid Search**：Fast 无生成式调用，融合 vector + FTS/关键词 + environment + Graph；Auto 按可解释门控启用 rewrite/multi-query/HyDE；Deep 使用显式高预算；任一组件失败均保留可用 fallback
-- 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count`/共同召回边权反馈由有界后台队列单事务写入
+- 🧵 **读写解耦**：向量召回与关联读取完成后立即返回，`access_count` 与召回埋点由有界后台队列单事务写入
+- 📈 **召回反馈飞轮**：`recall_events`/`recall_exposures` 记录曝光与点击，做梦周期离线判定 used/ignored/misleading；`book memory feedback` 查看漏斗、低采纳记忆、零结果查询与记忆缺口
 - 📈 **性能可观察**：每次查询分段记录 cache/embed/vector/lexical/fusion/transform/fallback/graph/rerank/serialize/total，`status --performance` 汇总最近 100 次 p50/p95；固定 10k Story benchmark 与离线策略消融同时守护质量/时延
 - 🔌 **多数据源**：Claude Code 会话（主）、Cursor、Codex、Gemini CLI、Cline、JSON 文件/目录、内置模拟器
 - 🏠 **本地优先**：Profile、原始证据与数据库留在本机；embedding 默认走本地 Ollama，选择远程 API 时会明确披露文本离机；云端调用均可快速降级
@@ -185,7 +186,7 @@ flowchart TB
 | **自适应** | `adaptive.py` | 模式解析、查询规划、门控、变换融合、本地 reranker 与熔断 |
 | **生成 LLM** | `llm.py` | OpenAI / Anthropic / Ollama 协议，结构化响应 + 本地类型校验 |
 | **向量** | `embeddings.py` | 统一 embedding API（Ollama / OpenAI-compatible），维度校验与模型状态 |
-| **反馈** | `feedback.py` | `access_count` / `co_recall` 边权异步队列，单事务写回 |
+| **反馈** | `feedback.py` / `adoption.py` | 召回埋点与 `access_count` 异步队列；做梦周期离线采纳判定、共同采纳 `co_recall` 边 |
 | **启动注入** | `prime.py` | 会话启动主动召回并生成 ≤2k token 简报，静默降级 |
 | **MCP** | `mcp_server.py` | `recall` / `get_story` / `stats` / `prime_context` 四个工具，复用 `search` / `store` |
 | **Profile** | `profiles.py` | 用户级 registry、平台目录、local/isolated Profile、数据库世代指针 |
@@ -445,7 +446,7 @@ pip 失败，无法创建隔离环境），说明当前 Python 的 venv/ensurepi
 既有版本，也不会在 prefix 下留下残留 target。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh | sh -s -- --version 0.2.1
+curl -fsSL https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh | sh -s -- --version 0.3.0
 curl -fsSL https://raw.githubusercontent.com/OrcaxNet/storybook/main/install.sh | sh -s -- --prefix "$HOME/tools/storybook" --no-init
 sh ./install.sh --dry-run          # 本地安装计划，严格零写入
 ```
@@ -721,6 +722,8 @@ book admin benchmark --stories 100 --queries 6 --repeats 2 --concurrency 1
 
 分组:
   book memory list|show|forget            记忆管理
+  book memory feedback [--days N]         召回反馈漏斗与治理候选
+  book memory clean-keywords [--apply]    清理注入指令产生的噪声关键词
   book source list|enable|disable|reset   本机 Agent 历史来源
   book profile list|show|create|switch    用户级 Profile
   book admin init-db|migration|index|benchmark|eval|uninstall   低频维护

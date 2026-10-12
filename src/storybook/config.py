@@ -244,6 +244,28 @@ QUERY_FEEDBACK_QUEUE_SIZE = int(
     os.getenv("STORYBOOK_QUERY_FEEDBACK_QUEUE_SIZE", "1024")
 )
 
+# ── 召回反馈飞轮 / Recall feedback flywheel ──
+# 曝光（被返回）只计 access_count；默认不再凭"共同曝光"建 co_recall 边，
+# 避免排名靠前 -> 更常曝光 -> 边更强的自我强化。co_recall 改由做梦周期的
+# "共同采纳"判定产生。设为 1 恢复 v0.2 的曝光即强化语义。
+RECALL_EXPOSURE_REINFORCE = os.getenv(
+    "STORYBOOK_RECALL_EXPOSURE_REINFORCE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+# 记录 Agent 侧召回埋点（recall_events，仅本地库）。
+RECALL_TELEMETRY_ENABLED = os.getenv(
+    "STORYBOOK_RECALL_TELEMETRY_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+# 做梦周期对含记忆工具调用的会话做离线采纳判定（每会话至多一次生成调用）。
+ADOPTION_JUDGE_ENABLED = os.getenv(
+    "STORYBOOK_ADOPTION_JUDGE_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+# 采纳先验：Beta(1,1) 平滑的 (used+1)/(judged+2) 相对 0.5 的偏移乘以该权重，
+# 有界地调节最终 score；被判 misleading 额外扣分。未判定的 Story 保持中性。
+ADOPTION_SCORE_WEIGHT = float(os.getenv("STORYBOOK_ADOPTION_SCORE_WEIGHT", "0.06"))
+ADOPTION_MISLEADING_PENALTY = float(
+    os.getenv("STORYBOOK_ADOPTION_MISLEADING_PENALTY", "0.03")
+)
+
 # ── 自适应 Hybrid Search / Query Transformation ──
 # ``fast`` 是兼容且可预测的默认值：常态融合 vector + lexical + environment，
 # 可继续使用受预算 Memory Graph，但绝不调用生成式 LLM。``auto`` 在 fast 结果

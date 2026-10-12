@@ -544,6 +544,71 @@ def judge_split(merged_text: str) -> bool:
     return result["should_split"]
 
 
+_ADOPTION_SCHEMA = _object_schema({
+    "verdicts": {"type": "array", "items": _object_schema({
+        "story_id": {"type": "integer"},
+        "verdict": {"type": "string", "enum": ["used", "ignored", "misleading"]},
+        "reason": {"type": "string"},
+    })},
+    "missing": {"type": "string"},
+})
+
+
+def judge_recall_adoption(
+    session_content: str, recalls: list[dict]
+) -> dict | None:
+    """事后判定一段会话是否真正采纳了召回的记忆（做梦周期离线执行）。
+
+    Offline adoption judgment: the working agent is never asked to rate
+    memories; the dream cycle reads the finished transcript instead.
+
+    ``recalls``: ``[{"query", "origin", "stories": [{"story_id", "title",
+    "abstract"}]}]``.  Returns ``{"verdicts": {story_id: (verdict, reason)},
+    "missing": str}`` or None when the model output is unusable.
+    """
+
+    if not recalls:
+        return None
+    blocks = []
+    known_ids: set[int] = set()
+    for index, recall in enumerate(recalls, 1):
+        lines = [f"召回 #{index}（{recall.get('origin')}）查询：{str(recall.get('query'))[:300]}"]
+        stories = recall.get("stories") or []
+        if not stories:
+            lines.append("  （无结果）")
+        for story in stories:
+            known_ids.add(int(story["story_id"]))
+            lines.append(
+                f"  - story_id={story['story_id']} 标题：{str(story.get('title'))[:120]}"
+                f"\n    摘要：{str(story.get('abstract') or '')[:400]}"
+            )
+        blocks.append("\n".join(lines))
+    prompt = f"""你在复盘一段已完成的 AI 编程 Agent 会话。会话中 Agent 调用了记忆库，记忆库返回了下列记忆。
+请根据会话后续的实际行为判断每条记忆的作用：
+- used：会话后续确实利用了该记忆的内容（沿用了其中的命令/结论/做法、避开了其中记录的坑，或明确引用）。
+- ignored：与任务无关或未被利用；仅"看起来相关"不算 used。
+- misleading：Agent 按它行事却走了弯路，或用户/事实推翻了它（记忆过时或错误）。
+只依据会话证据，不确定时判 ignored。reason 用一句话给出证据。
+missing：若会话中需要但记忆库没有提供的历史经验，用一句话描述；否则留空字符串。
+
+{chr(10).join(blocks)}
+
+会话记录：
+{session_content[:6000]}
+
+输出 JSON 对象：{{"verdicts": [{{"story_id": 1, "verdict": "used", "reason": "..."}}], "missing": ""}}。"""
+
+    result = _structured_call(prompt, _ADOPTION_SCHEMA, num_predict=1024)
+    if result is None:
+        return None
+    verdicts = {}
+    for item in result["verdicts"]:
+        story_id = int(item["story_id"])
+        if story_id in known_ids:
+            verdicts[story_id] = (item["verdict"], item["reason"].strip())
+    return {"verdicts": verdicts, "missing": result["missing"].strip()}
+
+
 def split_story(merged_text: str) -> list[dict]:
     """将过长/过复杂的 story 拆分为多个子 story"""
     prompt = f"""请将以下技术记忆拆分为多个独立的子记忆。

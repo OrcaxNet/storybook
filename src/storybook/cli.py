@@ -1073,6 +1073,7 @@ def prime(cwd, first_prompt, top_k, token_budget, output_format):
             cwd=cwd, first_prompt=first_prompt,
             top_k=top_k, token_budget=token_budget,
             tool_type="claude_code", integration_mode="hook",
+            telemetry_origin="hook_prime",
         )
     except Exception as e:  # noqa: BLE001  -- 绝不向 hook 上下文抛错
         result = {
@@ -1619,6 +1620,64 @@ def memory_forget(half_life_days, max_access, max_edge_weight, min_age_days, app
     _memory_forget_impl(
         half_life_days, max_access, max_edge_weight, min_age_days, apply, as_json
     )
+
+
+@memory_group.command(name="feedback")
+@click.option("--days", type=click.FloatRange(min=0.01), default=30.0,
+              show_default=True, help="统计窗口（天）")
+@click.option("--limit", type=click.IntRange(min=1), default=10, show_default=True)
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
+def memory_feedback(days, limit, as_json):
+    """召回反馈漏斗：曝光 → 点击 → 采纳，以及低采纳/零结果/缺口。"""
+    store.init_db()
+    report = store.feedback_report(days=days, limit=limit)
+    if as_json:
+        click.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    f = report["funnel"]
+    pct = lambda v: "-" if v is None else f"{v * 100:.1f}%"
+    click.echo(f"\n📈 召回反馈（近 {days:g} 天）")
+    click.echo(f"  召回事件: {report['events']} {report['events_by_origin']}，"
+               f"零结果 {report['empty_events']}，已判定 {report['judged_events']}")
+    click.echo(f"  曝光 {f['exposures']} → 点击 {f['clicked']} ({pct(f['click_rate'])})"
+               f" → 判定 {f['judged']}：used {f['used']} / ignored {f['ignored']}"
+               f" / misleading {f['misleading']}（采纳率 {pct(f['adoption_rate'])}）")
+    sections = (
+        ("低采纳记忆（判定≥2 且从未采纳）", report["low_adoption"],
+         lambda r: f"#{r['story_id']} {r['title']}  judged={r['judged']} misleading={r['misleading']}"),
+        ("高采纳记忆", report["top_used"],
+         lambda r: f"#{r['story_id']} {r['title']}  used={r['used']}/{r['judged']}"),
+        ("零结果查询", report["empty_queries"],
+         lambda r: f"[{r['origin']}] x{r['n']} {r['query'][:80]}"),
+        ("记忆缺口", report["missing_notes"],
+         lambda r: f"{r['missing_note'][:120]}"),
+    )
+    for title, rows, fmt in sections:
+        if rows:
+            click.echo(f"\n  {title}:")
+            for row in rows:
+                click.echo(f"    - {fmt(row)}")
+    click.echo("")
+
+
+@memory_group.command(name="clean-keywords")
+@click.option("--apply", is_flag=True, help="执行清理并重算向量；默认仅预览")
+@click.option("--json", "as_json", is_flag=True, help="输出结构化 JSON")
+def memory_clean_keywords(apply, as_json):
+    """清理注入指令/记忆工具产生的噪声关键词（如 AGENTS.md、storybook.recall）。"""
+    store.init_db()
+    result = processor.clean_keywords(apply=apply)
+    if as_json:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    for change in result["changes"][:20]:
+        click.echo(f"  #{change['story_id']} 移除 {change['removed']}")
+    if result["stories"] > 20:
+        click.echo(f"  …… 另 {result['stories'] - 20} 条")
+    if apply:
+        click.echo(f"已清理 {result['applied']}/{result['stories']} 条 Story。")
+    else:
+        click.echo(f"共 {result['stories']} 条 Story 含噪声关键词；加 --apply 执行。")
 
 
 @cli.command(name="forget", hidden=True)

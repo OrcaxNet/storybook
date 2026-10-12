@@ -166,15 +166,21 @@ class CodexAdapter:
         return [{"code": "SB_SOURCE_CODEX_ROLLOUT", "adapter_version": self.version}]
 
 
+# Codex 注入的上下文块（不是用户请求）。较新版本的 AGENTS.md 标题不再带
+# ``for <path>``，环境类标签也可能带属性（如 ``source="ambient-ui-state"``）。
+# Injected context blocks; newer Codex omits the AGENTS.md path and adds tag attributes.
 _INJECTED_PREAMBLE = re.compile(
-    r"\A(?:<(environment_context|environment_info|recommended_plugins)>.*?</\1>"
-    r"|# AGENTS\.md instructions for [^\n]*\n.*?</INSTRUCTIONS>)\s*",
+    r"\A(?:<(environment_context|environment_info|recommended_plugins"
+    r"|in-app-browser-context|codex_apps_client_time_context)(?:\s[^>]*)?>.*?</\1>"
+    r"|# AGENTS\.md instructions(?: for [^\n]*)?\s*\n.*?</INSTRUCTIONS>"
+    r"|## My request:[ \t]*(?=\n))\s*",
     re.DOTALL,
 )
 
 
 def _user_text(text: str) -> str:
     """Remove known injected preambles, preserving a request after the block."""
+    text = text.strip()
     while match := _INJECTED_PREAMBLE.match(text):
         text = text[match.end():].strip()
     return text

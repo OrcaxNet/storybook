@@ -256,7 +256,8 @@ class TestGraphRecall:
 
 
 class TestCoRecallLifecycle:
-    def test_feedback_creates_reinforces_caps_and_decays_co_recall_edge(self):
+    def test_feedback_creates_reinforces_caps_and_decays_co_recall_edge(self, monkeypatch):
+        monkeypatch.setattr(config, "RECALL_EXPOSURE_REINFORCE", True)
         first = _seed("first", basis(0))
         second = _seed("second", basis(1))
 

@@ -303,6 +303,39 @@ CREATE TABLE IF NOT EXISTS query_state (
 );
 INSERT OR IGNORE INTO query_state(key, value) VALUES ('index_version', 1);
 
+-- 召回埋点（曝光）：每次 Agent 侧 recall / prime_context 一行。查询文本只存本地库，
+-- 与 sessions.raw_content 同等隐私级别；性能 jsonl 仍保持无内容白名单。
+-- Recall exposure log. One row per agent-facing recall; joined to later
+-- Sessions by time window + workspace fingerprint during the dream cycle.
+CREATE TABLE IF NOT EXISTS recall_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL UNIQUE,
+    origin TEXT NOT NULL,
+    query TEXT NOT NULL,
+    workspace_path_hash TEXT,
+    result_state TEXT,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    judged_session_id INTEGER,
+    judged_at TEXT,
+    missing_note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recall_events_created ON recall_events(created_at);
+
+-- 漏斗：exposure -> clicked(get_story) -> verdict(做梦周期判定 used/ignored/misleading)。
+CREATE TABLE IF NOT EXISTS recall_exposures (
+    event_id INTEGER NOT NULL,
+    story_id INTEGER NOT NULL,
+    rank INTEGER NOT NULL,
+    score REAL,
+    clicked_at TEXT,
+    verdict TEXT CHECK(verdict IS NULL OR verdict IN ('used', 'ignored', 'misleading')),
+    reason TEXT,
+    PRIMARY KEY (event_id, story_id),
+    FOREIGN KEY (event_id) REFERENCES recall_events(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_recall_exposures_story ON recall_exposures(story_id);
+
 -- Durable idempotency/audit record for v1 -> v2 database generations.
 CREATE TABLE IF NOT EXISTS migration_history (
     migration_id TEXT PRIMARY KEY,
@@ -2964,7 +2997,8 @@ def increment_access_count(story_id: int):
 
 
 def apply_recall_feedback(
-    story_ids: list[int], *, db_path: str | Path | None = None
+    story_ids: list[int], *, db_path: str | Path | None = None,
+    reinforce_edges: bool | None = None,
 ) -> None:
     """单事务写入一次召回的访问计数与共同召回边权反馈。
 
@@ -3000,7 +3034,11 @@ def apply_recall_feedback(
                WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL""",
             [(story_id,) for story_id in unique_ids],
         )
-        for source_id, target_id in combinations(sorted(unique_ids), 2):
+        if reinforce_edges is None:
+            reinforce_edges = config.RECALL_EXPOSURE_REINFORCE
+        # v0.3：曝光默认只计访问；边权学习改由做梦周期的采纳判定驱动。
+        pairs = combinations(sorted(unique_ids), 2) if reinforce_edges else ()
+        for source_id, target_id in pairs:
             now = datetime.now(UTC).isoformat()
             db.execute(
                 """UPDATE edges
@@ -3047,6 +3085,380 @@ def apply_recall_feedback(
         db.commit()
     finally:
         db.close()
+
+
+# ═══════════════════════════════════════════════
+#  召回埋点与采纳反馈 / Recall telemetry and adoption feedback
+# ═══════════════════════════════════════════════
+
+RECALL_VERDICTS = ("used", "ignored", "misleading")
+
+
+def record_recall_event(
+    *,
+    request_id: str,
+    origin: str,
+    query: str,
+    exposures: list[tuple[int, int, float | None]],
+    workspace_path_hash: str | None = None,
+    result_state: str | None = None,
+    created_at: str | None = None,
+    db_path: str | Path | None = None,
+) -> int | None:
+    """Persist one agent-facing recall and its ranked exposures.
+
+    ``exposures`` holds ``(story_id, rank, score)``.  Idempotent on
+    ``request_id``; returns the event row id.
+    """
+
+    created_at = created_at or datetime.now(UTC).isoformat()
+    db = get_db(db_path, load_vector_extension=False)
+    try:
+        cursor = db.execute(
+            """INSERT INTO recall_events (
+                   request_id, origin, query, workspace_path_hash,
+                   result_state, result_count, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(request_id) DO NOTHING""",
+            (
+                request_id, origin, query[:2000], workspace_path_hash,
+                result_state, len(exposures), created_at,
+            ),
+        )
+        if cursor.rowcount == 0:
+            return None
+        event_id = int(cursor.lastrowid)
+        db.executemany(
+            """INSERT OR IGNORE INTO recall_exposures(event_id, story_id, rank, score)
+               VALUES (?, ?, ?, ?)""",
+            [(event_id, int(sid), int(rank), score) for sid, rank, score in exposures],
+        )
+        db.commit()
+        return event_id
+    finally:
+        db.close()
+
+
+def record_story_click(
+    story_id: int,
+    *,
+    window_hours: float = 6.0,
+    now: datetime | None = None,
+    db_path: str | Path | None = None,
+) -> bool:
+    """Mark the most recent exposure of ``story_id`` as clicked (get_story).
+
+    Returns False when the Story was not exposed within ``window_hours`` --
+    a direct lookup without a preceding recall is not a click-through.
+    """
+
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    since = (now - timedelta(hours=window_hours)).isoformat()
+    db = get_db(db_path, load_vector_extension=False)
+    try:
+        row = db.execute(
+            """SELECT x.event_id FROM recall_exposures x
+               JOIN recall_events e ON e.id = x.event_id
+               WHERE x.story_id = ? AND e.created_at >= ?
+               ORDER BY e.created_at DESC LIMIT 1""",
+            (int(story_id), since),
+        ).fetchone()
+        if row is None:
+            return False
+        db.execute(
+            """UPDATE recall_exposures SET clicked_at = COALESCE(clicked_at, ?)
+               WHERE event_id = ? AND story_id = ?""",
+            (now.isoformat(), row["event_id"], int(story_id)),
+        )
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def unjudged_recall_events(
+    *,
+    start: str,
+    end: str,
+    workspace_path_hash: str | None = None,
+    db_path: str | Path | None = None,
+) -> list[dict]:
+    """Recall events in ``[start, end]`` not yet judged, with exposed Stories.
+
+    A workspace hash narrows the match when both sides know it; events without
+    a workspace (plain ``recall``) match on time alone.
+    """
+
+    db = get_db(db_path, load_vector_extension=False)
+    try:
+        rows = db.execute(
+            """SELECT * FROM recall_events
+               WHERE judged_at IS NULL AND created_at >= ? AND created_at <= ?
+                 AND (? IS NULL OR workspace_path_hash IS NULL
+                      OR workspace_path_hash = ?)
+               ORDER BY created_at""",
+            (start, end, workspace_path_hash, workspace_path_hash),
+        ).fetchall()
+        events = []
+        for row in rows:
+            exposures = db.execute(
+                """SELECT x.story_id, x.rank, x.score, x.clicked_at,
+                          s.title, s.abstract, s.content
+                   FROM recall_exposures x JOIN stories s ON s.id = x.story_id
+                   WHERE x.event_id = ? ORDER BY x.rank""",
+                (row["id"],),
+            ).fetchall()
+            events.append({**dict(row), "exposures": [dict(x) for x in exposures]})
+        return events
+    finally:
+        db.close()
+
+
+def apply_recall_verdicts(
+    event_id: int,
+    session_id: int,
+    verdicts: dict[int, tuple[str, str]],
+    *,
+    missing_note: str | None = None,
+    db_path: str | Path | None = None,
+) -> None:
+    """Write adoption verdicts for one event and learn from co-adoption.
+
+    Stories judged ``used`` together in one recall form/strengthen a
+    ``co_recall`` edge -- co-adoption, not mere co-exposure.
+    """
+
+    now = datetime.now(UTC).isoformat()
+    db = get_db(db_path, load_vector_extension=False)
+    try:
+        for story_id, (verdict, reason) in verdicts.items():
+            if verdict not in RECALL_VERDICTS:
+                continue
+            db.execute(
+                """UPDATE recall_exposures SET verdict = ?, reason = ?
+                   WHERE event_id = ? AND story_id = ?""",
+                (verdict, (reason or "")[:500], event_id, int(story_id)),
+            )
+        db.execute(
+            """UPDATE recall_events
+               SET judged_session_id = ?, judged_at = ?, missing_note = ?
+               WHERE id = ?""",
+            (session_id, now, (missing_note or None) and missing_note[:500], event_id),
+        )
+        used = sorted(int(s) for s, (v, _r) in verdicts.items() if v == "used")
+        for source_id, target_id in combinations(used, 2):
+            _reinforce_co_recall(db, source_id, target_id, now, method="co_adoption")
+        db.commit()
+    finally:
+        db.close()
+
+
+def _reinforce_co_recall(
+    db: sqlite3.Connection, source_id: int, target_id: int, now: str, *, method: str
+) -> None:
+    db.execute(
+        """INSERT INTO edges (
+               global_id, profile_id, sync_state, source_id, target_id,
+               weight, edge_type, directed, provenance_json, version,
+               observations, last_reinforced_at, updated_at
+           ) VALUES (?, ?, 'local_only', ?, ?, ?, 'co_recall', 0, ?, 1, 1, ?, ?)
+           ON CONFLICT(source_id, target_id, edge_type) DO UPDATE SET
+               weight = MIN(edges.weight + excluded.weight, ?),
+               observations = edges.observations + 1,
+               version = edges.version + 1,
+               last_reinforced_at = excluded.last_reinforced_at,
+               updated_at = excluded.updated_at,
+               deleted_at = NULL""",
+        (
+            _new_global_id(), config.PROFILE_ID, source_id, target_id,
+            min(config.WEIGHT_INCREMENT, config.WEIGHT_MAX),
+            json.dumps({"source": "recall_feedback", "method": method}, sort_keys=True),
+            now, now, config.WEIGHT_MAX,
+        ),
+    )
+
+
+def get_adoption_stats(
+    story_ids: list[int], *, db_path: str | Path | None = None
+) -> dict[int, dict]:
+    """Judged exposure counts per Story: ``{id: {judged, used, misleading}}``."""
+
+    ids = list(dict.fromkeys(int(s) for s in story_ids))
+    if not ids:
+        return {}
+    db = get_db(db_path, load_vector_extension=False)
+    try:
+        placeholders = ",".join("?" for _ in ids)
+        rows = db.execute(
+            f"""SELECT story_id,
+                       COUNT(verdict) AS judged,
+                       SUM(verdict = 'used') AS used,
+                       SUM(verdict = 'misleading') AS misleading
+                FROM recall_exposures
+                WHERE story_id IN ({placeholders})
+                GROUP BY story_id""",
+            ids,
+        ).fetchall()
+        return {
+            int(r["story_id"]): {
+                "judged": int(r["judged"] or 0),
+                "used": int(r["used"] or 0),
+                "misleading": int(r["misleading"] or 0),
+            }
+            for r in rows
+        }
+    except sqlite3.OperationalError:
+        # 迁移中的旧库尚无埋点表：采纳先验退化为中性。
+        return {}
+    finally:
+        db.close()
+
+
+def feedback_report(
+    *, days: float = 30.0, limit: int = 10, now: datetime | None = None,
+    db_path: str | Path | None = None,
+) -> dict:
+    """Funnel and governance candidates over the last ``days``."""
+
+    now = (now or datetime.now(UTC)).astimezone(UTC)
+    since = (now - timedelta(days=days)).isoformat()
+    db = get_db(db_path, load_vector_extension=False)
+    try:
+        events = db.execute(
+            """SELECT COUNT(*) AS events,
+                      SUM(result_count = 0) AS empty,
+                      SUM(judged_at IS NOT NULL) AS judged
+               FROM recall_events WHERE created_at >= ?""",
+            (since,),
+        ).fetchone()
+        by_origin = {
+            r["origin"]: int(r["n"])
+            for r in db.execute(
+                """SELECT origin, COUNT(*) AS n FROM recall_events
+                   WHERE created_at >= ? GROUP BY origin""",
+                (since,),
+            )
+        }
+        funnel = db.execute(
+            """SELECT COUNT(*) AS exposures,
+                      SUM(x.clicked_at IS NOT NULL) AS clicked,
+                      SUM(x.verdict IS NOT NULL) AS judged,
+                      SUM(x.verdict = 'used') AS used,
+                      SUM(x.verdict = 'ignored') AS ignored,
+                      SUM(x.verdict = 'misleading') AS misleading
+               FROM recall_exposures x JOIN recall_events e ON e.id = x.event_id
+               WHERE e.created_at >= ?""",
+            (since,),
+        ).fetchone()
+        low_adoption = [
+            dict(r) for r in db.execute(
+                """SELECT x.story_id, s.title,
+                          COUNT(*) AS exposures,
+                          SUM(x.verdict IS NOT NULL) AS judged,
+                          SUM(x.verdict = 'used') AS used,
+                          SUM(x.verdict = 'misleading') AS misleading
+                   FROM recall_exposures x
+                   JOIN recall_events e ON e.id = x.event_id
+                   JOIN stories s ON s.id = x.story_id
+                   WHERE e.created_at >= ? AND s.deleted_at IS NULL
+                   GROUP BY x.story_id
+                   HAVING judged >= 2 AND used = 0
+                   ORDER BY misleading DESC, judged DESC LIMIT ?""",
+                (since, limit),
+            )
+        ]
+        top_used = [
+            dict(r) for r in db.execute(
+                """SELECT x.story_id, s.title,
+                          SUM(x.verdict = 'used') AS used,
+                          SUM(x.verdict IS NOT NULL) AS judged
+                   FROM recall_exposures x
+                   JOIN recall_events e ON e.id = x.event_id
+                   JOIN stories s ON s.id = x.story_id
+                   WHERE e.created_at >= ? AND s.deleted_at IS NULL
+                   GROUP BY x.story_id HAVING used > 0
+                   ORDER BY used DESC, judged ASC LIMIT ?""",
+                (since, limit),
+            )
+        ]
+        empty_queries = [
+            dict(r) for r in db.execute(
+                """SELECT query, origin, COUNT(*) AS n, MAX(created_at) AS last_seen
+                   FROM recall_events
+                   WHERE created_at >= ? AND result_count = 0
+                   GROUP BY query ORDER BY n DESC, last_seen DESC LIMIT ?""",
+                (since, limit),
+            )
+        ]
+        missing = [
+            dict(r) for r in db.execute(
+                """SELECT missing_note, query, created_at FROM recall_events
+                   WHERE created_at >= ? AND missing_note IS NOT NULL
+                   ORDER BY created_at DESC LIMIT ?""",
+                (since, limit),
+            )
+        ]
+    finally:
+        db.close()
+
+    def _int(value) -> int:
+        return int(value or 0)
+
+    exposures = _int(funnel["exposures"])
+    judged = _int(funnel["judged"])
+    used = _int(funnel["used"])
+    return {
+        "window_days": days,
+        "events": _int(events["events"]),
+        "events_by_origin": by_origin,
+        "empty_events": _int(events["empty"]),
+        "judged_events": _int(events["judged"]),
+        "funnel": {
+            "exposures": exposures,
+            "clicked": _int(funnel["clicked"]),
+            "judged": judged,
+            "used": used,
+            "ignored": _int(funnel["ignored"]),
+            "misleading": _int(funnel["misleading"]),
+            "click_rate": round(_int(funnel["clicked"]) / exposures, 4) if exposures else None,
+            "adoption_rate": round(used / judged, 4) if judged else None,
+        },
+        "low_adoption": low_adoption,
+        "top_used": top_used,
+        "empty_queries": empty_queries,
+        "missing_notes": missing,
+    }
+
+
+def plan_keyword_cleanup() -> dict:
+    """Plan removal of injected-instruction noise keywords from active Stories.
+
+    Read-only; ``processor.clean_keywords`` applies the plan with re-embedding
+    so the BLOB and vec0 rows stay in sync.
+    """
+
+    db = get_db(load_vector_extension=False)
+    try:
+        rows = db.execute(
+            """SELECT id, keywords FROM stories
+               WHERE deleted_at IS NULL AND archived_at IS NULL"""
+        ).fetchall()
+    finally:
+        db.close()
+    changed: list[dict] = []
+    for row in rows:
+        try:
+            keywords = json.loads(row["keywords"] or "[]")
+        except (TypeError, ValueError):
+            continue
+        cleaned = story_v2.clean_keywords(keywords)
+        if cleaned != story_v2._string_list(keywords):
+            changed.append({
+                "story_id": int(row["id"]),
+                "removed": [k for k in keywords if k not in cleaned],
+                "keywords": cleaned,
+            })
+    return {"stories": len(changed), "changes": changed}
 
 
 def decay_story_access_counts(
