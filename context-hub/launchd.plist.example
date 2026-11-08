@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.contexthub.pilot</string>
+  <key>ProgramArguments</key><array>
+    <string>/REPLACE/context-hub/.venv/bin/context-hub</string>
+    <string>serve</string><string>--data</string><string>/REPLACE/private/ContextHub-pilot</string>
+    <string>--port</string><string>7341</string>
+  </array>
+  <key>WorkingDirectory</key><string>/REPLACE/context-hub</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>/REPLACE/private/logs/context-hub.out.log</string>
+  <key>StandardErrorPath</key><string>/REPLACE/private/logs/context-hub.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,3 @@
+include README.md VALIDATION.md launchd.plist.example uv.lock .python-version
+recursive-include scripts *.py
+recursive-include tests *.py
