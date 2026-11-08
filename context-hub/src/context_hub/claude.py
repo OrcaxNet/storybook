@@ -44,7 +44,9 @@ def verified_source(root, session_id):
         raise HubError("SOURCE_SIZE_UNVERIFIED_OR_TOO_LARGE", 413)
     proved = set()
     try:
-        for line in raw.decode("utf-8").splitlines():
+        # JSONL records end at LF (CRLF is valid JSON whitespace). Unicode line
+        # separators inside JSON strings are content, not record boundaries.
+        for line in raw.decode("utf-8").split("\n"):
             if not line.strip():
                 continue
             entry = json.loads(line)

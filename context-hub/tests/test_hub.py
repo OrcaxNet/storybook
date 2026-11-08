@@ -98,6 +98,40 @@ class HubTest(unittest.TestCase):
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "synthetic-claude")}):
             self.error("SESSION_NOT_IN_APPROVED_ROOT", collect, self.root, sid)
 
+    def test_jsonl_unicode_content_and_record_endings_roundtrip(self):
+        from claude_agent_sdk import get_session_messages
+        for separator in ["\u0085", "\u2028", "\u2029"]:
+            for ending in [b"\n", b"\r\n"]:
+                with self.subTest(codepoint=f"U+{ord(separator):04X}", ending=ending):
+                    contents = ["合法正文" + separator + "后半段证据", "第二条记录\n转义换行\r\n及制表符\t保留"]
+                    sid, path = self.transcript(self.root, contents[0])
+                    first = json.loads(path.read_text())
+                    second = {**first, "uuid": str(uuid.uuid4()), "parentUuid": first["uuid"],
+                              "type": "assistant", "message": {"role": "assistant", "content": contents[1]}}
+                    raw = ending.join(json.dumps(row, ensure_ascii=False).encode() for row in [first, second]) + ending
+                    path.write_bytes(raw)
+                    with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "synthetic-claude")}):
+                        native = get_session_messages(sid, directory=str(self.root))
+                        self.assertEqual([item.message["content"] for item in native], contents)
+                        snapshot = collect(self.root, sid)
+                    self.assertEqual([m["text"] for m in snapshot["messages"]], contents)
+                    receipt = self.upload(snapshot)
+                    self.assertEqual(receipt["added"], 2)
+                    refs = [r[0] for r in self.store.db.execute(
+                        "SELECT id FROM evidence WHERE session=? ORDER BY position", (receipt["session_ref"],))]
+                    self.assertEqual([self.call("evidence", id=ref)["text"] for ref in refs], contents)
+                    self.assertEqual(path.read_bytes(), raw)
+
+    def test_jsonl_invalid_records_remain_rejected(self):
+        for invalid in [b'{"type":', b'{"message":"unescaped\nnewline"}', b'{"a":1}\r{"b":2}']:
+            with self.subTest(invalid=invalid):
+                sid, path = self.transcript(self.root, "valid first record")
+                with path.open("ab") as output:
+                    output.write(invalid + b"\n")
+                with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "synthetic-claude")}):
+                    self.error("SOURCE_METADATA_INVALID", collect, self.root, sid)
+        self.assertEqual(self.call("sessions")["items"], [])
+
     def test_real_sdk_source_change_rejected_even_with_same_size_and_mtime(self):
         from claude_agent_sdk import get_session_messages
         sid, path = self.transcript(self.root, "original text")
