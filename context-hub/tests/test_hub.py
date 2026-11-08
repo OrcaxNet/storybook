@@ -8,9 +8,11 @@ import asyncio
 import os
 import subprocess
 import sys
+import uuid
 from unittest.mock import patch
 
-from context_hub.claude import visible_text, collect
+from context_hub.claude import visible_text, collect, upload
+from claude_agent_sdk._internal.sessions import project_key_for_directory
 from context_hub.store import Store, HubError, write_private
 from context_hub.transport import Server, Client
 
@@ -47,6 +49,172 @@ class HubTest(unittest.TestCase):
     def memory(self, ref, text="先查询请求日志，不关闭校验。"):
         return self.call("propose", text=text, scope="p / test only", evidence_ids=[ref],
                          expected_revision=self.revision())["memory_id"]
+
+    def transcript(self, root, text, cwd=True):
+        sid = str(uuid.uuid4())
+        directory = self.root / "synthetic-claude" / "projects" / project_key_for_directory(root)
+        directory.mkdir(parents=True, exist_ok=True)
+        entry = {"type": "user", "uuid": str(uuid.uuid4()), "parentUuid": None,
+                 "sessionId": sid, "timestamp": "2026-11-09T00:00:00.000Z",
+                 "message": {"role": "user", "content": text}}
+        if cwd:
+            entry["cwd"] = str(root)
+        path = directory / (sid + ".jsonl")
+        path.write_text(json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8")
+        return sid, path
+
+    def snapshot(self, text):
+        sid, _ = self.transcript(self.root, text)
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "synthetic-claude")}):
+            return collect(self.root, sid)
+
+    def upload(self, snapshot):
+        test = self
+        class LocalClient:
+            def call(self, op, args):
+                return test.call(op, **args)
+        return upload(LocalClient(), "p", snapshot)
+
+    def test_real_sdk_rejects_unproven_and_colliding_project_ownership(self):
+        approved, other = self.root / "a-b", self.root / "a" / "b"
+        approved.mkdir()
+        other.mkdir(parents=True)
+        self.assertEqual(project_key_for_directory(approved), project_key_for_directory(other))
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "synthetic-claude")}):
+            missing, _ = self.transcript(other, "OTHER_PROJECT_MARKER", cwd=False)
+            self.error("SOURCE_OWNERSHIP_UNVERIFIED", collect, approved, missing)
+            mismatch, _ = self.transcript(other, "OTHER_PROJECT_MARKER")
+            self.error("SESSION_NOT_IN_APPROVED_ROOT", collect, approved, mismatch)
+            normal, _ = self.transcript(approved, "approved text")
+            self.assertEqual(collect(approved, normal)["messages"][0]["text"], "approved text")
+            self.assertEqual(self.call("sessions")["items"], [])
+
+    def test_real_sdk_checks_all_recorded_cwds_not_just_first(self):
+        sid, path = self.transcript(self.root, "approved text")
+        other = self.root / "other"
+        other.mkdir()
+        with path.open("a") as output:
+            output.write(json.dumps({"type": "system", "cwd": str(other)}) + "\n")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "synthetic-claude")}):
+            self.error("SESSION_NOT_IN_APPROVED_ROOT", collect, self.root, sid)
+
+    def test_real_sdk_source_change_rejected_even_with_same_size_and_mtime(self):
+        from claude_agent_sdk import get_session_messages
+        sid, path = self.transcript(self.root, "original text")
+        stat = path.stat()
+        def changed(*args, **kwargs):
+            result = get_session_messages(*args, **kwargs)
+            path.write_text(path.read_text().replace("original text", "modified text"))
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            return result
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "synthetic-claude")}), \
+                patch("context_hub.claude.get_session_messages", side_effect=changed):
+            self.error("SOURCE_CHANGED_RETRY", collect, self.root, sid)
+
+    def test_real_sdk_boundary_queries_have_readable_traceable_evidence(self):
+        for original, query in [("甲" * 19999 + "超时" + "乙" * 20, "超时"),
+                                ("x" * 59995 + " ERR_TIMEOUT tail", "ERR_TIMEOUT")]:
+            with self.subTest(query=query):
+                snapshot = self.snapshot(original)
+                self.assertGreater(len(snapshot["messages"]), 1)
+                reconstructed = bytearray(len(original.encode()))
+                for message in snapshot["messages"]:
+                    span = message["source_span"]
+                    self.assertLessEqual(len(message["text"].encode()), 60000)
+                    self.assertEqual(original.encode()[span["start"]:span["end"]], message["text"].encode())
+                    reconstructed[span["start"]:span["end"]] = message["text"].encode()
+                self.assertEqual(reconstructed.decode(), original)
+                self.upload(snapshot)
+                hits = self.call("context", query=query, budget_tokens=6000)["items"]
+                self.assertTrue(hits)
+                for hit in hits:
+                    source = self.call("evidence", id=hit["id"], limit_bytes=65536)
+                    self.assertIn(query, source["text"])
+                    span = source["source_span"]
+                    self.assertEqual(original.encode()[span["start"]:span["end"]].decode(), source["text"])
+                session = self.upload(snapshot)["session_ref"]
+                refs = [r[0] for r in self.store.db.execute("SELECT id FROM evidence WHERE session=? ORDER BY position", (session,))]
+                memory = self.memory(refs[0], "withdraw this source")
+                derivative = self.memory(refs[1], "overlap derivative")
+                self.call("confirm", id=derivative, reason="test", expected_revision=self.revision())
+                self.call("retract", id=memory, reason="wrong scope", expected_revision=self.revision())
+                self.upload(snapshot)  # replay must not revive any overlapping chunk
+                self.assertEqual(self.call("context", query=query, budget_tokens=6000)["items"], [])
+                self.assertEqual(self.call("context", query="derivative", budget_tokens=6000)["items"], [])
+                self.assertTrue(all(not self.call("evidence", id=ref)["current"] for ref in refs))
+
+    def test_late_chunk_upload_inherits_source_message_withdrawal(self):
+        snapshot = self.snapshot("甲" * 19999 + "超时" + "乙" * 20)
+        self.upload({**snapshot, "messages": snapshot["messages"][:1]})
+        ref = self.store.db.execute("SELECT id FROM evidence").fetchone()[0]
+        memory = self.memory(ref)
+        self.call("retract", id=memory, reason="withdraw before final upload", expected_revision=self.revision())
+        self.upload(snapshot)
+        self.assertEqual(self.call("context", query="超时", budget_tokens=6000)["items"], [])
+
+    def test_memory_wording_is_searchable_only_after_confirmation(self):
+        ref = self.ingest("Enable keepalive.")["accepted_ids"][0]
+        mid = self.memory(ref, "网关超时处理：启用连接保活。")
+        for op in ["context", "recall"]:
+            self.assertEqual(self.call(op, query="网关超时", budget_tokens=6000)["items"], [])
+        self.call("confirm", id=mid, reason="owner checked", expected_revision=self.revision())
+        for op in ["context", "recall"]:
+            hit = self.call(op, query="网关超时", budget_tokens=6000)["items"]
+            self.assertEqual([item["id"] for item in hit], [mid])
+            self.assertEqual(hit[0]["evidence_ids"], [ref])
+        both = self.call("context", query="网关超时 keepalive", budget_tokens=6000)
+        self.assertEqual(sum(item["id"] == mid for item in both["items"]), 1)
+        self.call("retract", id=mid, reason="incorrect", expected_revision=self.revision())
+        self.assertEqual(self.call("context", query="网关超时", budget_tokens=6000)["items"], [])
+
+    def test_memory_wording_respects_project_and_all_source_permissions(self):
+        first, second = self.ingest("keepalive"), self.ingest("backoff", session="s2")
+        mid = self.call("propose", text="独有结论", scope="p", evidence_ids=first["accepted_ids"] + second["accepted_ids"],
+                        expected_revision=self.revision())["memory_id"]
+        self.call("confirm", id=mid, reason="owner checked", expected_revision=self.revision())
+        self.call("project", project="other", root=str(self.root))
+        grant = self.call("grant", project="other", consumer="other-reader")
+        self.assertEqual(self.store.dispatch(grant["token"], "context", {"project": "other", "query": "独有结论"})["items"], [])
+        self.error("FORBIDDEN", self.store.dispatch, grant["token"], "context", {"project": "p", "query": "独有结论"})
+        self.call("revoke_source", session_ref=second["session_ref"], reason="access removed", expected_revision=self.revision())
+        self.assertEqual(self.call("context", query="独有结论", budget_tokens=6000)["items"], [])
+        # Defense in depth: even a stale active row cannot bypass dependency gates.
+        with self.store.db:
+            self.store.db.execute("UPDATE memories SET status='active' WHERE id=?", (mid,))
+        self.assertEqual(self.call("context", query="独有结论", budget_tokens=6000)["items"], [])
+
+    def test_schema_one_upgrade_indexes_active_memory_and_preserves_tombstones(self):
+        ref = self.ingest("keepalive")["accepted_ids"][0]
+        active = self.memory(ref, "迁移可搜索")
+        self.call("confirm", id=active, reason="owner checked", expected_revision=self.revision())
+        old_ref = self.ingest("withdrawn", session="old")["accepted_ids"][0]
+        old = self.memory(old_ref, "撤回不可搜索")
+        self.call("retract", id=old, reason="withdrawn", expected_revision=self.revision())
+        # Recreate the previous schema using existing real records and credentials.
+        with self.store.db:
+            self.store.db.execute("DROP TABLE memory_fts")
+            self.store.db.execute("DROP TABLE evidence_spans")
+            self.store.db.execute("PRAGMA user_version=1")
+        self.store.close()
+        with patch("context_hub.store.terms", side_effect=RuntimeError("interrupted index backfill")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted index backfill"):
+                Store(self.data)
+        import sqlite3
+        check = sqlite3.connect(self.data / "hub.sqlite")
+        try:
+            self.assertEqual(check.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertFalse(check.execute("SELECT name FROM sqlite_master WHERE name='memory_fts'").fetchall())
+        finally:
+            check.close()
+        self.store = Store(self.data)
+        self.assertEqual(self.call("status")["schema"], 2)
+        self.assertEqual(self.call("context", query="迁移", budget_tokens=6000)["items"][0]["id"], active)
+        self.assertEqual(self.call("context", query="撤回", budget_tokens=6000)["items"], [])
+        self.assertFalse(self.call("evidence", id=old_ref)["current"])
+        self.assertIsNone(self.call("evidence", id=ref)["source_span"])
+        self.store.close()
+        self.store = Store(self.data)
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM memory_fts WHERE id=?", (active,)).fetchone()[0], 1)
 
     def test_evidence_utf8_pagination_hash_and_midpoint(self):
         text = "头" * 4000 + "关键中段：ECONNRESET 用连接池退避" + "尾" * 4000

@@ -80,6 +80,13 @@ CREATE TABLE changes(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL
 PRAGMA user_version=1;
 """
 
+SCHEMA_V2 = [
+    "CREATE VIRTUAL TABLE memory_fts USING fts5(id UNINDEXED, words, tokenize='unicode61')",
+    "CREATE TABLE evidence_spans(evidence TEXT PRIMARY KEY REFERENCES evidence(id), "
+    "message TEXT NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL)",
+    "CREATE INDEX evidence_spans_message ON evidence_spans(message)",
+]
+
 
 class Store:
     def __init__(self, directory: Path):
@@ -94,7 +101,22 @@ class Store:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA synchronous=FULL")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] != 1:
+        schema = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if schema == 1:
+            # Atomic upgrade: existing evidence/credentials/tombstones are preserved.
+            try:
+                with self.db:
+                    self.db.execute("BEGIN IMMEDIATE")
+                    for statement in SCHEMA_V2:
+                        self.db.execute(statement)
+                    self.db.executemany("INSERT INTO memory_fts VALUES (?,?)", [
+                        (m["id"], " ".join(terms(m["text"]))) for m in
+                        self.db.execute("SELECT id,text FROM memories WHERE status='active'")])
+                    self.db.execute("PRAGMA user_version=2")
+            except Exception:
+                self.db.close()
+                raise
+        elif schema != 2:
             self.db.close()
             raise HubError("UNSUPPORTED_SCHEMA")
 
@@ -152,7 +174,7 @@ class Store:
                 raise HubError("AS_OF_UNAVAILABLE", 422)
             if operation == "status":
                 result = {"project": project, "revision": p["revision"], "model_egress": "disabled",
-                          "consumer": auth["consumer"], "schema": 1, "sqlite": sqlite3.sqlite_version}
+                          "consumer": auth["consumer"], "schema": 2, "sqlite": sqlite3.sqlite_version}
                 if auth["role"] == "admin":
                     result["capture_root"] = p["root"]
                 return result
@@ -237,16 +259,35 @@ class Store:
             if type(position) is not int or not 0 <= position <= 1_000_000_000:
                 raise HubError("INVALID_POSITION")
             text, changed = redact(bounded(m.get("text", "")))
+            span = m.get("source_span")
+            if span is not None:
+                if (not isinstance(span, dict) or set(span) != {"message", "start", "end"}
+                        or type(span["start"]) is not int or type(span["end"]) is not int
+                        or not 0 <= span["start"] < span["end"] <= 10 * 1024 * 1024
+                        or span["end"] - span["start"] != len(text.encode())):
+                    raise HubError("INVALID_SOURCE_SPAN")
+                identifier(span["message"])
             eid = digest(session + ":" + mid)
             h = digest(text)
             prior = self.db.execute("SELECT * FROM evidence WHERE id=?", (eid,)).fetchone()
             if prior:
                 if (prior["hash"], prior["role"], prior["position"]) != (h, role, position):
                     raise HubError("EVENT_ID_CONFLICT", 409)
+                stored = self.db.execute("SELECT message,start,end FROM evidence_spans WHERE evidence=?", (eid,)).fetchone()
+                if (dict(stored) if stored else None) != span:
+                    raise HubError("EVENT_ID_CONFLICT", 409)
             else:
                 self.db.execute("INSERT INTO evidence VALUES (?,?,?,?,?,?,?,?,1)",
                                 (eid, session, mid, position, role, text, h, int(changed or m.get("redacted") is True)))
                 self.db.execute("INSERT INTO evidence_fts(id,words) VALUES (?,?)", (eid, " ".join(terms(text))))
+                if span:
+                    self.db.execute("INSERT INTO evidence_spans VALUES (?,?,?,?)",
+                                    (eid, span["message"], span["start"], span["end"]))
+                    # A later upload batch cannot resurrect a withdrawn source message.
+                    if self.db.execute("SELECT 1 FROM evidence e JOIN evidence_spans x ON x.evidence=e.id "
+                                       "WHERE e.session=? AND x.message=? AND e.current=0",
+                                       (session, span["message"])).fetchone():
+                        self.db.execute("UPDATE evidence SET current=0 WHERE id=?", (eid,))
                 added += 1
             ids.append(eid)
         self.db.execute("UPDATE sessions SET coverage=?,source_version=?,imported_at=? WHERE id=?",
@@ -298,7 +339,9 @@ class Store:
                                  "ORDER BY position DESC,id DESC LIMIT ?", (row["session"], row["position"], around)).fetchall()
         after = self.db.execute("SELECT id,role,current,hash FROM evidence WHERE session=? AND position>? "
                                 "ORDER BY position,id LIMIT ?", (row["session"], row["position"], around)).fetchall()
+        span = self.db.execute("SELECT message,start,end FROM evidence_spans WHERE evidence=?", (row["id"],)).fetchone()
         return {"id": row["id"], "session_ref": row["session"], "native_id": row["native_id"],
+                "source_span": dict(span) if span else None,
                 "text": part, "range": [offset, end], "next_cursor": end if end < len(raw) else None,
                 "content_hash": row["hash"], "source_version": row["source_version"], "role": row["role"],
                 "redacted": bool(row["redacted"]), "current": bool(row["current"]),
@@ -334,12 +377,22 @@ class Store:
             # Manual attestation is explicit. It never claims automatic fact verification.
             reason = bounded(a.get("reason", ""), 1000)
             self.db.execute("UPDATE memories SET status='active',authority='owner_confirmed',revision=revision+1 WHERE id=?", (mid,))
+            self.db.execute("INSERT INTO memory_fts VALUES (?,?)", (mid, " ".join(terms(m["text"]))))
         else:
             if m["status"] not in {"candidate", "active"}:
                 raise HubError("INVALID_TRANSITION", 409)
             reason = bounded(a.get("reason", ""), 1000)
-            # Fail closed: suppress original source snippets from current recall too.
+            # Overlapping chunks share one source message. Withdraw the whole group
+            # so adjacent chunks cannot leak withdrawn text through their overlap.
+            related = set(refs)
             for ref in refs:
+                related.update(r[0] for r in self.db.execute(
+                    "SELECT other.evidence FROM evidence_spans own JOIN evidence e ON e.id=own.evidence "
+                    "JOIN evidence_spans other ON other.message=own.message "
+                    "JOIN evidence sibling ON sibling.id=other.evidence AND sibling.session=e.session "
+                    "WHERE own.evidence=?", (ref,)))
+            # Fail closed: suppress original source snippets from current recall too.
+            for ref in related:
                 self.db.execute("UPDATE evidence SET current=0 WHERE id=?", (ref,))
                 self.db.execute("UPDATE memories SET status='invalid',revision=revision+1 WHERE id IN "
                                 "(SELECT memory FROM dependencies WHERE evidence=?) AND status IN ('candidate','active')", (ref,))
@@ -369,21 +422,36 @@ class Store:
                                "WHERE evidence_fts MATCH ? AND s.project=? AND s.active=1 AND e.current=1 "
                                "ORDER BY score,e.id LIMIT 100", (match, p["id"])).fetchall()
         items, seen, excluded = [], set(), []
+        memories = self.db.execute(
+            "SELECT m.* FROM memory_fts JOIN memories m ON m.id=memory_fts.id "
+            "WHERE memory_fts MATCH ? AND m.project=? AND m.status='active' "
+            "ORDER BY bm25(memory_fts),m.id LIMIT 100", (match, p["id"])).fetchall()
+
+        def append_memory(m):
+            if m["id"] in seen:
+                return
+            refs = [r[0] for r in self.db.execute("SELECT evidence FROM dependencies WHERE memory=? ORDER BY evidence", (m["id"],))]
+            # Both search routes revalidate ALL dependencies under the dispatch lock.
+            if not refs:
+                return
+            try:
+                for ref in refs:
+                    self.source(p["id"], ref, current=True)
+            except HubError:
+                return
+            seen.add(m["id"])
+            items.append({"kind": "memory", "id": m["id"], "text": m["text"], "scope": m["scope"],
+                          "authority": m["authority"], "evidence_ids": refs, "revision": m["revision"]})
+
+        # Direct memory wording ranks before source-derived candidates. FTS scores
+        # from separate corpora are not comparable; keep stable ranks within each.
+        for m in memories:
+            append_memory(m)
         for row in rows:
             for m in self.db.execute("SELECT m.* FROM memories m JOIN dependencies d ON m.id=d.memory "
-                                     "WHERE d.evidence=? AND m.status='active'", (row["id"],)).fetchall():
-                if m["id"] in seen:
-                    continue
-                refs = [r[0] for r in self.db.execute("SELECT evidence FROM dependencies WHERE memory=?", (m["id"],))]
-                # Revalidate every contributing dependency, not only the matched citation.
-                try:
-                    for ref in refs:
-                        self.source(p["id"], ref, current=True)
-                except HubError:
-                    continue
-                seen.add(m["id"])
-                items.append({"kind": "memory", "id": m["id"], "text": m["text"], "scope": m["scope"],
-                              "authority": m["authority"], "evidence_ids": refs, "revision": m["revision"]})
+                                     "WHERE d.evidence=? AND m.project=? AND m.status='active' ORDER BY m.id",
+                                     (row["id"], p["id"])).fetchall():
+                append_memory(m)
             # Raw snippets are explicitly non-authoritative; do not label user text as a requirement.
             snippet = row["text"]
             if len(snippet.encode()) > 1200:
